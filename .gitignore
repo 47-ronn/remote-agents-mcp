@@ -31,3 +31,6 @@ logs/
 
 # Wrangler
 .wrangler/
+
+# npm wrapper: downloaded binary
+npm/bin/

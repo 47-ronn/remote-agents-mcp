@@ -1,0 +1,25 @@
+{
+  "name": "remote-agents",
+  "version": "0.0.0",
+  "description": "Unified MCP server for controlling fleets of remote machines through AI agents (Claude, opencode)",
+  "keywords": ["mcp", "model-context-protocol", "remote", "agent", "fleet", "ssh", "devops"],
+  "homepage": "https://github.com/ObsidianMotorman/tunshell_mcp_agents#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ObsidianMotorman/tunshell_mcp_agents.git"
+  },
+  "license": "MIT",
+  "author": "47-ron",
+  "bin": {
+    "remote-agents": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": ["run.js", "install.js"],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"]
+}

@@ -50,6 +50,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/remote-agent" "$dist/"
           cp "target/${{ matrix.target }}/release/remote-agents-relay" "$dist/"
           tar -czf "$dist.tar.gz" "$dist"
+          # Raw single binary for the npm installer (downloaded at `npm install`).
+          cp "target/${{ matrix.target }}/release/remote-agent" "remote-agent-${{ matrix.target }}"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -60,6 +62,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" $dist
           Copy-Item "target/${{ matrix.target }}/release/remote-agents-relay.exe" $dist
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
+          Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" "remote-agent-${{ matrix.target }}.exe"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -67,6 +70,7 @@ jobs:
           path: |
             remote-agents-*.tar.gz
             remote-agents-*.zip
+            remote-agent-${{ matrix.target }}*
 
   # ---------------------------------------------------------------------------
   # Attach all platform archives to the GitHub release.
@@ -87,3 +91,27 @@ jobs:
         with:
           files: artifacts/**/*
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # Publish the npm wrapper (downloads the matching release binary on install).
+  # Requires the NPM_TOKEN repository secret.
+  # ---------------------------------------------------------------------------
+  npm-publish:
+    name: npm publish
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Set version from tag
+        working-directory: npm
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Publish to npm
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

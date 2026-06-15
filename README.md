@@ -1,5 +1,8 @@
 # Remote Agents
 
+[![CI](https://github.com/ObsidianMotorman/tunshell_mcp_agents/actions/workflows/ci.yml/badge.svg)](https://github.com/ObsidianMotorman/tunshell_mcp_agents/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A unified, [MCP](https://modelcontextprotocol.io)-compatible system for
 controlling fleets of remote machines through AI agents (Claude, opencode).
 Agents connect outbound to a relay; an MCP server lets the AI run commands,
@@ -56,14 +59,19 @@ over end-to-end-encrypted channels.
 ## Install
 
 ```bash
-# Build both binaries
-cargo build --release --workspace
-
-# Or install the agent/MCP binary to ~/.cargo/bin
-cargo install --path crates/mcp-server
+# Via npm (downloads the prebuilt binary for your platform)
+npm install -g remote-agents        # then: remote-agents --help
+# or run on demand:
+npx remote-agents mcp --help
 ```
 
-Prebuilt binaries for macOS / Linux / Windows are attached to each GitHub
+```bash
+# From source
+cargo build --release --workspace
+cargo install --path crates/mcp-server   # → ~/.cargo/bin/remote-agent
+```
+
+Prebuilt binaries for macOS / Linux / Windows are also attached to each GitHub
 release.
 
 ## Quick start
