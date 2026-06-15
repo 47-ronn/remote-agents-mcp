@@ -1,0 +1,900 @@
+//! Connection pool management for relay servers
+
+use crate::relay_udp::{SignalMessage, UdpTransport};
+use anyhow::{bail, Context, Result};
+use futures::{SinkExt, StreamExt};
+use remote_agents_shared::{
+    AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, ClientRole, Command,
+    CommandResult, ServerMessage, Target, TaskStatus, UdpFrame,
+};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Once};
+use std::time::Duration;
+
+/// Install the rustls crypto provider once, so outbound `wss://` connections work.
+static CRYPTO_INIT: Once = Once::new();
+fn ensure_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
+
+/// Overall backstop for collecting replies to a command.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// For broadcasts: once at least one reply has arrived, stop waiting after this
+/// much idle time with no new reply (bounds latency if the agent count is stale).
+const FLEET_IDLE_GAP: Duration = Duration::from_secs(3);
+
+/// One reply from one agent for a request: Ok(result) or Err(error string).
+type AgentReply = (String, Result<CommandResult, String>);
+
+/// Map of in-flight request IDs to the collector receiving every agent's reply.
+type PendingMap = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<AgentReply>>>>;
+
+/// Latest known status of autonomous tasks, populated by push events.
+type EventMap = Arc<RwLock<HashMap<String, TaskStatus>>>;
+
+/// A reminder cron to cancel automatically when its task completes.
+#[derive(Clone)]
+struct Watch {
+    reminder_name: String,
+    self_agent_id: String,
+}
+
+/// Map of watched task ids to their reminder cron (for auto-cancel on push).
+type WatchMap = Arc<RwLock<HashMap<String, Watch>>>;
+
+/// Per-agent outcome for a (possibly fleet-wide) command.
+#[derive(Serialize)]
+pub struct AgentOutcome {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A connection to a single room
+struct RoomConnection {
+    /// Sender for outgoing messages
+    tx: mpsc::Sender<ClientMessage>,
+    /// Cached agent list
+    agents: Arc<RwLock<Vec<AgentInfo>>>,
+    /// Pending command responses
+    pending: PendingMap,
+    /// End-to-end transport cipher for this room.
+    cipher: Cipher,
+    /// Latest autonomous task statuses from push events.
+    events: EventMap,
+    /// Wakes `task_wait` callers when a new event arrives.
+    events_notify: Arc<Notify>,
+    /// Tasks with a reminder cron to auto-cancel on completion.
+    watched: WatchMap,
+    /// UDP transport for direct peer-to-peer communication.
+    // Held to keep the transport alive; the MCP-side UDP data path is still
+    // WIP (plan.md Phase 14: "UDP transport в MCP-сервере"), so it is not yet
+    // read. Remove the allow once that path lands.
+    #[allow(dead_code)]
+    udp_transport: Arc<UdpTransport>,
+}
+
+/// Pool of connections to relay servers
+pub struct ConnectionPool {
+    rooms: HashMap<String, RoomConnection>,
+}
+
+impl ConnectionPool {
+    pub fn new() -> Self {
+        Self {
+            rooms: HashMap::new(),
+        }
+    }
+
+    /// Connect to a room on the relay server. `key` optionally overrides the
+    /// token-derived end-to-end encryption key (must match the agents' key).
+    pub async fn connect(
+        &mut self,
+        relay_url: &str,
+        room: &str,
+        token: &str,
+        key: Option<&str>,
+    ) -> Result<String> {
+        if self.rooms.contains_key(room) {
+            return Ok(format!("Already connected to room '{}'", room));
+        }
+
+        ensure_crypto_provider();
+        let cipher = Cipher::for_transport(token, key);
+
+        let ws_url = format!("{}/ws/room/{}?token={}", relay_url, room, token);
+        info!("Connecting to {}", ws_url);
+
+        let (ws_stream, _) = connect_async(&ws_url)
+            .await
+            .context("Failed to connect to relay")?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Create channels
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(32);
+        let agents = Arc::new(RwLock::new(Vec::new()));
+        let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
+        let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
+        let events_notify = Arc::new(Notify::new());
+        let watched: WatchMap = Arc::new(RwLock::new(HashMap::new()));
+
+        // Create UDP signaling channel
+        let (udp_signal_tx, mut udp_signal_rx) = mpsc::channel::<SignalMessage>(32);
+        let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx));
+
+        // Send auth
+        let auth_msg = ClientMessage::Auth {
+            room: room.to_string(),
+            token: token.to_string(),
+            role: ClientRole::Mcp,
+            agent_info: None,
+        };
+
+        write
+            .send(Message::Text(auth_msg.to_json()?))
+            .await
+            .context("Failed to send auth")?;
+
+        // Wait for auth response
+        let auth_response = timeout(Duration::from_secs(10), read.next())
+            .await
+            .context("Auth timeout")?
+            .ok_or_else(|| anyhow::anyhow!("Connection closed"))?
+            .context("WebSocket error")?;
+
+        let session_id = if let Message::Text(text) = auth_response {
+            let msg: ServerMessage = ServerMessage::from_json(&text)?;
+            match msg {
+                ServerMessage::AuthOk { session_id } => session_id,
+                ServerMessage::AuthFailed { reason } => {
+                    bail!("Auth failed: {}", reason);
+                }
+                _ => bail!("Unexpected auth response"),
+            }
+        } else {
+            bail!("Unexpected message type");
+        };
+
+        info!("Connected to room '{}' with session '{}'", room, session_id);
+
+        // Set session ID on UDP transport
+        udp_transport.set_session_id(session_id.clone()).await;
+        info!("UDP transport initialized");
+
+        // Spawn message handler
+        let agents_clone = agents.clone();
+        let pending_clone = pending.clone();
+        let cipher_clone = cipher.clone();
+        let events_clone = events.clone();
+        let notify_clone = events_notify.clone();
+        let watched_clone = watched.clone();
+        let tx_clone = tx.clone();
+        let udp_transport_clone = udp_transport.clone();
+
+        tokio::spawn(async move {
+            let shared = HandlerShared {
+                agents: agents_clone,
+                pending: pending_clone,
+                cipher: cipher_clone,
+                events: events_clone,
+                events_notify: notify_clone,
+                watched: watched_clone,
+                tx: tx_clone,
+                udp_transport: udp_transport_clone,
+            };
+            loop {
+                tokio::select! {
+                    // Incoming messages
+                    msg = read.next() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                if let Err(e) = handle_message(&text, &shared).await {
+                                    error!("Error handling message: {}", e);
+                                }
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                let _ = write.send(Message::Pong(data)).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => {
+                                info!("Connection closed");
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                error!("WebSocket error: {}", e);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Outgoing messages
+                    msg = rx.recv() => {
+                        if let Some(msg) = msg {
+                            if let Ok(json) = msg.to_json() {
+                                if let Err(e) = write.send(Message::Text(json)).await {
+                                    error!("Failed to send message: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // UDP signaling messages to relay
+                    signal = udp_signal_rx.recv() => {
+                        if let Some(signal) = signal {
+                            let msg = match signal {
+                                SignalMessage::Offer(offer) => ClientMessage::UdpOffer(offer),
+                                SignalMessage::Answer(answer) => ClientMessage::UdpAnswer(answer),
+                                SignalMessage::Result(result) => ClientMessage::UdpResult(result),
+                            };
+                            if let Ok(json) = msg.to_json() {
+                                if let Err(e) = write.send(Message::Text(json)).await {
+                                    error!("Failed to send UDP signal: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Request initial agent list
+        tx.send(ClientMessage::ListAgents).await?;
+
+        self.rooms.insert(
+            room.to_string(),
+            RoomConnection {
+                tx,
+                agents,
+                pending,
+                cipher,
+                events,
+                events_notify,
+                watched,
+                udp_transport,
+            },
+        );
+
+        Ok(format!("Connected to room '{}' as session '{}'", room, session_id))
+    }
+
+    /// Disconnect from a room
+    pub async fn disconnect(&mut self, room: &str) -> Result<()> {
+        if let Some(conn) = self.rooms.remove(room) {
+            conn.tx.send(ClientMessage::Close).await?;
+        }
+        Ok(())
+    }
+
+    /// List agents in a room
+    pub async fn list_agents(&self, room: &str) -> Result<Vec<AgentInfo>> {
+        let conn = self.rooms.get(room).ok_or_else(|| {
+            anyhow::anyhow!("Not connected to room '{}'", room)
+        })?;
+
+        // Request fresh list
+        conn.tx.send(ClientMessage::ListAgents).await?;
+
+        // Wait a bit for response
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let agents = conn.agents.read().await;
+        Ok(agents.clone())
+    }
+
+    /// Send a command to agent(s) and return only the successful results.
+    /// Now correctly aggregates across a broadcast (every matching agent), not
+    /// just the first responder. Used by the single-result helpers.
+    pub async fn send_command(
+        &self,
+        room: &str,
+        target: Target,
+        payload: Command,
+    ) -> Result<Vec<(String, CommandResult)>> {
+        let (successes, errors) = self.dispatch(room, target, payload).await?;
+        if successes.is_empty() {
+            if let Some((_, e)) = errors.into_iter().next() {
+                bail!("{}", e);
+            }
+            bail!("Command timeout");
+        }
+        Ok(successes)
+    }
+
+    /// Send a command to agent(s) and return a per-agent outcome (success OR
+    /// error for each), so one failing host doesn't sink the whole batch.
+    pub async fn send_command_fleet(
+        &self,
+        room: &str,
+        target: Target,
+        payload: Command,
+    ) -> Result<Vec<AgentOutcome>> {
+        let (successes, errors) = self.dispatch(room, target, payload).await?;
+        let mut out: Vec<AgentOutcome> = successes
+            .into_iter()
+            .map(|(agent_id, result)| AgentOutcome {
+                agent_id,
+                result: Some(result),
+                error: None,
+            })
+            .collect();
+        out.extend(errors.into_iter().map(|(agent_id, error)| AgentOutcome {
+            agent_id,
+            result: None,
+            error: Some(error),
+        }));
+        Ok(out)
+    }
+
+    /// Encrypt, broadcast, and collect replies from every targeted agent.
+    async fn dispatch(
+        &self,
+        room: &str,
+        target: Target,
+        payload: Command,
+    ) -> Result<(Vec<(String, CommandResult)>, Vec<(String, String)>)> {
+        let conn = self
+            .rooms
+            .get(room)
+            .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        // Encrypt the command into an opaque envelope before it touches the relay.
+        let envelope = payload
+            .encrypt(&conn.cipher)
+            .map_err(|e| anyhow::anyhow!("failed to encrypt command: {}", e))?;
+
+        // How many replies do we expect? Filter the cached agent list with the
+        // same rules the relay's resolveTarget uses. This is a hint for early
+        // return only — correctness is guaranteed by the deadline backstop.
+        let expected = {
+            let agents = conn.agents.read().await;
+            match &target {
+                Target::Agent { id } => agents.iter().filter(|a| &a.id == id).count(),
+                Target::All => agents.len(),
+                Target::Tagged { tags } => agents
+                    .iter()
+                    .filter(|a| a.tags.iter().any(|t| tags.contains(t)))
+                    .count(),
+                Target::Platform { family } => agents
+                    .iter()
+                    .filter(|a| {
+                        family.eq_ignore_ascii_case(&a.platform.family)
+                            || family.eq_ignore_ascii_case(&a.os)
+                    })
+                    .count(),
+            }
+        };
+        let single = matches!(target, Target::Agent { .. });
+
+        // For a single-agent command, prefer the direct UDP channel (bulk data
+        // like a MapTask partition then bypasses the relay). The agent replies
+        // over WS, correlated by request_id, so the collector below is unchanged.
+        let udp_session = {
+            let agents = conn.agents.read().await;
+            udp_session_for(&agents, &target)
+        };
+
+        // Register the collector BEFORE sending so no reply can race ahead of it.
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
+        {
+            let mut pending = conn.pending.write().await;
+            pending.insert(request_id.clone(), reply_tx);
+        }
+
+        let mut sent_via_udp = false;
+        if let Some(session) = &udp_session {
+            if conn.udp_transport.has_udp_channel(session).await {
+                let frame = UdpFrame::Command {
+                    request_id: request_id.clone(),
+                    // Agent replies over WS (correlated by request_id), so the
+                    // origin session is not needed for the reply path.
+                    from_session: String::new(),
+                    payload: envelope.clone(),
+                };
+                if let Ok(true) = conn.udp_transport.send_via_udp(session, &frame.to_bytes()).await {
+                    sent_via_udp = true;
+                    debug!("Sent command {} via UDP to {}", request_id, session);
+                }
+            }
+        }
+
+        // WS path (fallback when no UDP channel, or the broadcast/tagged cases).
+        if !sent_via_udp {
+            if let Err(e) = conn
+                .tx
+                .send(ClientMessage::Command {
+                    request_id: request_id.clone(),
+                    target,
+                    payload: envelope,
+                })
+                .await
+            {
+                conn.pending.write().await.remove(&request_id);
+                return Err(e.into());
+            }
+        }
+
+        let collected = collect_replies(reply_rx, expected, single).await;
+
+        // Single cleanup covering every exit path; late replies are then dropped.
+        conn.pending.write().await.remove(&request_id);
+
+        Ok(collected)
+    }
+
+    /// Register a reminder cron to auto-cancel when `task_id` completes.
+    pub async fn register_watch(
+        &self,
+        room: &str,
+        task_id: &str,
+        reminder_name: &str,
+        self_agent_id: &str,
+    ) -> Result<()> {
+        let conn = self
+            .rooms
+            .get(room)
+            .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
+        conn.watched.write().await.insert(
+            task_id.to_string(),
+            Watch {
+                reminder_name: reminder_name.to_string(),
+                self_agent_id: self_agent_id.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Block until an autonomous task completes (via push event) or `timeout_ms`
+    /// elapses, then fetch and return its full state over the encrypted path.
+    pub async fn task_wait(
+        &self,
+        room: &str,
+        agent_id: &str,
+        task_id: &str,
+        timeout_ms: u64,
+    ) -> Result<AutonomousTask> {
+        let (events, notify) = {
+            let conn = self
+                .rooms
+                .get(room)
+                .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
+            (conn.events.clone(), conn.events_notify.clone())
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            // Arm the waiter BEFORE checking, so an event between the check and
+            // the await is not missed.
+            let notified = notify.notified();
+            if let Some(status) = events.read().await.get(task_id).copied() {
+                if matches!(status, TaskStatus::Done | TaskStatus::Failed) {
+                    break;
+                }
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = sleep_until(deadline) => break,
+            }
+        }
+
+        // Fetch the full task (status + result) over the encrypted command path.
+        let results = self
+            .send_command(
+                room,
+                Target::Agent {
+                    id: agent_id.to_string(),
+                },
+                Command::TaskGet {
+                    id: task_id.to_string(),
+                },
+            )
+            .await?;
+        match results.into_iter().next() {
+            Some((_, CommandResult::Task { task })) => Ok(task),
+            _ => Err(anyhow::anyhow!("unexpected task_wait result")),
+        }
+    }
+}
+
+/// The peer session to try a direct UDP send for, if any. Only single-agent
+/// targets are eligible (broadcast/tagged/platform commands go over the WS
+/// fan-out); the agent must have a relay-assigned `session_id`.
+fn udp_session_for(agents: &[AgentInfo], target: &Target) -> Option<String> {
+    match target {
+        Target::Agent { id } => agents
+            .iter()
+            .find(|a| &a.id == id)
+            .and_then(|a| a.session_id.clone()),
+        _ => None,
+    }
+}
+
+/// Drain agent replies for one request, returning (successes, errors).
+///
+/// Returns as soon as all `expected` replies arrive (or the first, for a
+/// single-agent target). After at least one reply, a broadcast also stops on an
+/// idle gap; an overall deadline backstops everything.
+async fn collect_replies(
+    mut rx: mpsc::UnboundedReceiver<AgentReply>,
+    expected: usize,
+    single: bool,
+) -> (Vec<(String, CommandResult)>, Vec<(String, String)>) {
+    let mut successes: Vec<(String, CommandResult)> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+
+    loop {
+        let total = successes.len() + errors.len();
+        if single && total >= 1 {
+            break;
+        }
+        if !single && expected > 0 && total >= expected {
+            break;
+        }
+
+        // Once we have any reply on a broadcast, cap further waiting on an idle gap.
+        let next_deadline = if total > 0 && !single {
+            (Instant::now() + FLEET_IDLE_GAP).min(deadline)
+        } else {
+            deadline
+        };
+
+        match timeout_at(next_deadline, rx.recv()).await {
+            Ok(Some((agent_id, Ok(result)))) => successes.push((agent_id, result)),
+            Ok(Some((agent_id, Err(e)))) => errors.push((agent_id, e)),
+            Ok(None) => break, // all senders dropped
+            Err(_) => break,   // deadline / idle gap elapsed
+        }
+    }
+
+    (successes, errors)
+}
+
+/// Shared per-connection state handed to the message handler.
+struct HandlerShared {
+    agents: Arc<RwLock<Vec<AgentInfo>>>,
+    pending: PendingMap,
+    cipher: Cipher,
+    events: EventMap,
+    events_notify: Arc<Notify>,
+    watched: WatchMap,
+    tx: mpsc::Sender<ClientMessage>,
+    udp_transport: Arc<UdpTransport>,
+}
+
+/// Agents we can open a UDP data channel to: those that the relay has assigned
+/// a `session_id`. Returns `(session_id, name)` pairs.
+fn dial_targets(agents: &[AgentInfo]) -> Vec<(String, String)> {
+    agents
+        .iter()
+        .filter_map(|a| a.session_id.clone().map(|s| (s, a.name.clone())))
+        .collect()
+}
+
+/// Offer a UDP channel to `session` in the background, unless one already
+/// exists (connected or mid-handshake) so a list refresh never clobbers an
+/// in-flight offer. Failure is non-fatal — WebSocket remains the transport.
+async fn spawn_udp_dial(udp: &Arc<UdpTransport>, session: String, name: String) {
+    if udp.has_channel(&session).await {
+        return;
+    }
+    let udp = udp.clone();
+    tokio::spawn(async move {
+        match udp.offer_channel(session).await {
+            Ok(channel_id) => {
+                info!("Initiated UDP channel {} to agent {}", channel_id, name);
+            }
+            Err(e) => {
+                debug!("Failed to initiate UDP channel to {}: {}", name, e);
+            }
+        }
+    });
+}
+
+async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
+    let msg: ServerMessage = ServerMessage::from_json(text)?;
+
+    match msg {
+        ServerMessage::AgentList { agents: new_agents } => {
+            // Dial agents that were already present when we connected (or
+            // appeared in a refresh). Without this, only agents that join
+            // *after* us via AgentJoined ever get a UDP channel.
+            for (session, name) in dial_targets(&new_agents) {
+                spawn_udp_dial(&shared.udp_transport, session, name).await;
+            }
+            let mut list = shared.agents.write().await;
+            *list = new_agents;
+            debug!("Updated agent list: {} agents", list.len());
+        }
+
+        ServerMessage::AgentJoined { agent } => {
+            let mut list = shared.agents.write().await;
+            list.push(agent.clone());
+            info!("Agent joined: {} ({})", agent.name, agent.id);
+
+            // Initiate UDP channel if agent has session_id.
+            if let Some(session_id) = &agent.session_id {
+                spawn_udp_dial(&shared.udp_transport, session_id.clone(), agent.name.clone())
+                    .await;
+            }
+        }
+
+        ServerMessage::AgentLeft { agent_id } => {
+            let mut list = shared.agents.write().await;
+            list.retain(|a| a.id != agent_id);
+            info!("Agent left: {}", agent_id);
+        }
+
+        ServerMessage::CommandResult {
+            request_id,
+            agent_id,
+            result,
+        } => {
+            // Decrypt, then forward to the collector (do NOT remove the entry —
+            // other agents in the same broadcast still need to deliver).
+            let reply = match CommandResult::decrypt(&result, &shared.cipher) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    error!("Failed to decrypt result for {}: {}", request_id, e);
+                    Err(format!("result decryption failed: {}", e))
+                }
+            };
+            let pending_map = shared.pending.read().await;
+            if let Some(tx) = pending_map.get(&request_id) {
+                let _ = tx.send((agent_id, reply));
+            }
+        }
+
+        ServerMessage::CommandError {
+            request_id,
+            agent_id,
+            error,
+        } => {
+            warn!("Command error from {}: {}", agent_id, error);
+            // Per-agent error; record it without dropping other agents' replies.
+            let pending_map = shared.pending.read().await;
+            if let Some(tx) = pending_map.get(&request_id) {
+                let _ = tx.send((agent_id, Err(error)));
+            }
+        }
+
+        ServerMessage::Event { agent_id, event } => {
+            handle_event(shared, &agent_id, event).await;
+        }
+
+        ServerMessage::Pong => {
+            debug!("Received pong");
+        }
+
+        // UDP Signaling messages
+        ServerMessage::YourEndpoint { endpoint } => {
+            info!("Relay reports our public endpoint: {}", endpoint);
+            shared.udp_transport.set_public_endpoint(endpoint).await;
+        }
+
+        ServerMessage::UdpOffer { from_session, offer } => {
+            debug!("Received UDP offer from {}", from_session);
+            if let Err(e) = shared.udp_transport.handle_offer(offer).await {
+                warn!("Failed to handle UDP offer: {}", e);
+            }
+        }
+
+        ServerMessage::UdpAnswer { from_session, answer } => {
+            debug!("Received UDP answer from {}", from_session);
+            if let Err(e) = shared.udp_transport.handle_answer(answer).await {
+                warn!("Failed to handle UDP answer: {}", e);
+            }
+        }
+
+        ServerMessage::UdpResult { from_session, result } => {
+            if result.success {
+                info!(
+                    "UDP channel {} established with {}",
+                    result.channel_id, from_session
+                );
+            } else {
+                warn!(
+                    "UDP channel {} failed with {}: {:?}",
+                    result.channel_id, from_session, result.error
+                );
+            }
+        }
+
+        _ => {
+            debug!("Ignoring message: {:?}", msg);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle an unsolicited agent event: record status, wake `task_wait` callers,
+/// and auto-cancel the reminder cron when a watched task completes.
+async fn handle_event(shared: &HandlerShared, agent_id: &str, event: AgentEvent) {
+    match event {
+        AgentEvent::TaskCompleted { task_id, status } => {
+            info!("Event: task {} on {} -> {:?}", task_id, agent_id, status);
+            shared.events.write().await.insert(task_id.clone(), status);
+            shared.events_notify.notify_waiters();
+
+            // If this task had a reminder cron registered, cancel it now
+            // (fire-and-forget ScheduleRemove on the initiator's self-agent).
+            if matches!(status, TaskStatus::Done | TaskStatus::Failed) {
+                let watch = shared.watched.write().await.remove(&task_id);
+                if let Some(watch) = watch {
+                    let cmd = Command::ScheduleRemove {
+                        name: watch.reminder_name,
+                    };
+                    if let Ok(envelope) = cmd.encrypt(&shared.cipher) {
+                        let _ = shared
+                            .tx
+                            .send(ClientMessage::Command {
+                                request_id: uuid::Uuid::new_v4().to_string(),
+                                target: Target::Agent {
+                                    id: watch.self_agent_id,
+                                },
+                                payload: envelope,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for ConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_aggregates_successes_and_errors() {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentReply>();
+        tx.send(("a".into(), Ok(CommandResult::Ok))).unwrap();
+        tx.send(("b".into(), Err("boom".into()))).unwrap();
+        tx.send(("c".into(), Ok(CommandResult::Ok))).unwrap();
+        // expected=3 → early return without hitting any timeout.
+        let (ok, err) = collect_replies(rx, 3, false).await;
+        assert_eq!(ok.len(), 2);
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].0, "b");
+    }
+
+    #[tokio::test]
+    async fn collect_single_returns_first_reply() {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentReply>();
+        tx.send(("a".into(), Ok(CommandResult::Ok))).unwrap();
+        tx.send(("b".into(), Ok(CommandResult::Ok))).unwrap();
+        let (ok, _err) = collect_replies(rx, 1, true).await;
+        assert_eq!(ok.len(), 1, "single target must stop at the first reply");
+        assert_eq!(ok[0].0, "a");
+    }
+
+    #[tokio::test]
+    async fn event_registry_records_and_wakes() {
+        // Simulate handle_event's effect on the shared registry + notify.
+        let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+
+        // A waiter arms notified() then awaits.
+        let (e2, n2) = (events.clone(), notify.clone());
+        let waiter = tokio::spawn(async move {
+            loop {
+                let notified = n2.notified();
+                if let Some(s) = e2.read().await.get("t1").copied() {
+                    if matches!(s, TaskStatus::Done | TaskStatus::Failed) {
+                        return s;
+                    }
+                }
+                notified.await;
+            }
+        });
+
+        // Producer records completion and wakes waiters.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        events.write().await.insert("t1".into(), TaskStatus::Done);
+        notify.notify_waiters();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter did not wake")
+            .unwrap();
+        assert_eq!(status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn collect_no_match_error_is_captured() {
+        // Relay "No matching agents found" arrives as an error with empty id.
+        let (tx, rx) = mpsc::unbounded_channel::<AgentReply>();
+        tx.send(("".into(), Err("No matching agents found".into()))).unwrap();
+        // Single target → returns on first reply (no 60s wait).
+        let (ok, err) = collect_replies(rx, 1, true).await;
+        assert!(ok.is_empty());
+        assert_eq!(err.len(), 1);
+    }
+
+    fn agent(name: &str, session: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            mode: remote_agents_shared::AgentMode::Plan,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            hostname: "h".into(),
+            tags: vec![],
+            platform: Default::default(),
+            autonomous: false,
+            connected_at: 0,
+            session_id: session.map(String::from),
+        }
+    }
+
+    #[test]
+    fn dial_targets_skips_agents_without_session() {
+        let agents = vec![
+            agent("a", Some("sess-a")),
+            agent("b", None), // no session yet → not dialable
+            agent("c", Some("sess-c")),
+        ];
+        let targets = dial_targets(&agents);
+        assert_eq!(
+            targets,
+            vec![
+                ("sess-a".to_string(), "a".to_string()),
+                ("sess-c".to_string(), "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dial_targets_empty_when_no_sessions() {
+        assert!(dial_targets(&[]).is_empty());
+        assert!(dial_targets(&[agent("a", None)]).is_empty());
+    }
+
+    #[test]
+    fn udp_session_only_for_known_single_agent() {
+        let agents = vec![
+            agent("a", Some("sess-a")),
+            agent("b", None), // no session yet
+        ];
+        // Single agent with a session → eligible for UDP (helper ids are "id-<name>").
+        assert_eq!(
+            udp_session_for(&agents, &Target::Agent { id: "id-a".into() }),
+            Some("sess-a".to_string())
+        );
+        // Agent without a session, unknown agent, and broadcasts → WS only.
+        assert_eq!(udp_session_for(&agents, &Target::Agent { id: "id-b".into() }), None);
+        assert_eq!(udp_session_for(&agents, &Target::Agent { id: "zzz".into() }), None);
+        assert_eq!(udp_session_for(&agents, &Target::All), None);
+        assert_eq!(
+            udp_session_for(&agents, &Target::Tagged { tags: vec!["x".into()] }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn has_channel_false_before_any_offer() {
+        let (sig_tx, _rx) = mpsc::channel(4);
+        let udp = UdpTransport::new(Cipher::from_passphrase("k"), sig_tx);
+        assert!(!udp.has_channel("sess-x").await);
+    }
+}

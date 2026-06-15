@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/mcp-server",
+    "crates/relay",
+]
+exclude = [
+    "crates/mcp-server/fuzz",
+    "crates/relay/fuzz",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/anthropics/remote-agents"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Crypto
+sha2 = "0.10"
+rand = "0.8"
+
+# UUID
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Config
+toml = "0.8"
+dirs = "5.0"
+
+# Internal
+remote-agents-shared = { path = "crates/shared" }

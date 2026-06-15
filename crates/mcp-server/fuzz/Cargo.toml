@@ -1,0 +1,72 @@
+[package]
+name = "remote-agent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+remote-agent = { path = ".." }
+remote-agents-shared = { path = "../../shared" }
+
+[[bin]]
+name = "safety_command"
+path = "fuzz_targets/safety_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safety_path"
+path = "fuzz_targets/safety_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_client"
+path = "fuzz_targets/protocol_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_server"
+path = "fuzz_targets/protocol_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_decrypt"
+path = "fuzz_targets/crypto_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_decrypt"
+path = "fuzz_targets/envelope_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cron_validate"
+path = "fuzz_targets/cron_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fragment_reassemble"
+path = "fuzz_targets/fragment_reassemble.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace so the fuzz crate has its own build graph.
+[workspace]

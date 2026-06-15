@@ -1,0 +1,50 @@
+[package]
+name = "remote-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remote-agent"
+path = "src/main.rs"
+
+[dependencies]
+remote-agents-shared = { workspace = true, features = ["udp"] }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+rand = { workspace = true }
+
+# Platform info
+sysinfo = "0.32"
+hostname = "0.4"
+
+# Scheduling
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# TLS
+rustls = { workspace = true }
+
+# MCP Server (for stdio MCP mode)
+rust-mcp-sdk = { version = "0.9", default-features = false, features = ["server", "macros", "stdio"] }
+rust-mcp-macros = "0.9"
+schemars = "0.8"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+

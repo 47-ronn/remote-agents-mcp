@@ -1,0 +1,33 @@
+# Rust
+/target/
+Cargo.lock
+
+# Node
+node_modules/
+*.node
+dist/
+docs/
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+*.wasm
+
+# Wrangler
+.wrangler/

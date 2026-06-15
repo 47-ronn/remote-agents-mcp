@@ -1,0 +1,16 @@
+{
+  "name": "@anthropic/remote-agents-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "worker"
+  ],
+  "scripts": {
+    "build:worker": "npm run build -w worker",
+    "deploy:worker": "npm run deploy -w worker",
+    "test": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

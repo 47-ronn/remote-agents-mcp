@@ -1,0 +1,28 @@
+[package]
+name = "remote-agents-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remote-agents-relay"
+path = "src/main.rs"
+
+[dependencies]
+remote-agents-shared = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+
+axum = { version = "0.7", features = ["ws"] }
+dashmap = "6"
+mimalloc = "0.1"
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }

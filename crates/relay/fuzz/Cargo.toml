@@ -1,0 +1,25 @@
+[package]
+name = "remote-agents-relay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+remote-agents-relay = { path = ".." }
+remote-agents-shared = { path = "../../shared" }
+tokio = { version = "1", features = ["sync"] }
+
+[[bin]]
+name = "routing"
+path = "fuzz_targets/routing.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]
