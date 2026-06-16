@@ -251,19 +251,26 @@ export class Room implements DurableObject {
     const agents = this.agentSockets();
     switch (target.type) {
       case 'agent':
+        // Explicit target is delivered even to a send-only node (it replies
+        // with its own --no-agent rejection).
         return agents.filter(([, a]) => a.agentInfo?.id === target.id);
       case 'all':
-        return agents;
+        // Broadcasts skip send-only peers (accepts_commands === false): they
+        // never execute, so fanning out to them is pointless.
+        return agents.filter(([, a]) => a.agentInfo?.accepts_commands !== false);
       case 'tagged':
-        return agents.filter(([, a]) =>
-          a.agentInfo?.tags.some((t) => target.tags.includes(t))
+        return agents.filter(
+          ([, a]) =>
+            a.agentInfo?.accepts_commands !== false &&
+            a.agentInfo?.tags.some((t) => target.tags.includes(t))
         );
       case 'platform': {
         const fam = target.family.toLowerCase();
         return agents.filter(
           ([, a]) =>
-            a.agentInfo?.platform?.family.toLowerCase() === fam ||
-            a.agentInfo?.os.toLowerCase() === fam
+            a.agentInfo?.accepts_commands !== false &&
+            (a.agentInfo?.platform?.family.toLowerCase() === fam ||
+              a.agentInfo?.os.toLowerCase() === fam)
         );
       }
     }

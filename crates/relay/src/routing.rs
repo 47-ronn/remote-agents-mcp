@@ -6,6 +6,12 @@ use remote_agents_shared::Target;
 
 /// Resolve the outbound senders of all agents matching `target`.
 /// Returns `(agent_id, tx)` pairs.
+///
+/// Broadcast targets (All/Tagged/Platform) skip send-only peers
+/// (`accepts_commands == false`: `--no-agent` controllers/dashboards) — they
+/// never execute, so fanning out to them is pointless. An explicit
+/// `Target::Agent` is still delivered (the node replies with its own --no-agent
+/// rejection, which is informative).
 pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
     match target {
         Target::Agent { id } => room
@@ -17,6 +23,7 @@ pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
         Target::All => room
             .agents
             .iter()
+            .filter(|e| e.info.accepts_commands)
             .map(|e| (e.key().clone(), e.tx.clone()))
             .collect(),
 
@@ -24,7 +31,7 @@ pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
         Target::Tagged { tags } => room
             .agents
             .iter()
-            .filter(|e| e.info.tags.iter().any(|t| tags.contains(t)))
+            .filter(|e| e.info.accepts_commands && e.info.tags.iter().any(|t| tags.contains(t)))
             .map(|e| (e.key().clone(), e.tx.clone()))
             .collect(),
 
@@ -33,7 +40,7 @@ pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
         Target::Platform { family } => room
             .agents
             .iter()
-            .filter(|e| platform_matches(&e.info, family))
+            .filter(|e| e.info.accepts_commands && platform_matches(&e.info, family))
             .map(|e| (e.key().clone(), e.tx.clone()))
             .collect(),
     }
@@ -109,6 +116,25 @@ mod tests {
     fn target_all() {
         let r = room();
         assert_eq!(resolve_targets(&r, &Target::All).len(), 3);
+    }
+
+    #[test]
+    fn broadcasts_skip_send_only_peers_but_explicit_target_reaches_them() {
+        let r = room();
+        // Make "b" a send-only peer (--no-agent).
+        r.agents.get_mut("b").unwrap().info.accepts_commands = false;
+
+        // All / tagged / platform skip the send-only peer.
+        assert_eq!(resolve_targets(&r, &Target::All).len(), 2);
+        let backend = resolve_targets(&r, &Target::Tagged { tags: vec!["frontend".into()] });
+        assert!(backend.is_empty(), "b is frontend but send-only → skipped");
+        assert_eq!(
+            resolve_targets(&r, &Target::Platform { family: "linux".into() }).len(),
+            2
+        );
+
+        // ...but an explicit Agent target still reaches it (node self-rejects).
+        assert_eq!(resolve_targets(&r, &Target::Agent { id: "b".into() }).len(), 1);
     }
 
     #[test]

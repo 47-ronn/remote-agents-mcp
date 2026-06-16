@@ -21,6 +21,11 @@ export interface AgentInfo {
   tags: string[];
   platform?: PlatformInfo;
   autonomous?: boolean;
+  /** Whether this peer executes commands from others (false = --no-agent
+   * send-only). Absent (legacy) is treated as true. */
+  accepts_commands?: boolean;
+  /** Newer published version available for this host, if any. */
+  update_available?: string;
   connected_at: number;
   session_id?: string;
 }
