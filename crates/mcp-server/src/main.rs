@@ -20,7 +20,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the agent (connect to relay)
     Run {
@@ -62,6 +62,31 @@ enum Commands {
         /// Relay server URL
         #[arg(long)]
         relay: Option<String>,
+    },
+
+    /// Run BOTH an agent and an MCP server in one process: this node becomes a
+    /// peer — visible/controllable from the room (Agent role) AND able to control
+    /// the fleet via its local AI (Mcp role). Two relay connections, one process.
+    Hybrid {
+        /// Agent name (default: hostname)
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Room name to join
+        #[arg(short, long)]
+        room: Option<String>,
+
+        /// Authentication token for relay
+        #[arg(short, long)]
+        token: Option<String>,
+
+        /// Relay server URL
+        #[arg(long)]
+        relay: Option<String>,
+
+        /// Tags for this node as an agent (comma-separated)
+        #[arg(long)]
+        tags: Option<String>,
     },
 
     /// Generate default config file
@@ -120,6 +145,9 @@ async fn main() -> Result<()> {
         Commands::Mcp { name, room, token, relay } => {
             run_mcp(name, room, token, relay).await?;
         }
+        Commands::Hybrid { name, room, token, relay, tags } => {
+            run_hybrid(room, token, relay, name, tags).await?;
+        }
         Commands::Init => {
             config::init_config()?;
         }
@@ -151,14 +179,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_agent(
+/// Build the effective config from CLI overrides.
+/// Precedence: CLI flag > env var > config.toml > built-in default.
+fn build_config(
     room: Option<String>,
     token: Option<String>,
     relay: Option<String>,
     name: Option<String>,
     tags: Option<String>,
-) -> Result<()> {
-    // Config precedence: CLI flag > env var > config.toml > default.
+) -> config::Config {
     let mut cfg = config::load_config().unwrap_or_default();
     config::apply_env(&mut cfg);
 
@@ -177,6 +206,17 @@ async fn run_agent(
     if let Some(tags) = tags {
         cfg.tags = tags.split(',').map(|s| s.trim().to_string()).collect();
     }
+    cfg
+}
+
+async fn run_agent(
+    room: Option<String>,
+    token: Option<String>,
+    relay: Option<String>,
+    name: Option<String>,
+    tags: Option<String>,
+) -> Result<()> {
+    let cfg = build_config(room, token, relay, name, tags);
 
     info!(
         "Starting agent '{}' connecting to room '{}' at {}",
@@ -187,29 +227,94 @@ async fn run_agent(
     connection::run(&cfg).await
 }
 
+/// Hybrid: run the agent connection (Agent role — this node is visible and
+/// executes commands) AND the MCP server (Mcp role — controls the fleet via the
+/// local AI) concurrently, from one process. The MCP stdio server drives the
+/// process lifetime (it returns when its client closes stdin); the agent side
+/// is then aborted.
+async fn run_hybrid(
+    room: Option<String>,
+    token: Option<String>,
+    relay: Option<String>,
+    name: Option<String>,
+    tags: Option<String>,
+) -> Result<()> {
+    let cfg = build_config(room, token, relay, name, tags);
+
+    info!(
+        "Starting HYBRID node '{}' in room '{}' at {} (agent + MCP controller)",
+        cfg.name, cfg.room, cfg.relay_url
+    );
+
+    // Agent side: a controllable peer with its own executor. connection::run
+    // reconnects internally and effectively runs until the process exits.
+    let agent_cfg = cfg.clone();
+    let agent = tokio::spawn(async move {
+        if let Err(e) = connection::run(&agent_cfg).await {
+            tracing::error!("hybrid agent side ended: {}", e);
+        }
+    });
+
+    // Controller side: MCP stdio server. Returns when the MCP client disconnects.
+    let result = mcp_server::run_mcp_server(&cfg).await;
+
+    agent.abort();
+    result
+}
+
 async fn run_mcp(
     name: Option<String>,
     room: Option<String>,
     token: Option<String>,
     relay: Option<String>,
 ) -> Result<()> {
-    // Config precedence: CLI flag > env var > config.toml > default.
-    let mut cfg = config::load_config().unwrap_or_default();
-    config::apply_env(&mut cfg);
-
-    if let Some(name) = name {
-        cfg.name = name;
-    }
-    if let Some(room) = room {
-        cfg.room = room;
-    }
-    if let Some(token) = token {
-        cfg.token = token;
-    }
-    if let Some(relay) = relay {
-        cfg.relay_url = relay;
-    }
+    let cfg = build_config(room, token, relay, name, None);
 
     // MCP mode with optional relay connection for remote agent control
     mcp_server::run_mcp_server(&cfg).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_subcommand_parses_with_room_and_tags() {
+        let cli = Cli::try_parse_from([
+            "remote-agent",
+            "hybrid",
+            "--room",
+            "gpu",
+            "--token",
+            "t",
+            "--tags",
+            "macos,dev",
+        ])
+        .expect("hybrid args should parse");
+        match cli.command {
+            Commands::Hybrid { room, token, tags, .. } => {
+                assert_eq!(room.as_deref(), Some("gpu"));
+                assert_eq!(token.as_deref(), Some("t"));
+                assert_eq!(tags.as_deref(), Some("macos,dev"));
+            }
+            other => panic!("expected Hybrid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_config_applies_cli_overrides() {
+        let cfg = build_config(
+            Some("room1".into()),
+            Some("tok".into()),
+            Some("ws://r".into()),
+            Some("node-x".into()),
+            Some("a, b ,c".into()),
+        );
+        assert_eq!(cfg.room, "room1");
+        assert_eq!(cfg.token, "tok");
+        assert_eq!(cfg.relay_url, "ws://r");
+        assert_eq!(cfg.name, "node-x");
+        // Tags are split and trimmed.
+        assert_eq!(cfg.tags, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
 }
