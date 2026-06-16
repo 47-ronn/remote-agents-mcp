@@ -328,6 +328,15 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
                 vec![],
             ),
             make_tool(
+                "fleet_update_check",
+                "Recommend which idle fleet hosts should be updated. Returns the \
+                 connected, non-disabled agents that report a newer published \
+                 version (AgentInfo.update_available), so you can roll out \
+                 `npm i -g remote-agents@latest` across stale hosts.",
+                json!({}),
+                vec![],
+            ),
+            make_tool(
                 "fleet_exec",
                 "Execute a command on multiple agents at once (all, by tags, or by OS).",
                 json!({
@@ -479,6 +488,7 @@ impl ServerHandler for McpHandler {
         // Handle special multi-agent tools
         match tool_name.as_str() {
             "list_agents" => return self.handle_list_agents().await,
+            "fleet_update_check" => return self.handle_fleet_update_check().await,
             "fleet_exec" => return self.handle_fleet_exec(args).await,
             "fleet_read" => return self.handle_fleet_read(args).await,
             "fleet_write" => return self.handle_fleet_write(args).await,
@@ -619,6 +629,33 @@ impl McpHandler {
         let agents = relay.list_agents(room).await.map_err(exec_error)?;
         let text =
             serde_json::to_string_pretty(&agents).unwrap_or_else(|_| format!("{:?}", agents));
+        Ok(text_result(text))
+    }
+
+    /// Handle fleet_update_check tool: recommend idle hosts with a pending update.
+    async fn handle_fleet_update_check(&self) -> Result<CallToolResult, CallToolError> {
+        let relay = self
+            .relay
+            .as_ref()
+            .ok_or_else(|| exec_error("Relay not connected"))?;
+        let room = self
+            .room
+            .as_ref()
+            .ok_or_else(|| exec_error("Room not configured"))?;
+
+        let recs = relay.update_recommendations(room).await.map_err(exec_error)?;
+        let text = if recs.is_empty() {
+            "All idle fleet hosts are up to date.".to_string()
+        } else {
+            let listing = serde_json::to_string_pretty(&recs)
+                .unwrap_or_else(|_| format!("{:?}", recs));
+            format!(
+                "{} idle host(s) have a newer version available. Update each with \
+                 `npm i -g remote-agents@latest` (restarts the agent):\n{}",
+                recs.len(),
+                listing
+            )
+        };
         Ok(text_result(text))
     }
 
@@ -1203,11 +1240,19 @@ mod tests {
         assert!(!local.contains(&"fleet_exec".to_string()));
 
         let relay = names(true);
-        for t in ["list_agents", "fleet_exec", "mapreduce", "fleet_read", "fleet_write", "fleet_git"] {
+        for t in [
+            "list_agents",
+            "fleet_update_check",
+            "fleet_exec",
+            "mapreduce",
+            "fleet_read",
+            "fleet_write",
+            "fleet_git",
+        ] {
             assert!(relay.contains(&t.to_string()), "missing relay tool {t}");
         }
         // Enabling the relay only adds tools, never removes them.
-        assert_eq!(relay.len(), local.len() + 6);
+        assert_eq!(relay.len(), local.len() + 7);
     }
 
     // --- format_result ------------------------------------------------------
