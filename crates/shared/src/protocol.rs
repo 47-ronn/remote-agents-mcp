@@ -484,6 +484,7 @@ mod tests {
                 tags: vec!["web".to_string()],
                 platform: Default::default(),
                 autonomous: false,
+                accepts_commands: true,
                 connected_at: 1234567890,
                 session_id: None,
                 update_available: None,

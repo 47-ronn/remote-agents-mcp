@@ -842,6 +842,7 @@ mod tests {
             tags: vec![],
             platform: Default::default(),
             autonomous: false,
+            accepts_commands: true,
             connected_at: 0,
             session_id: session.map(String::from),
             update_available: None,

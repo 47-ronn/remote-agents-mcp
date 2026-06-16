@@ -23,6 +23,12 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
     let mode = state.mode().await;
     let sec = &state.config.security;
 
+    // Send-only nodes (--no-agent: prod controllers, browser dashboards) are
+    // visible peers that dispatch work but never run others' commands.
+    if !state.config.accepts_commands {
+        bail!("This node does not accept remote commands (--no-agent)");
+    }
+
     if mode == AgentMode::Disabled {
         bail!("Agent is disabled");
     }
@@ -109,6 +115,7 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 tags: state.config.tags.clone(),
                 platform: remote_agents_shared::PlatformInfo::detect(),
                 autonomous: state.config.autonomous.enabled,
+                accepts_commands: state.config.accepts_commands,
                 connected_at: 0,
                 session_id: None,
                 update_available: crate::config::update_available(),
@@ -307,6 +314,21 @@ mod tests {
             ))
             .to_string_lossy()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn no_agent_node_rejects_remote_commands() {
+        // A send-only peer (--no-agent) never executes others' commands, even in
+        // bypass mode and even for a side-effect-free command like GetInfo.
+        let config = Config {
+            accepts_commands: false,
+            ..Config::default()
+        };
+        let state = AgentState::new(config);
+        state.set_mode(AgentMode::Bypass).await;
+
+        let err = execute(&Command::GetInfo, &state).await.unwrap_err().to_string();
+        assert!(err.contains("--no-agent"), "got: {err}");
     }
 
     #[tokio::test]

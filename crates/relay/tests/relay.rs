@@ -75,6 +75,7 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
         tags: tags.iter().map(|s| s.to_string()).collect(),
         platform: Default::default(),
         autonomous: true,
+        accepts_commands: true,
         connected_at: 0,
         session_id: None,
         update_available: None,

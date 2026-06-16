@@ -39,6 +39,7 @@ fn mk_agent(id: &str, tags: Vec<String>) -> AgentSession {
             tags,
             platform: Default::default(),
             autonomous: false,
+            accepts_commands: true,
             connected_at: 0,
             session_id: None,
             update_available: None,

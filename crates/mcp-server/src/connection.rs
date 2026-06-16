@@ -454,6 +454,7 @@ fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> A
         tags: config.tags.clone(),
         platform: remote_agents_shared::PlatformInfo::detect(),
         autonomous: config.autonomous.enabled,
+        accepts_commands: config.accepts_commands,
         connected_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -611,6 +612,7 @@ mod tests {
             tags: vec![],
             platform: Default::default(),
             autonomous: false,
+            accepts_commands: true,
             connected_at: 0,
             session_id: None,
             update_available: None,

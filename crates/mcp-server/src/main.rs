@@ -43,6 +43,11 @@ enum Commands {
         /// Tags for this agent (comma-separated)
         #[arg(long)]
         tags: Option<String>,
+
+        /// Send-only peer: stay visible and dispatch work, but NEVER execute
+        /// commands from other peers (for prod controllers / browser dashboards).
+        #[arg(long)]
+        no_agent: bool,
     },
 
     /// Run as MCP stdio server (for Claude Desktop, opencode, etc.)
@@ -87,6 +92,10 @@ enum Commands {
         /// Tags for this node as an agent (comma-separated)
         #[arg(long)]
         tags: Option<String>,
+
+        /// Send-only peer: dispatch work but never execute others' commands.
+        #[arg(long)]
+        no_agent: bool,
     },
 
     /// Generate default config file
@@ -139,14 +148,15 @@ async fn main() -> Result<()> {
             relay,
             name,
             tags,
+            no_agent,
         } => {
-            run_agent(room, token, relay, name, tags).await?;
+            run_agent(room, token, relay, name, tags, no_agent).await?;
         }
         Commands::Mcp { name, room, token, relay } => {
             run_mcp(name, room, token, relay).await?;
         }
-        Commands::Hybrid { name, room, token, relay, tags } => {
-            run_hybrid(room, token, relay, name, tags).await?;
+        Commands::Hybrid { name, room, token, relay, tags, no_agent } => {
+            run_hybrid(room, token, relay, name, tags, no_agent).await?;
         }
         Commands::Init => {
             config::init_config()?;
@@ -187,6 +197,7 @@ fn build_config(
     relay: Option<String>,
     name: Option<String>,
     tags: Option<String>,
+    no_agent: bool,
 ) -> config::Config {
     let mut cfg = config::load_config().unwrap_or_default();
     config::apply_env(&mut cfg);
@@ -206,6 +217,10 @@ fn build_config(
     if let Some(tags) = tags {
         cfg.tags = tags.split(',').map(|s| s.trim().to_string()).collect();
     }
+    // --no-agent overrides to send-only; otherwise keep config/default (true).
+    if no_agent {
+        cfg.accepts_commands = false;
+    }
     cfg
 }
 
@@ -215,8 +230,9 @@ async fn run_agent(
     relay: Option<String>,
     name: Option<String>,
     tags: Option<String>,
+    no_agent: bool,
 ) -> Result<()> {
-    let cfg = build_config(room, token, relay, name, tags);
+    let cfg = build_config(room, token, relay, name, tags, no_agent);
 
     info!(
         "Starting agent '{}' connecting to room '{}' at {}",
@@ -238,8 +254,9 @@ async fn run_hybrid(
     relay: Option<String>,
     name: Option<String>,
     tags: Option<String>,
+    no_agent: bool,
 ) -> Result<()> {
-    let cfg = build_config(room, token, relay, name, tags);
+    let cfg = build_config(room, token, relay, name, tags, no_agent);
 
     info!(
         "Starting HYBRID node '{}' in room '{}' at {} (agent + MCP controller)",
@@ -268,7 +285,7 @@ async fn run_mcp(
     token: Option<String>,
     relay: Option<String>,
 ) -> Result<()> {
-    let cfg = build_config(room, token, relay, name, None);
+    let cfg = build_config(room, token, relay, name, None, false);
 
     // MCP mode with optional relay connection for remote agent control
     mcp_server::run_mcp_server(&cfg).await
@@ -309,6 +326,7 @@ mod tests {
             Some("ws://r".into()),
             Some("node-x".into()),
             Some("a, b ,c".into()),
+            false,
         );
         assert_eq!(cfg.room, "room1");
         assert_eq!(cfg.token, "tok");
@@ -316,5 +334,26 @@ mod tests {
         assert_eq!(cfg.name, "node-x");
         // Tags are split and trimmed.
         assert_eq!(cfg.tags, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // Default: a peer accepts commands.
+        assert!(cfg.accepts_commands);
+    }
+
+    #[test]
+    fn no_agent_flag_makes_node_send_only() {
+        let cfg = build_config(None, None, None, None, None, true);
+        assert!(!cfg.accepts_commands, "--no-agent must disable command execution");
+    }
+
+    #[test]
+    fn run_subcommand_parses_no_agent() {
+        let cli = Cli::try_parse_from(["remote-agent", "run", "--room", "gpu", "--no-agent"])
+            .expect("run --no-agent should parse");
+        match cli.command {
+            Commands::Run { no_agent, room, .. } => {
+                assert!(no_agent);
+                assert_eq!(room.as_deref(), Some("gpu"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 }

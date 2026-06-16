@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// serde default for boolean fields that default to `true`.
+fn default_true_bool() -> bool {
+    true
+}
+
 /// Agent operation mode - determines what operations are allowed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -144,6 +149,14 @@ pub struct AgentInfo {
     /// Whether this host can run autonomous AI tasks with its own credentials
     #[serde(default)]
     pub autonomous: bool,
+    /// Whether this peer executes commands sent by other peers. In the peer
+    /// model there is no controller/target role — every node is equal; this
+    /// capability is what `--no-agent` toggles. Send-only nodes (prod
+    /// controllers, browser dashboards) advertise `false`: visible and able to
+    /// dispatch work, but never running others' commands. Defaults to `true`
+    /// (wire-compat: nodes predating the field are full peers).
+    #[serde(default = "default_true_bool")]
+    pub accepts_commands: bool,
     /// Connection timestamp (Unix ms)
     pub connected_at: u64,
     /// Session ID for this connection (used for UDP signaling)
@@ -358,6 +371,24 @@ mod tests {
         assert!(!p.arch.is_empty());
         assert_eq!(p.family, std::env::consts::OS);
         assert_eq!(p.arch, std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn agent_info_accepts_commands_defaults_true_on_wire() {
+        // A node predating the capability field (or a full peer) is treated as
+        // accepting commands — defaults to true when absent.
+        let json = r#"{
+            "id":"a","name":"a","mode":"plan","os":"linux","arch":"x86_64",
+            "hostname":"h","tags":[],"connected_at":0
+        }"#;
+        let info: AgentInfo = serde_json::from_str(json).unwrap();
+        assert!(info.accepts_commands, "missing field must default to true");
+
+        // A send-only (--no-agent) peer round-trips as false.
+        let send_only = AgentInfo { accepts_commands: false, ..info.clone() };
+        let s = serde_json::to_string(&send_only).unwrap();
+        let back: AgentInfo = serde_json::from_str(&s).unwrap();
+        assert!(!back.accepts_commands);
     }
 
     #[test]

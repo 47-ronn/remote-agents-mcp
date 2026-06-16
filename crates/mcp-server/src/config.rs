@@ -32,6 +32,14 @@ pub struct Config {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// Whether this node executes commands sent by other peers. In the peer
+    /// model every node is equal; this capability (advertised in AgentInfo) is
+    /// what replaces the old controller/target role split. `--no-agent` sets it
+    /// false for send-only nodes (prod controllers, browser dashboards): the
+    /// node stays visible and can dispatch work, but never runs others' commands.
+    #[serde(default = "default_accepts_commands")]
+    pub accepts_commands: bool,
+
     /// Security settings
     #[serde(default)]
     pub security: SecurityConfig,
@@ -39,6 +47,10 @@ pub struct Config {
     /// Autonomous AI task execution settings
     #[serde(default)]
     pub autonomous: AutonomousConfig,
+}
+
+fn default_accepts_commands() -> bool {
+    true
 }
 
 /// Per-host autonomous AI runner configuration.
@@ -145,6 +157,7 @@ impl Default for Config {
             token: String::new(),
             relay_url: default_relay(),
             tags: Vec::new(),
+            accepts_commands: default_accepts_commands(),
             security: SecurityConfig::default(),
             autonomous: AutonomousConfig::default(),
         }

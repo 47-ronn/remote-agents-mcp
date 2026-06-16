@@ -1166,6 +1166,7 @@ mod tests {
                 tags: tags.iter().map(|s| s.to_string()).collect(),
                 platform: Default::default(),
                 autonomous: false,
+                accepts_commands: true,
                 connected_at: 0,
                 session_id: None,
                 update_available: None,
