@@ -1037,4 +1037,60 @@ mod tests {
         assert!(watched.read().await.contains_key("t3"), "watch must survive non-terminal status");
         assert!(rx.try_recv().is_err());
     }
+
+    // --- single-peer execution: a node also runs others' commands (step 2c) ---
+
+    /// A `HandlerShared` with a local executor, so it runs incoming commands.
+    fn shared_with_executor() -> (HandlerShared, mpsc::Receiver<ClientMessage>, Cipher) {
+        let (tx, rx) = mpsc::channel::<ClientMessage>(8);
+        let (sig_tx, _sig_rx) = mpsc::channel(4);
+        let cipher = Cipher::from_passphrase(WATCH_KEY);
+        let state = Arc::new(crate::state::AgentState::new(crate::config::Config::default()));
+        let shared = HandlerShared {
+            agents: Arc::new(RwLock::new(Vec::new())),
+            pending: Arc::new(RwLock::new(HashMap::new())),
+            cipher: cipher.clone(),
+            events: Arc::new(RwLock::new(HashMap::new())),
+            events_notify: Arc::new(Notify::new()),
+            watched: Arc::new(RwLock::new(HashMap::new())),
+            tx,
+            udp_transport: Arc::new(UdpTransport::new(cipher.clone(), sig_tx)),
+            executor_state: Some(state),
+        };
+        (shared, rx, cipher)
+    }
+
+    fn command_msg(cipher: &Cipher, request_id: &str) -> String {
+        let payload = Command::GetInfo.encrypt(cipher).unwrap();
+        serde_json::to_string(&ServerMessage::Command {
+            request_id: request_id.to_string(),
+            from_session: "peer".to_string(),
+            payload,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn incoming_command_executed_when_executor_present() {
+        let (shared, mut rx, cipher) = shared_with_executor();
+        handle_message(&command_msg(&cipher, "r1"), &shared).await.unwrap();
+
+        match rx.try_recv().expect("a result should be queued") {
+            ClientMessage::CommandResult { request_id, result } => {
+                assert_eq!(request_id, "r1");
+                let decrypted = CommandResult::decrypt(&result, &cipher).unwrap();
+                assert!(matches!(decrypted, CommandResult::Info { .. }));
+            }
+            other => panic!("expected CommandResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_command_ignored_without_executor() {
+        // A send-only node (no executor) silently drops incoming commands.
+        let (shared, mut rx, _watched, _events) = handler_shared();
+        let cipher = Cipher::from_passphrase(WATCH_KEY);
+        handle_message(&command_msg(&cipher, "r1"), &shared).await.unwrap();
+        assert!(rx.try_recv().is_err(), "no executor → no reply");
+    }
 }
