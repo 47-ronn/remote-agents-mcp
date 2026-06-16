@@ -976,6 +976,17 @@ fn format_result(result: &CommandResult) -> String {
             Some(e) => format!("reduce[{job_id}] failed: {e}"),
             None => format!("reduce[{job_id}] (success: {success})\n{output}"),
         },
+        CommandResult::SessionList { sessions, active } => {
+            format!(
+                "{} session(s), {} live:\n{}",
+                sessions.len(),
+                active.len(),
+                serde_json::to_string_pretty(sessions).unwrap_or_default()
+            )
+        }
+        CommandResult::SessionTranscript { messages } => {
+            serde_json::to_string_pretty(messages).unwrap_or_else(|_| format!("{:?}", messages))
+        }
     }
 }
 

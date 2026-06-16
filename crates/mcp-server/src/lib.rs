@@ -20,5 +20,6 @@ pub mod relay_controller;
 pub mod relay_udp;
 pub mod safety;
 pub mod scheduler;
+pub mod sessions;
 pub mod state;
 pub mod udp_transport;
