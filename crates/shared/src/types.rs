@@ -149,6 +149,11 @@ pub struct AgentInfo {
     /// Session ID for this connection (used for UDP signaling)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Newer published version available for this host, if any (e.g. "0.1.2").
+    /// Set when the launcher's npm-registry check found a release newer than the
+    /// running binary, so orchestrators can flag stale hosts in `list_agents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_available: Option<String>,
 }
 
 /// Lifecycle status of an autonomous task
@@ -353,6 +358,27 @@ mod tests {
         assert!(!p.arch.is_empty());
         assert_eq!(p.family, std::env::consts::OS);
         assert_eq!(p.arch, std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn agent_info_update_available_is_optional_on_wire() {
+        // Older agents (and up-to-date ones) omit the field entirely.
+        let json = r#"{
+            "id":"a","name":"a","mode":"plan","os":"linux","arch":"x86_64",
+            "hostname":"h","tags":[],"connected_at":0
+        }"#;
+        let info: AgentInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.update_available, None);
+        // None is skipped on serialize (keeps the common case small).
+        assert!(!serde_json::to_string(&info).unwrap().contains("update_available"));
+
+        // When set, it round-trips.
+        let mut withv = info.clone();
+        withv.update_available = Some("0.1.2".into());
+        let s = serde_json::to_string(&withv).unwrap();
+        assert!(s.contains("update_available"));
+        let back: AgentInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.update_available.as_deref(), Some("0.1.2"));
     }
 
     #[test]

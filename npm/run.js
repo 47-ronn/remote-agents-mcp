@@ -83,12 +83,56 @@ function fetchLatestVersion(doGet = httpGetJson, timeoutMs = 3000) {
     .catch(() => null);
 }
 
+// Platform data directory, mirroring Rust's `dirs::data_dir()` so the native
+// agent reads the same cache file: Linux XDG, macOS Application Support,
+// Windows Roaming AppData.
+function dataDir() {
+  if (process.platform === "win32") {
+    return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support");
+  }
+  return process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+}
+
+// Where the latest-known version is cached for the native agent to read and
+// surface as AgentInfo.update_available.
+function latestVersionPath() {
+  return path.join(dataDir(), "remote-agents", "latest-version");
+}
+
+// Best-effort write of the update-available cache for the native agent to read
+// (surfaced as AgentInfo.update_available). The launcher owns the comparison —
+// it knows the accurate INSTALLED version (the compiled-in Cargo version can lag
+// the npm release) — so it writes the newer version when an upgrade exists and
+// clears the file (empty) once up to date. Never throws. `writeFile`/`mkdir`
+// are injectable for tests.
+function cacheUpdateAvailable(
+  latest,
+  current = version,
+  file = latestVersionPath(),
+  writeFile = fs.writeFileSync,
+  mkdir = fs.mkdirSync
+) {
+  const body = latest && isNewer(latest, current) ? String(latest) : "";
+  try {
+    mkdir(path.dirname(file), { recursive: true });
+    writeFile(file, body);
+  } catch {
+    /* cache is best-effort; the notify-only log still fires */
+  }
+}
+
 // Fire-and-forget: log an upgrade notice for long-running modes. Never throws,
 // never blocks the agent. Disable with REMOTE_AGENTS_NO_UPDATE_CHECK=1.
 async function maybeNotifyUpdate(subcommand, fetchLatest = fetchLatestVersion) {
   if (process.env.REMOTE_AGENTS_NO_UPDATE_CHECK) return;
   if (!LONG_RUNNING.has(subcommand)) return;
   const latest = await fetchLatest();
+  // Cache the result so the native agent can surface it as
+  // AgentInfo.update_available (visible in list_agents).
+  cacheUpdateAvailable(latest);
   const notice = updateNotice(version, latest);
   if (notice) console.error(notice);
 }
@@ -145,4 +189,11 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { isNewer, updateNotice, fetchLatestVersion, maybeNotifyUpdate };
+module.exports = {
+  isNewer,
+  updateNotice,
+  fetchLatestVersion,
+  maybeNotifyUpdate,
+  cacheUpdateAvailable,
+  latestVersionPath,
+};

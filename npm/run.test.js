@@ -3,7 +3,14 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { isNewer, updateNotice, fetchLatestVersion, maybeNotifyUpdate } = require("./run.js");
+const {
+  isNewer,
+  updateNotice,
+  fetchLatestVersion,
+  maybeNotifyUpdate,
+  cacheUpdateAvailable,
+  latestVersionPath,
+} = require("./run.js");
 
 test("isNewer compares dotted versions", () => {
   assert.strictEqual(isNewer("0.1.1", "0.1.0"), true);
@@ -56,6 +63,46 @@ test("maybeNotifyUpdate checks the registry for long-running modes", async () =>
   };
   await maybeNotifyUpdate("run", fetchLatest);
   assert.strictEqual(called, true);
+});
+
+test("latestVersionPath ends in the shared cache location", () => {
+  const p = latestVersionPath();
+  assert.ok(p.endsWith(require("path").join("remote-agents", "latest-version")), p);
+});
+
+test("cacheUpdateAvailable writes the version when newer", () => {
+  let written = null;
+  let mkdirCalled = false;
+  const writeFile = (file, data) => {
+    written = { file, data };
+  };
+  const mkdir = () => {
+    mkdirCalled = true;
+  };
+  cacheUpdateAvailable("0.1.2", "0.1.0", "/tmp/x/latest-version", writeFile, mkdir);
+  assert.strictEqual(mkdirCalled, true);
+  assert.strictEqual(written.file, "/tmp/x/latest-version");
+  assert.strictEqual(written.data, "0.1.2");
+});
+
+test("cacheUpdateAvailable clears the file when up to date", () => {
+  // Same or older latest → write empty so a since-updated agent stops flagging.
+  for (const latest of ["0.1.0", "0.0.9", null]) {
+    let data = "unset";
+    cacheUpdateAvailable(latest, "0.1.0", "/tmp/x", (_f, d) => {
+      data = d;
+    });
+    assert.strictEqual(data, "", `latest=${latest} should clear the cache`);
+  }
+});
+
+test("cacheUpdateAvailable swallows write errors", () => {
+  // A failing fs must not throw (cache is best-effort).
+  assert.doesNotThrow(() =>
+    cacheUpdateAvailable("0.1.2", "0.1.0", "/tmp/x", () => {
+      throw new Error("EACCES");
+    })
+  );
 });
 
 test("maybeNotifyUpdate honors REMOTE_AGENTS_NO_UPDATE_CHECK", async () => {

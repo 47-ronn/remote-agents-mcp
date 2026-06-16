@@ -4,9 +4,38 @@
 
 use crate::relay_controller::{AgentOutcome, ConnectionPool};
 use anyhow::Result;
-use remote_agents_shared::{Command, CommandResult};
+use remote_agents_shared::{AgentInfo, AgentMode, Command, CommandResult};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// A fleet host that has a newer version available and is safe to update
+/// ("idle": connected and not `Disabled`). Surfaced so the orchestrator can
+/// recommend rolling the update out across the fleet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpdateRecommendation {
+    pub agent_id: String,
+    pub name: String,
+    /// The newer version published for this host (from `AgentInfo.update_available`).
+    pub latest_version: String,
+}
+
+/// From a room's agent list, pick the idle hosts that have an update available.
+/// Pure (no I/O) so the selection is unit-testable. "Idle" here means connected
+/// and not `Disabled` — AgentInfo carries no active-task busy flag, so updating
+/// is recommended on a host that isn't administratively blocked.
+fn update_recommendations(agents: &[AgentInfo]) -> Vec<UpdateRecommendation> {
+    agents
+        .iter()
+        .filter(|a| a.mode != AgentMode::Disabled)
+        .filter_map(|a| {
+            a.update_available.as_ref().map(|latest| UpdateRecommendation {
+                agent_id: a.id.clone(),
+                name: a.name.clone(),
+                latest_version: latest.clone(),
+            })
+        })
+        .collect()
+}
 
 /// Build the wire `Command` for a fleet git operation. Pure (no I/O) so the
 /// op-name → command mapping can be unit-tested without a live relay.
@@ -94,6 +123,17 @@ impl McpServer {
     ) -> Result<Vec<remote_agents_shared::AgentInfo>> {
         let pool = self.connections.read().await;
         pool.list_agents(room).await
+    }
+
+    /// Recommend which idle hosts in a room should be updated (those reporting a
+    /// newer published version). Lets the orchestrator roll an update across the
+    /// fleet instead of chasing per-host logs.
+    pub async fn update_recommendations(
+        &self,
+        room: &str,
+    ) -> Result<Vec<UpdateRecommendation>> {
+        let agents = self.list_agents(room).await?;
+        Ok(update_recommendations(&agents))
     }
 
     /// Execute a command on an agent
@@ -539,6 +579,49 @@ impl Default for McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(id: &str, mode: AgentMode, update: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            mode,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            hostname: "h".into(),
+            tags: vec![],
+            platform: Default::default(),
+            autonomous: false,
+            connected_at: 0,
+            session_id: None,
+            update_available: update.map(String::from),
+        }
+    }
+
+    #[test]
+    fn update_recommendations_flags_idle_hosts_with_updates() {
+        let agents = vec![
+            agent("a", AgentMode::Plan, Some("0.1.2")),   // eligible
+            agent("b", AgentMode::Edit, None),            // up to date
+            agent("c", AgentMode::Disabled, Some("0.1.2")), // has update but not idle
+            agent("d", AgentMode::Bypass, Some("0.2.0")), // eligible
+        ];
+        let recs = update_recommendations(&agents);
+        assert_eq!(recs.len(), 2, "only idle hosts with an update: {recs:?}");
+        assert_eq!(recs[0].agent_id, "a");
+        assert_eq!(recs[0].name, "name-a");
+        assert_eq!(recs[0].latest_version, "0.1.2");
+        assert_eq!(recs[1].agent_id, "d");
+        assert_eq!(recs[1].latest_version, "0.2.0");
+    }
+
+    #[test]
+    fn update_recommendations_empty_when_all_current() {
+        let agents = vec![
+            agent("a", AgentMode::Plan, None),
+            agent("b", AgentMode::Edit, None),
+        ];
+        assert!(update_recommendations(&agents).is_empty());
+    }
 
     #[test]
     fn build_git_command_maps_each_op() {

@@ -460,6 +460,8 @@ fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> A
             .unwrap_or(0),
         // session_id is set by the relay, not the agent
         session_id: None,
+        // Surfaced from the launcher's cached npm-registry check.
+        update_available: crate::config::update_available(),
     }
 }
 
@@ -611,6 +613,7 @@ mod tests {
             autonomous: false,
             connected_at: 0,
             session_id: None,
+            update_available: None,
         };
         peer_a.platform.distro = Some("Ubuntu 22.04".into());
 

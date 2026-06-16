@@ -322,6 +322,35 @@ fn id_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("agent-id"))
 }
 
+/// Path to the cache file the npm launcher (`run.js`) writes when a newer
+/// release is published. The launcher does the version comparison (it knows the
+/// accurate *installed* package version — the compiled-in Cargo version can lag
+/// the npm release), writing the newer version here and clearing it (empty)
+/// once up to date. So this side only needs to read, never compare.
+fn latest_version_path() -> PathBuf {
+    dirs::data_dir()
+        .map(|p| p.join("remote-agents").join("latest-version"))
+        .unwrap_or_else(|| PathBuf::from("latest-version"))
+}
+
+/// Interpret the cache file body: a non-empty version string means an upgrade
+/// is available; empty/whitespace/absent means up to date. Pure, so it is
+/// unit-testable without the cache file.
+fn update_available_from(cache_body: Option<&str>) -> Option<String> {
+    let v = cache_body?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// The newer published version available for this host, if any (from the
+/// launcher-written cache; see [`latest_version_path`]).
+pub fn update_available() -> Option<String> {
+    update_available_from(fs::read_to_string(latest_version_path()).ok().as_deref())
+}
+
 /// A stable agent id that survives restarts. Reads the id file if present and
 /// non-empty; otherwise mints a new uuid, persists it, and returns it.
 pub fn persistent_id() -> String {
@@ -543,6 +572,18 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), id);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_available_from_reads_cache_body() {
+        // A non-empty cached version means an upgrade is available.
+        assert_eq!(update_available_from(Some("0.1.2")), Some("0.1.2".to_string()));
+        // Whitespace is trimmed.
+        assert_eq!(update_available_from(Some(" 0.2.0 \n")), Some("0.2.0".to_string()));
+        // Empty / whitespace-only / absent cache → up to date.
+        assert_eq!(update_available_from(Some("")), None);
+        assert_eq!(update_available_from(Some("   \n")), None);
+        assert_eq!(update_available_from(None), None);
     }
 
     #[test]

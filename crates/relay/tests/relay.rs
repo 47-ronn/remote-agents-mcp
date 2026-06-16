@@ -77,6 +77,7 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
         autonomous: true,
         connected_at: 0,
         session_id: None,
+        update_available: None,
     }
 }
 

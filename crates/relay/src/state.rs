@@ -94,6 +94,7 @@ mod tests {
             autonomous: false,
             connected_at: 0,
             session_id: None,
+            update_available: None,
         }
     }
 

@@ -111,6 +111,7 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 autonomous: state.config.autonomous.enabled,
                 connected_at: 0,
                 session_id: None,
+                update_available: crate::config::update_available(),
             };
 
             Ok(CommandResult::Info { info })

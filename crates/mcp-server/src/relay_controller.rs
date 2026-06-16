@@ -844,6 +844,7 @@ mod tests {
             autonomous: false,
             connected_at: 0,
             session_id: session.map(String::from),
+            update_available: None,
         }
     }
 
