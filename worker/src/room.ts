@@ -18,6 +18,11 @@ interface Attachment {
 }
 
 export class Room implements DurableObject {
+  // In-flight commands: request_id → originating session id, so a result routes
+  // back to the peer that issued it (peer-model) instead of all controllers.
+  // In-memory; if lost to hibernation, routeToOrigin falls back to broadcast.
+  private pending = new Map<string, string>();
+
   constructor(
     private state: DurableObjectState,
     private env: unknown
@@ -110,6 +115,8 @@ export class Room implements DurableObject {
           });
           return;
         }
+        // Remember who asked, so the result(s) route back to them only.
+        this.pending.set(msg.request_id, att.sessionId || '');
         for (const [sock] of targets) {
           this.send(sock, {
             type: 'command',
@@ -123,7 +130,7 @@ export class Room implements DurableObject {
 
       case 'command_result':
         if (att.role !== 'agent') return this.sendError(ws, 'Not authorized');
-        this.broadcastToMcp({
+        this.routeToOrigin(msg.request_id, {
           type: 'command_result',
           request_id: msg.request_id,
           agent_id: att.agentInfo?.id || 'unknown',
@@ -133,7 +140,7 @@ export class Room implements DurableObject {
 
       case 'command_error':
         if (att.role !== 'agent') return this.sendError(ws, 'Not authorized');
-        this.broadcastToMcp({
+        this.routeToOrigin(msg.request_id, {
           type: 'command_error',
           request_id: msg.request_id,
           agent_id: att.agentInfo?.id || 'unknown',
@@ -276,6 +283,26 @@ export class Room implements DurableObject {
         att.agentInfo.id
       );
     }
+    // Drop any in-flight requests this session initiated.
+    if (att.sessionId) {
+      for (const [rid, sid] of this.pending) {
+        if (sid === att.sessionId) this.pending.delete(rid);
+      }
+    }
+  }
+
+  /** Route a result/error back to the initiating session; fall back to
+   * broadcasting to controllers if the origin is unknown or has disconnected. */
+  private routeToOrigin(requestId: string, msg: ServerMessage) {
+    const origin = this.pending.get(requestId);
+    if (origin) {
+      const sock = this.findSocketBySession(origin);
+      if (sock) {
+        this.send(sock, msg);
+        return;
+      }
+    }
+    this.broadcastToMcp(msg);
   }
 
   // --- helpers (state derived from live sockets, hibernation-safe) ---------

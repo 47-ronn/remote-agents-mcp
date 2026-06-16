@@ -64,6 +64,25 @@ async fn recv(ws: &mut Ws) -> ServerMessage {
     }
 }
 
+/// Like `recv` but returns `None` if no (non-noise) message arrives within `ms`.
+/// Used to assert a peer does NOT receive something.
+async fn try_recv(ws: &mut Ws, ms: u64) -> Option<ServerMessage> {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(ms), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let msg = ServerMessage::from_json(&t).unwrap();
+                if matches!(msg, ServerMessage::YourEndpoint { .. }) {
+                    continue;
+                }
+                return Some(msg);
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(_) => return None,  // connection closed
+            Err(_) => return None, // timeout → nothing arrived
+        }
+    }
+}
+
 fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
@@ -402,4 +421,62 @@ async fn udp_offer_routes_to_target_agent_by_session() {
         }
         other => panic!("expected udp_offer at b, got {:?}", other),
     }
+}
+
+/// Peer-model routing: a command result returns ONLY to the peer that issued the
+/// command, not to every controller in the room (iter74).
+#[tokio::test]
+async fn result_routes_only_to_requesting_mcp() {
+    let port = start_relay().await;
+
+    // An executing agent.
+    let mut agent = connect(port, "dev").await;
+    auth(&mut agent, ClientRole::Agent, Some(agent_info("a1", &[]))).await;
+    match recv(&mut agent).await {
+        ServerMessage::AgentList { .. } => {}
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+
+    // Two controllers in the same room.
+    let mut mcp1 = connect(port, "dev").await;
+    auth(&mut mcp1, ClientRole::Mcp, None).await;
+    let mut mcp2 = connect(port, "dev").await;
+    auth(&mut mcp2, ClientRole::Mcp, None).await;
+
+    // mcp1 issues the command.
+    send(
+        &mut mcp1,
+        &ClientMessage::Command {
+            request_id: "req-x".into(),
+            target: Target::Agent { id: "a1".into() },
+            payload: "P".into(),
+        },
+    )
+    .await;
+    match recv(&mut agent).await {
+        ServerMessage::Command { request_id, .. } => assert_eq!(request_id, "req-x"),
+        other => panic!("expected Command at agent, got {:?}", other),
+    }
+    send(
+        &mut agent,
+        &ClientMessage::CommandResult {
+            request_id: "req-x".into(),
+            result: "R".into(),
+        },
+    )
+    .await;
+
+    // The initiator (mcp1) receives the result...
+    match recv(&mut mcp1).await {
+        ServerMessage::CommandResult { request_id, result, .. } => {
+            assert_eq!(request_id, "req-x");
+            assert_eq!(result, "R");
+        }
+        other => panic!("expected CommandResult at mcp1, got {:?}", other),
+    }
+    // ...the bystander controller (mcp2) does NOT.
+    assert!(
+        try_recv(&mut mcp2, 400).await.is_none(),
+        "result must not leak to other controllers"
+    );
 }

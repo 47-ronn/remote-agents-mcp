@@ -34,6 +34,10 @@ pub struct McpSession {
 pub struct Room {
     pub agents: DashMap<String, AgentSession>,
     pub mcp: DashMap<String, McpSession>,
+    /// In-flight commands: `request_id → originating session id`. Lets a command
+    /// result route back to the specific peer that issued it (peer-model: a room
+    /// has many potential initiators), instead of broadcasting to all clients.
+    pub pending: DashMap<String, String>,
 }
 
 impl Room {

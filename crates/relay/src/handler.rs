@@ -191,6 +191,9 @@ pub async fn handle_socket(
             room.mcp.remove(&session_id);
         }
     }
+    // Drop any in-flight requests this session initiated; their results would
+    // have nowhere to go now.
+    room.pending.retain(|_, origin| origin != &session_id);
     state.gc_room(&room_name);
 }
 
@@ -266,6 +269,9 @@ fn handle_client_msg(
                     },
                 );
             } else {
+                // Remember who asked, so the result(s) route back to them only.
+                room.pending
+                    .insert(request_id.clone(), session_id.to_string());
                 for (_, tx) in targets {
                     send_raw(
                         &tx,
@@ -284,14 +290,12 @@ fn handle_client_msg(
                 return ControlFlow::Continue(());
             }
             let agent_id = agent_id_of(agent_info);
-            broadcast_mcp(
-                room,
-                &ServerMessage::CommandResult {
-                    request_id,
-                    agent_id,
-                    result,
-                },
-            );
+            let msg = ServerMessage::CommandResult {
+                request_id: request_id.clone(),
+                agent_id,
+                result,
+            };
+            route_to_origin(room, &request_id, &msg);
         }
 
         ClientMessage::CommandError { request_id, error } => {
@@ -299,14 +303,12 @@ fn handle_client_msg(
                 return ControlFlow::Continue(());
             }
             let agent_id = agent_id_of(agent_info);
-            broadcast_mcp(
-                room,
-                &ServerMessage::CommandError {
-                    request_id,
-                    agent_id,
-                    error,
-                },
-            );
+            let msg = ServerMessage::CommandError {
+                request_id: request_id.clone(),
+                agent_id,
+                error,
+            };
+            route_to_origin(room, &request_id, &msg);
         }
 
         ClientMessage::Notify { event } => {
@@ -363,6 +365,20 @@ fn handle_client_msg(
 
 fn agent_id_of(info: &Option<Box<AgentInfo>>) -> String {
     info.as_ref().map(|a| a.id.clone()).unwrap_or_default()
+}
+
+/// Route a command result/error back to the session that issued the request.
+/// Falls back to broadcasting to controllers if the origin is unknown (e.g. a
+/// late/duplicate reply) or has since disconnected. The pending entry is kept
+/// (not removed) so broadcasts — one request_id, many agent replies — all route.
+fn route_to_origin(room: &Room, request_id: &str, msg: &ServerMessage) {
+    if let Some(origin) = room.pending.get(request_id).map(|e| e.value().clone()) {
+        if let Some(tx) = crate::routing::find_session_tx(room, &origin) {
+            send_raw(&tx, msg);
+            return;
+        }
+    }
+    broadcast_mcp(room, msg);
 }
 
 /// Non-blocking send to one connection. A full queue means a slow/stuck
