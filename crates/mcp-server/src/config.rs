@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use remote_agents_shared::AgentMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -276,13 +276,73 @@ pub fn load_config() -> Result<Config> {
     let path = config_path();
 
     if !path.exists() {
-        return Ok(Config::default());
+        // No config file: still give the agent a STABLE identity across restarts
+        // (otherwise fleet targeting / task reminders keyed by id break every
+        // time the process restarts, since the serde default mints a new uuid).
+        return Ok(Config {
+            id: persistent_id(),
+            ..Config::default()
+        });
     }
 
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config from {:?}", path))?;
 
-    toml::from_str(&content).with_context(|| "Failed to parse config")
+    let mut cfg: Config = toml::from_str(&content).with_context(|| "Failed to parse config")?;
+
+    // If the file doesn't pin an explicit id, the deserialized id is a fresh
+    // (volatile) uuid from the serde default. Replace it with the persisted one
+    // so the agent keeps the same identity across restarts. An explicit id in
+    // config.toml always wins.
+    if !toml_has_explicit_id(&content) {
+        cfg.id = persistent_id();
+    }
+
+    Ok(cfg)
+}
+
+/// Whether `content` (a config.toml body) sets a non-empty top-level `id`.
+/// Used to decide if the persisted stable id should fill in instead.
+fn toml_has_explicit_id(content: &str) -> bool {
+    content
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|v| {
+            v.get("id")
+                .and_then(|id| id.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Path to the persisted stable agent id.
+fn id_path() -> PathBuf {
+    dirs::data_dir()
+        .map(|p| p.join("remote-agents").join("agent-id"))
+        .unwrap_or_else(|| PathBuf::from("agent-id"))
+}
+
+/// A stable agent id that survives restarts. Reads the id file if present and
+/// non-empty; otherwise mints a new uuid, persists it, and returns it.
+pub fn persistent_id() -> String {
+    persistent_id_at(&id_path())
+}
+
+/// Testable core of [`persistent_id`], parameterised on the storage path.
+fn persistent_id_at(path: &Path) -> String {
+    if let Ok(existing) = fs::read_to_string(path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Best-effort persist; a write failure just means a new id next restart.
+    let _ = fs::write(path, &id);
+    id
 }
 
 /// Initialize default config file
@@ -443,5 +503,58 @@ mod tests {
 
         assert_eq!(config.relay_url, parsed.relay_url);
         assert_eq!(config.security.mode, parsed.security.mode);
+    }
+
+    #[test]
+    fn persistent_id_generates_then_reuses() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "agent-id-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = fs::remove_file(&path);
+
+        // First call mints + persists an id.
+        let first = persistent_id_at(&path);
+        assert!(!first.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), first);
+
+        // Subsequent calls return the SAME id (stable across restarts).
+        assert_eq!(persistent_id_at(&path), first);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistent_id_regenerates_on_empty_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "agent-id-empty-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        // A blank/whitespace file must not be treated as a valid id.
+        fs::write(&path, "  \n").unwrap();
+        let id = persistent_id_at(&path);
+        assert!(!id.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), id);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn toml_explicit_id_detection() {
+        assert!(toml_has_explicit_id("id = \"abc\"\nname = \"x\"\n"));
+        // Absent id → not explicit (persisted id should fill in).
+        assert!(!toml_has_explicit_id("name = \"x\"\n"));
+        // Empty id → not explicit.
+        assert!(!toml_has_explicit_id("id = \"\"\n"));
+        // Whitespace-only id → not explicit.
+        assert!(!toml_has_explicit_id("id = \"   \"\n"));
+        // Malformed toml → safely false.
+        assert!(!toml_has_explicit_id("this is not toml ::: ="));
     }
 }
