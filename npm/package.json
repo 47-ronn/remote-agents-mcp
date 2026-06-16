@@ -1,6 +1,7 @@
 {
   "name": "remote-agents",
   "version": "0.0.0",
+  "mcpName": "io.github.47-ronn/remote-agents",
   "description": "Unified MCP server for controlling fleets of remote machines through AI agents (Claude, opencode)",
   "keywords": ["mcp", "model-context-protocol", "remote", "agent", "fleet", "ssh", "devops"],
   "homepage": "https://github.com/47-ronn/tunshell_mcp_agents#readme",
