@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use remote_agent::{config, daemon, mcp_server};
+use remote_agent::{config, daemon, install_mcp, mcp_server};
 use remote_agent::connection;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -130,6 +130,43 @@ enum Commands {
 
     /// Remove the installed background service
     Uninstall,
+
+    /// Register this binary as an MCP server in a popular AI agent's config
+    /// (Claude Desktop/Code, Cursor, Cline, Roo, Kilo, Windsurf, Zed, opencode,
+    /// Continue, Goose). Connection flags are baked into the server's args.
+    InstallMcp {
+        /// Target client id (omit to list supported clients)
+        #[arg(short, long)]
+        client: Option<String>,
+
+        /// Name to register the server under in the client config
+        #[arg(long, default_value = "remote-agents")]
+        server_name: String,
+
+        /// Room name to bake into the MCP server command
+        #[arg(short, long)]
+        room: Option<String>,
+
+        /// Authentication token to bake into the MCP server command
+        #[arg(short, long)]
+        token: Option<String>,
+
+        /// Relay server URL
+        #[arg(long)]
+        relay: Option<String>,
+
+        /// Agent name for this node as a peer
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Tags for this node as a peer (comma-separated)
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Register as a send-only controller (never executes others' commands)
+        #[arg(long)]
+        no_agent: bool,
+    },
 }
 
 #[tokio::main]
@@ -194,6 +231,42 @@ async fn main() -> Result<()> {
         }
         Commands::Uninstall => {
             daemon::uninstall()?;
+        }
+        Commands::InstallMcp {
+            client,
+            server_name,
+            room,
+            token,
+            relay,
+            name,
+            tags,
+            no_agent,
+        } => {
+            let Some(client) = client else {
+                println!("Supported clients:\n{}", install_mcp::supported_clients());
+                return Ok(());
+            };
+            // Build the MCP server's argv: `mcp` plus the connection flags, in
+            // the same form the README documents for a hand-written config.
+            let mut args = vec!["mcp".to_string()];
+            let mut push = |flag: &str, val: Option<String>| {
+                if let Some(v) = val {
+                    args.push(flag.to_string());
+                    args.push(v);
+                }
+            };
+            push("--relay", relay);
+            push("--room", room);
+            push("--token", token);
+            push("--name", name);
+            push("--tags", tags);
+            if no_agent {
+                args.push("--no-agent".to_string());
+            }
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "remote-agents".to_string());
+            install_mcp::install_mcp(&client, &server_name, &exe, &args)?;
         }
     }
 

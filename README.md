@@ -200,6 +200,25 @@ default**, so you can instead supply them via `env` in the MCP config:
 Without any relay/room/token the server runs locally only (no remote agent
 control); nothing points at a hosted endpoint by default.
 
+### One-command client registration
+
+Instead of hand-editing each agent's config, let the binary write it. The
+connection flags are baked into the registered server's args:
+
+```bash
+remote-agents install-mcp --client cursor \
+  --relay wss://<your-relay-host> --room myroom --token <secret>
+# ✓ Registered MCP server 'remote-agents' for Cursor (created ~/.cursor/mcp.json)
+
+remote-agents install-mcp            # no --client: list supported clients
+```
+
+Supported: `claude-desktop`, `claude-code`, `cursor`, `cline`, `roo`, `kilo`,
+`windsurf`, `zed`, `opencode` (config merged in place, preserving any servers
+you already have) and `continue`, `goose` (YAML — a ready-to-paste snippet is
+printed). Add `--server-name`, `--name`, `--tags`, or `--no-agent` to customize
+the registered entry.
+
 ## MCP tools
 
 | Tool | Description |
