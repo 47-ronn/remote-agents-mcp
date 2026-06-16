@@ -74,14 +74,41 @@ cargo install --path crates/mcp-server   # → ~/.cargo/bin/remote-agent
 Prebuilt binaries for macOS / Linux / Windows are also attached to each GitHub
 release.
 
+## Running: one binary, two ways
+
+`remote-agents` is **one binary** that behaves the same whether you launch it
+directly with flags or an AI host (opencode / Claude) starts it as an MCP
+server. Connection settings resolve identically in both cases:
+**CLI flag > `REMOTE_AGENTS_*` env var > `config.toml` > default**.
+
+It is a flat **peer network** — there are no controller/agent roles. Every node
+joins a relay room as an equal peer: visible to all, able to dispatch work, and
+(unless `--no-agent`) able to execute commands from others.
+
+| Mode | Command | The node… |
+|------|---------|-----------|
+| `run` | `remote-agents run …` | is a headless peer (executes + dispatches), no local AI |
+| `mcp` | `remote-agents mcp …` | exposes an MCP server for a local AI; joins as a **send-only** peer (visible, dispatches, never executes) |
+| `hybrid` | `remote-agents hybrid …` | both: local AI **and** a full executing peer |
+
+Common flags: `--relay <wss://host>` `--room <name>` `--token <secret>`
+`--name <id>` `--tags a,b` and `--no-agent` (send-only: stay visible and
+dispatch work but never run others' commands — for prod controllers / dashboards).
+
 ## Quick start
 
-### 1. Run an agent on a remote host
+### 1. Run an agent on a remote host (with flags)
 
 ```bash
-remote-agent run --relay wss://<your-relay-host> --room dev --token <secret>
-# install as a user service (systemd / launchd) instead:
-remote-agent install --room dev --token <secret> --relay wss://<your-relay-host>
+# Install once (downloads the prebuilt binary for your platform):
+npm install -g remote-agents
+
+# Run as a peer agent:
+remote-agents run --relay wss://<your-relay-host> --room dev --token <secret> \
+  --name web-1 --tags backend
+
+# ...or install it as an auto-starting user service (systemd / launchd):
+remote-agents install --room dev --token <secret> --relay wss://<your-relay-host>
 ```
 
 ### 2. Choose a relay
@@ -102,15 +129,17 @@ CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
 # → wss://<your-worker-subdomain>.workers.dev
 ```
 
-### 3. Wire up the MCP server (Claude Desktop / opencode)
+### 3. Install as an MCP server for Claude Desktop / opencode
 
-The MCP server is the same `remote-agent` binary in `mcp` mode (stdio):
+After `npm install -g remote-agents`, point your AI host at the same binary in
+`mcp` mode (stdio). Use `hybrid` instead of `mcp` if you also want this machine
+to be a fully controllable peer:
 
 ```json
 {
   "mcpServers": {
     "remote-agents": {
-      "command": "/path/to/remote-agent",
+      "command": "remote-agents",
       "args": [
         "mcp",
         "--relay", "wss://<your-relay-host>",
@@ -122,6 +151,9 @@ The MCP server is the same `remote-agent` binary in `mcp` mode (stdio):
 }
 ```
 
+(opencode uses the same shape under its own `mcp` config key — see
+`~/.config/opencode/opencode.json`.)
+
 Connection settings are resolved as **CLI flag > env var > `config.toml` >
 default**, so you can instead supply them via `env` in the MCP config:
 
@@ -129,7 +161,7 @@ default**, so you can instead supply them via `env` in the MCP config:
 {
   "mcpServers": {
     "remote-agents": {
-      "command": "/path/to/remote-agent",
+      "command": "remote-agents",
       "args": ["mcp"],
       "env": {
         "REMOTE_AGENTS_RELAY": "wss://<your-relay-host>",
