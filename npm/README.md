@@ -38,6 +38,22 @@ Supported platforms: linux x64/arm64, macOS x64/arm64, windows x64.
 `install`, …). See the [project README](https://github.com/47-ronn/tunshell_mcp_agents#readme)
 for the full documentation.
 
+## One-command client registration
+
+Skip hand-editing config files — register `remote-agents` as an MCP server in
+your agent directly. Connection flags are baked into the entry:
+
+```bash
+remote-agents install-mcp --client cursor \
+  --relay wss://<your-relay-host> --room myroom --token <secret>
+
+remote-agents install-mcp            # no --client: list supported clients
+```
+
+Supported: `claude-desktop`, `claude-code`, `cursor`, `cline`, `roo`, `kilo`,
+`windsurf`, `zed`, `opencode` (config merged in place, preserving existing
+servers) and `continue`, `goose` (YAML — a paste-able snippet is printed).
+
 ## Update checks
 
 When started in a long-running mode (`run` / `mcp` / `hybrid`), the launcher does
