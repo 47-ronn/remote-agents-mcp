@@ -19,9 +19,11 @@ fn ensure_crypto_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
+use futures::stream::{SplitSink, SplitStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 /// Overall backstop for collecting replies to a command.
@@ -29,6 +31,38 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// For broadcasts: once at least one reply has arrived, stop waiting after this
 /// much idle time with no new reply (bounds latency if the agent count is stale).
 const FLEET_IDLE_GAP: Duration = Duration::from_secs(3);
+/// Controller reconnect backoff bounds (mirrors the agent-side connection loop).
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsWrite = SplitSink<WsStream, Message>;
+type WsRead = SplitStream<WsStream>;
+
+/// Dial the relay and authenticate, returning the split halves + session id.
+/// Returns `None` on any failure (the supervisor loop retries with backoff).
+async fn redial(
+    ws_url: &str,
+    room: &str,
+    token: &str,
+    agent_info: Option<Box<AgentInfo>>,
+) -> Option<(WsWrite, WsRead, String)> {
+    let (ws, _) = connect_async(ws_url).await.ok()?;
+    let (mut write, mut read) = ws.split();
+    let auth = ClientMessage::Auth {
+        room: room.to_string(),
+        token: token.to_string(),
+        agent_info,
+    };
+    write.send(Message::Text(auth.to_json().ok()?)).await.ok()?;
+    let resp = timeout(Duration::from_secs(10), read.next()).await.ok()??.ok()?;
+    if let Message::Text(t) = resp {
+        if let Ok(ServerMessage::AuthOk { session_id }) = ServerMessage::from_json(&t) {
+            return Some((write, read, session_id));
+        }
+    }
+    None
+}
 
 /// One reply from one agent for a request: Ok(result) or Err(error string).
 type AgentReply = (String, Result<CommandResult, String>);
@@ -139,6 +173,9 @@ impl ConnectionPool {
         let (udp_signal_tx, mut udp_signal_rx) = mpsc::channel::<SignalMessage>(32);
         let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx));
 
+        // Keep a copy of our identity to re-send on every reconnect.
+        let agent_info_redial = agent_info.clone();
+
         // Send auth — peer model: we join as a peer carrying our agent_info.
         let auth_msg = ClientMessage::Auth {
             room: room.to_string(),
@@ -188,6 +225,10 @@ impl ConnectionPool {
         let udp_transport_clone = udp_transport.clone();
 
         let executor_clone = executor_state.clone();
+        let ws_url_task = ws_url.clone();
+        let room_task = room.to_string();
+        let token_task = token.to_string();
+        let udp_for_session = udp_transport.clone();
         tokio::spawn(async move {
             let shared = HandlerShared {
                 agents: agents_clone,
@@ -200,54 +241,88 @@ impl ConnectionPool {
                 udp_transport: udp_transport_clone,
                 executor_state: executor_clone,
             };
+
+            // The first connection is handed in; thereafter the supervisor loop
+            // re-dials with exponential backoff so the controller survives relay
+            // restarts (like the agent-side connection::run). The mpsc channels
+            // and shared maps persist across reconnects, so send_command keeps
+            // working (messages queue while offline, flush on reconnect).
+            let mut current = Some((write, read));
+            let mut backoff = RECONNECT_MIN;
             loop {
-                tokio::select! {
-                    // Incoming messages
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                if let Err(e) = handle_message(&text, &shared).await {
-                                    error!("Error handling message: {}", e);
-                                }
+                let (mut write, mut read) = match current.take() {
+                    Some(c) => c,
+                    None => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(RECONNECT_MAX);
+                        match redial(
+                            &ws_url_task,
+                            &room_task,
+                            &token_task,
+                            agent_info_redial.clone(),
+                        )
+                        .await
+                        {
+                            Some((w, r, session)) => {
+                                info!("Controller reconnected to room '{}'", room_task);
+                                udp_for_session.set_session_id(session).await;
+                                let _ = shared.tx.send(ClientMessage::ListAgents).await;
+                                backoff = RECONNECT_MIN;
+                                (w, r)
                             }
-                            Some(Ok(Message::Ping(data))) => {
-                                let _ = write.send(Message::Pong(data)).await;
+                            None => {
+                                warn!("Controller reconnect to '{}' failed; retrying", room_task);
+                                continue;
                             }
-                            Some(Ok(Message::Close(_))) | None => {
-                                info!("Connection closed");
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            _ => {}
                         }
                     }
+                };
 
-                    // Outgoing messages
-                    msg = rx.recv() => {
-                        if let Some(msg) = msg {
-                            if let Ok(json) = msg.to_json() {
-                                if let Err(e) = write.send(Message::Text(json)).await {
-                                    error!("Failed to send message: {}", e);
+                // Run until the link drops, then fall through to reconnect.
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Err(e) = handle_message(&text, &shared).await {
+                                        error!("Error handling message: {}", e);
+                                    }
+                                }
+                                Some(Ok(Message::Ping(data))) => {
+                                    let _ = write.send(Message::Pong(data)).await;
+                                }
+                                Some(Ok(Message::Close(_))) | None => {
+                                    info!("Controller connection closed");
                                     break;
                                 }
+                                Some(Err(e)) => {
+                                    error!("WebSocket error: {}", e);
+                                    break;
+                                }
+                                _ => {}
                             }
                         }
-                    }
-
-                    // UDP signaling messages to relay
-                    signal = udp_signal_rx.recv() => {
-                        if let Some(signal) = signal {
-                            let msg = match signal {
-                                SignalMessage::Offer(offer) => ClientMessage::UdpOffer(offer),
-                                SignalMessage::Answer(answer) => ClientMessage::UdpAnswer(answer),
-                                SignalMessage::Result(result) => ClientMessage::UdpResult(result),
-                            };
-                            if let Ok(json) = msg.to_json() {
-                                if let Err(e) = write.send(Message::Text(json)).await {
-                                    error!("Failed to send UDP signal: {}", e);
+                        msg = rx.recv() => {
+                            if let Some(msg) = msg {
+                                if let Ok(json) = msg.to_json() {
+                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                        error!("Failed to send message: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        signal = udp_signal_rx.recv() => {
+                            if let Some(signal) = signal {
+                                let msg = match signal {
+                                    SignalMessage::Offer(offer) => ClientMessage::UdpOffer(offer),
+                                    SignalMessage::Answer(answer) => ClientMessage::UdpAnswer(answer),
+                                    SignalMessage::Result(result) => ClientMessage::UdpResult(result),
+                                };
+                                if let Ok(json) = msg.to_json() {
+                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                        error!("Failed to send UDP signal: {}", e);
+                                    }
                                 }
                             }
                         }
