@@ -118,3 +118,49 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+
+  # ---------------------------------------------------------------------------
+  # Publish server.json to the official MCP Registry. The registry validates
+  # that the npm package version exists and carries the matching `mcpName`, so
+  # this runs after npm-publish. Auth is via GitHub Actions OIDC (no secrets);
+  # it grants the `io.github.<owner>/*` namespace.
+  # ---------------------------------------------------------------------------
+  mcp-publish:
+    name: MCP Registry publish
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      id-token: write   # required for `mcp-publisher login github-oidc`
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync server.json version to tag
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          jq --arg v "$ver" '.version = $v | .packages[0].version = $v' \
+            server.json > server.json.tmp && mv server.json.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher
+        run: |
+          url="https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz"
+          curl -fsSL "$url" | tar xz mcp-publisher
+          sudo mv mcp-publisher /usr/local/bin/
+
+      - name: Wait for npm version to propagate
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            if npm view "remote-agents@${ver}" version >/dev/null 2>&1; then
+              echo "remote-agents@${ver} is live on npm"; exit 0
+            fi
+            echo "waiting for remote-agents@${ver} on npm ($i/30)…"; sleep 10
+          done
+          echo "npm version ${ver} did not appear in time" >&2; exit 1
+
+      - name: Publish to MCP Registry
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish
