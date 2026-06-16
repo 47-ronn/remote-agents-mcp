@@ -4,7 +4,7 @@ use crate::relay_udp::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
-    AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, ClientRole, Command,
+    AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, Command,
     CommandResult, ServerMessage, Target, TaskStatus, UdpFrame,
 };
 use serde::Serialize;
@@ -136,17 +136,10 @@ impl ConnectionPool {
         let (udp_signal_tx, mut udp_signal_rx) = mpsc::channel::<SignalMessage>(32);
         let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx));
 
-        // Send auth. With a peer identity we register as a visible Agent peer;
-        // without one we fall back to a legacy invisible Mcp controller.
-        let role = if agent_info.is_some() {
-            ClientRole::Agent
-        } else {
-            ClientRole::Mcp
-        };
+        // Send auth — peer model: we join as a peer carrying our agent_info.
         let auth_msg = ClientMessage::Auth {
             room: room.to_string(),
             token: token.to_string(),
-            role,
             agent_info,
         };
 

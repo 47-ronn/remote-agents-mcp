@@ -28,18 +28,17 @@ pub enum EnvelopeError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// Authenticate with the relay
+    /// Authenticate with the relay. Peer model: there are no roles — every node
+    /// joins as an equal peer and must carry its `agent_info` identity.
     Auth {
         room: String,
         token: String,
-        role: ClientRole,
-        #[serde(skip_serializing_if = "Option::is_none")]
         // Boxed: `AgentInfo` is the largest payload across all ClientMessage
         // variants; boxing keeps the common (command/result/ping) messages small.
         agent_info: Option<Box<AgentInfo>>,
     },
 
-    /// Request list of agents in the room (MCP only)
+    /// Request the list of peers in the room
     ListAgents,
 
     /// Send a command to agent(s) (MCP only). `payload` is an encrypted
@@ -476,7 +475,6 @@ mod tests {
         let msg = ClientMessage::Auth {
             room: "dev".to_string(),
             token: "secret".to_string(),
-            role: ClientRole::Agent,
             agent_info: Some(Box::new(AgentInfo {
                 id: "agent-1".to_string(),
                 name: "Dev Server".to_string(),

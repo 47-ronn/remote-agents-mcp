@@ -36,16 +36,6 @@ impl AgentMode {
     }
 }
 
-/// Role of the client connecting to the relay
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ClientRole {
-    /// MCP server (AI agent controller)
-    Mcp,
-    /// Remote agent (target machine)
-    Agent,
-}
-
 /// Richer platform metadata so orchestrators (and peer agents) can tailor
 /// commands to a host's OS — e.g. choose `apt` vs `brew`, `sh` vs `powershell`.
 ///

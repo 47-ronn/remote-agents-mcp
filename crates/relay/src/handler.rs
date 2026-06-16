@@ -9,12 +9,12 @@ use crate::routing::resolve_targets;
 use crate::state::{AgentSession, McpSession, RelayState, Room, Tx, OUTBOUND_CAP};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use remote_agents_shared::{AgentInfo, ClientMessage, ClientRole, Endpoint, ServerMessage};
+use remote_agents_shared::{AgentInfo, ClientMessage, Endpoint, ServerMessage};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Drive a single accepted WebSocket connection to completion.
@@ -32,9 +32,9 @@ pub async fn handle_socket(
         Some(Ok(Message::Text(t))) => t,
         _ => return,
     };
-    let (role, agent_info) = match ClientMessage::from_json(&first) {
+    let agent_info = match ClientMessage::from_json(&first) {
         Ok(ClientMessage::Auth {
-            token, role, agent_info, ..
+            token, agent_info, ..
         }) => {
             if !auth_ok(&state, query_token.as_deref(), &token) {
                 let _ = sink
@@ -48,7 +48,7 @@ pub async fn handle_socket(
                     .await;
                 return;
             }
-            (role, agent_info)
+            agent_info
         }
         _ => {
             let _ = sink
@@ -100,46 +100,42 @@ pub async fn handle_socket(
     });
 
     // --- 3. Register the session -------------------------------------------
-    match role {
-        ClientRole::Agent => {
-            if let Some(info) = &agent_info {
-                // Clone and add session_id for UDP signaling (unbox to AgentInfo).
-                let mut info_with_session = (**info).clone();
-                info_with_session.session_id = Some(session_id.clone());
-                
-                room.agents.insert(
-                    info.id.clone(),
-                    AgentSession {
-                        info: info_with_session.clone(),
-                        tx: tx.clone(),
-                    },
-                );
+    // Peer model: a node with an identity (agent_info) joins as a visible peer;
+    // an anonymous connection (no agent_info — e.g. a browser stats/control
+    // client) joins as an unlisted observer that still receives broadcasts.
+    match &agent_info {
+        Some(info) => {
+            // Clone and add session_id for UDP signaling (unbox to AgentInfo).
+            let mut info_with_session = (**info).clone();
+            info_with_session.session_id = Some(session_id.clone());
 
-                // Tell the newcomer who its peers are (everyone already here,
-                // minus itself), so it knows its surroundings immediately.
-                let peers: Vec<AgentInfo> = room
-                    .agents
-                    .iter()
-                    .filter(|e| e.key() != &info.id)
-                    .map(|e| e.info.clone())
-                    .collect();
-                send_to(&tx, &ServerMessage::AgentList { agents: peers });
+            room.agents.insert(
+                info.id.clone(),
+                AgentSession {
+                    info: info_with_session.clone(),
+                    tx: tx.clone(),
+                },
+            );
 
-                // Announce the join to MCP clients and to the other agents.
-                let joined = ServerMessage::AgentJoined {
-                    agent: info_with_session,
-                };
-                broadcast_mcp(&room, &joined);
-                broadcast_agents(&room, &joined, Some(&info.id));
-                info!("agent joined: {} ({})", info.name, info.id);
-            } else {
-                warn!("agent auth without agent_info; dropping");
-                writer.abort();
-                state.gc_room(&room_name);
-                return;
-            }
+            // Tell the newcomer who its peers are (everyone already here,
+            // minus itself), so it knows its surroundings immediately.
+            let peers: Vec<AgentInfo> = room
+                .agents
+                .iter()
+                .filter(|e| e.key() != &info.id)
+                .map(|e| e.info.clone())
+                .collect();
+            send_to(&tx, &ServerMessage::AgentList { agents: peers });
+
+            // Announce the join to observers and to the other peers.
+            let joined = ServerMessage::AgentJoined {
+                agent: info_with_session,
+            };
+            broadcast_mcp(&room, &joined);
+            broadcast_agents(&room, &joined, Some(&info.id));
+            info!("peer joined: {} ({})", info.name, info.id);
         }
-        ClientRole::Mcp => {
+        None => {
             room.mcp.insert(
                 session_id.clone(),
                 McpSession {
@@ -147,7 +143,7 @@ pub async fn handle_socket(
                     tx: tx.clone(),
                 },
             );
-            debug!("mcp client joined: {}", session_id);
+            debug!("anonymous observer joined: {}", session_id);
         }
     }
 
@@ -175,19 +171,17 @@ pub async fn handle_socket(
 
     // --- 5. Cleanup ---------------------------------------------------------
     writer.abort();
-    match role {
-        ClientRole::Agent => {
-            if let Some(info) = &agent_info {
-                room.agents.remove(&info.id);
-                let left = ServerMessage::AgentLeft {
-                    agent_id: info.id.clone(),
-                };
-                broadcast_mcp(&room, &left);
-                broadcast_agents(&room, &left, None);
-                info!("agent left: {}", info.id);
-            }
+    match &agent_info {
+        Some(info) => {
+            room.agents.remove(&info.id);
+            let left = ServerMessage::AgentLeft {
+                agent_id: info.id.clone(),
+            };
+            broadcast_mcp(&room, &left);
+            broadcast_agents(&room, &left, None);
+            info!("peer left: {}", info.id);
         }
-        ClientRole::Mcp => {
+        None => {
             room.mcp.remove(&session_id);
         }
     }

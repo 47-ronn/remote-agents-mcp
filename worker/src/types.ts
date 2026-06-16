@@ -1,7 +1,6 @@
 // Types matching the Rust shared crate
 
 export type AgentMode = 'plan' | 'edit' | 'bypass' | 'disabled';
-export type ClientRole = 'mcp' | 'agent';
 
 export interface PlatformInfo {
   family: string;
@@ -153,7 +152,7 @@ export interface UdpChannelResult {
 // the relay forwards them opaquely and never sees plaintext. Only routing
 // metadata and error strings are in the clear.
 export type ClientMessage =
-  | { type: 'auth'; room: string; token: string; role: ClientRole; agent_info?: AgentInfo }
+  | { type: 'auth'; room: string; token: string; agent_info?: AgentInfo }
   | { type: 'list_agents' }
   | { type: 'command'; request_id: string; target: Target; payload: string }
   | { type: 'command_result'; request_id: string; result: string }
@@ -187,7 +186,6 @@ export type ServerMessage =
 // Internal session tracking
 export interface Session {
   id: string;
-  role: ClientRole;
   agentInfo?: AgentInfo;
   ws: WebSocket;
 }

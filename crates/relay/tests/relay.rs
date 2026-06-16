@@ -5,7 +5,7 @@
 use futures::{SinkExt, StreamExt};
 use remote_agents_relay::{router, state::RelayState};
 use remote_agents_shared::{
-    AgentEvent, AgentInfo, AgentMode, ClientMessage, ClientRole, Endpoint, ServerMessage, Target,
+    AgentEvent, AgentInfo, AgentMode, ClientMessage, Endpoint, ServerMessage, Target,
     TaskStatus, UdpOffer,
 };
 use std::net::{IpAddr, Ipv4Addr};
@@ -101,13 +101,12 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
     }
 }
 
-async fn auth(ws: &mut Ws, role: ClientRole, info: Option<AgentInfo>) -> String {
+async fn auth(ws: &mut Ws, info: Option<AgentInfo>) -> String {
     send(
         ws,
         &ClientMessage::Auth {
             room: "dev".into(),
             token: "secret".into(),
-            role,
             agent_info: info.map(Box::new),
         },
     )
@@ -124,7 +123,7 @@ async fn full_round_trip() {
 
     // Agent connects first.
     let mut agent = connect(port, "dev").await;
-    auth(&mut agent, ClientRole::Agent, Some(agent_info("a1", &["backend"]))).await;
+    auth(&mut agent, Some(agent_info("a1", &["backend"]))).await;
     // On joining the (empty) room the agent receives its initial peer list.
     match recv(&mut agent).await {
         ServerMessage::AgentList { agents } => assert!(agents.is_empty()),
@@ -133,7 +132,7 @@ async fn full_round_trip() {
 
     // MCP connects.
     let mut mcp = connect(port, "dev").await;
-    auth(&mut mcp, ClientRole::Mcp, None).await;
+    auth(&mut mcp, None).await;
 
     // MCP lists agents and sees the one agent.
     send(&mut mcp, &ClientMessage::ListAgents).await;
@@ -240,7 +239,7 @@ async fn agents_learn_about_each_other() {
 
     // First agent joins an empty room → empty initial peer list.
     let mut a1 = connect(port, "dev").await;
-    auth(&mut a1, ClientRole::Agent, Some(agent_info("a1", &["backend"]))).await;
+    auth(&mut a1, Some(agent_info("a1", &["backend"]))).await;
     match recv(&mut a1).await {
         ServerMessage::AgentList { agents } => assert!(agents.is_empty()),
         other => panic!("expected empty agent_list, got {:?}", other),
@@ -248,7 +247,7 @@ async fn agents_learn_about_each_other() {
 
     // Second agent joins → its initial list already contains a1.
     let mut a2 = connect(port, "dev").await;
-    auth(&mut a2, ClientRole::Agent, Some(agent_info("a2", &["frontend"]))).await;
+    auth(&mut a2, Some(agent_info("a2", &["frontend"]))).await;
     match recv(&mut a2).await {
         ServerMessage::AgentList { agents } => {
             assert_eq!(agents.len(), 1);
@@ -311,7 +310,7 @@ async fn room_info_reports_connected_agents() {
 
     // After an agent joins it shows up in the room info.
     let mut agent = connect(port, "dev").await;
-    auth(&mut agent, ClientRole::Agent, Some(agent_info("a1", &["backend"]))).await;
+    auth(&mut agent, Some(agent_info("a1", &["backend"]))).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (_status, body) = http_get(port, "/api/room/dev").await;
     assert!(body.contains("\"id\":\"a1\""), "body: {body}");
@@ -323,7 +322,7 @@ async fn room_info_reports_connected_agents() {
 async fn relay_reflects_your_endpoint() {
     let port = start_relay().await;
     let mut agent = connect(port, "dev").await;
-    auth(&mut agent, ClientRole::Agent, Some(agent_info("a1", &[]))).await;
+    auth(&mut agent, Some(agent_info("a1", &[]))).await;
 
     // Read raw frames (don't use recv(), which filters YourEndpoint out).
     let mut saw = None;
@@ -361,7 +360,7 @@ async fn relay_has_no_role_authorization() {
     let port = start_relay().await;
 
     let mut agent = connect(port, "dev").await;
-    auth(&mut agent, ClientRole::Agent, Some(agent_info("a", &[]))).await;
+    auth(&mut agent, Some(agent_info("a", &[]))).await;
     assert!(matches!(recv(&mut agent).await, ServerMessage::AgentList { .. })); // initial peers
 
     send(
@@ -390,11 +389,11 @@ async fn udp_offer_routes_to_target_agent_by_session() {
     let port = start_relay().await;
 
     let mut a = connect(port, "dev").await;
-    let a_sess = auth(&mut a, ClientRole::Agent, Some(agent_info("a", &[]))).await;
+    let a_sess = auth(&mut a, Some(agent_info("a", &[]))).await;
     assert!(matches!(recv(&mut a).await, ServerMessage::AgentList { .. }));
 
     let mut b = connect(port, "dev").await;
-    let b_sess = auth(&mut b, ClientRole::Agent, Some(agent_info("b", &[]))).await;
+    let b_sess = auth(&mut b, Some(agent_info("b", &[]))).await;
     assert!(matches!(recv(&mut b).await, ServerMessage::AgentList { .. }));
     // a is told b joined.
     assert!(matches!(recv(&mut a).await, ServerMessage::AgentJoined { .. }));
@@ -420,7 +419,7 @@ async fn result_routes_only_to_requesting_mcp() {
 
     // An executing agent.
     let mut agent = connect(port, "dev").await;
-    auth(&mut agent, ClientRole::Agent, Some(agent_info("a1", &[]))).await;
+    auth(&mut agent, Some(agent_info("a1", &[]))).await;
     match recv(&mut agent).await {
         ServerMessage::AgentList { .. } => {}
         other => panic!("expected AgentList, got {:?}", other),
@@ -428,9 +427,9 @@ async fn result_routes_only_to_requesting_mcp() {
 
     // Two controllers in the same room.
     let mut mcp1 = connect(port, "dev").await;
-    auth(&mut mcp1, ClientRole::Mcp, None).await;
+    auth(&mut mcp1, None).await;
     let mut mcp2 = connect(port, "dev").await;
-    auth(&mut mcp2, ClientRole::Mcp, None).await;
+    auth(&mut mcp2, None).await;
 
     // mcp1 issues the command.
     send(
@@ -478,7 +477,7 @@ async fn agent_peer_can_initiate_command() {
 
     // Executor agent.
     let mut a1 = connect(port, "dev").await;
-    auth(&mut a1, ClientRole::Agent, Some(agent_info("a1", &[]))).await;
+    auth(&mut a1, Some(agent_info("a1", &[]))).await;
     match recv(&mut a1).await {
         ServerMessage::AgentList { .. } => {}
         other => panic!("expected AgentList, got {:?}", other),
@@ -486,7 +485,7 @@ async fn agent_peer_can_initiate_command() {
 
     // Initiator agent (a second peer — NOT a controller).
     let mut a2 = connect(port, "dev").await;
-    auth(&mut a2, ClientRole::Agent, Some(agent_info("a2", &[]))).await;
+    auth(&mut a2, Some(agent_info("a2", &[]))).await;
     match recv(&mut a2).await {
         ServerMessage::AgentList { agents } => assert_eq!(agents.len(), 1), // sees a1
         other => panic!("expected AgentList, got {:?}", other),

@@ -6,7 +6,7 @@ use crate::state::AgentState;
 use crate::udp_transport::{SignalMessage, UdpTransport};
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use remote_agents_shared::{AgentInfo, ClientMessage, ClientRole, Command, ServerMessage, UdpFrame};
+use remote_agents_shared::{AgentInfo, ClientMessage, Command, ServerMessage, UdpFrame};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -104,7 +104,6 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     let auth_msg = ClientMessage::Auth {
         room: config.room.clone(),
         token: config.token.clone(),
-        role: ClientRole::Agent,
         agent_info: Some(Box::new(agent_info.clone())),
     };
 

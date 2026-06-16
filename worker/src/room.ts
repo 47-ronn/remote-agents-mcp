@@ -11,7 +11,6 @@ import type { AgentInfo, ClientMessage, ServerMessage, Target, UdpOffer, UdpAnsw
  */
 interface Attachment {
   sessionId?: string;
-  role?: 'mcp' | 'agent';
   agentInfo?: AgentInfo;
   token: string;
   clientIp?: string;
@@ -217,7 +216,6 @@ export class Room implements DurableObject {
     ws.serializeAttachment({
       token: att.token,
       sessionId,
-      role: msg.role,
       agentInfo,
       clientIp: att.clientIp,
     } as Attachment);
@@ -233,7 +231,7 @@ export class Room implements DurableObject {
       this.send(ws, { type: 'your_endpoint', endpoint: { addr: att.clientIp, port: 0 } });
     }
 
-    if (msg.role === 'agent' && agentInfo) {
+    if (agentInfo) {
       // Tell the newcomer who its peers are (everyone already here, minus
       // itself) so a host knows its surroundings immediately.
       const peers = this.agentSockets()
@@ -278,7 +276,7 @@ export class Room implements DurableObject {
 
   private handleDisconnect(ws: WebSocket) {
     const att = this.att(ws);
-    if (att.role === 'agent' && att.agentInfo) {
+    if (att.agentInfo) {
       this.broadcastToMcp({ type: 'agent_left', agent_id: att.agentInfo.id });
       this.broadcastToAgents(
         { type: 'agent_left', agent_id: att.agentInfo.id },
@@ -318,11 +316,13 @@ export class Room implements DurableObject {
   }
 
   private agentSockets(): [WebSocket, Attachment][] {
-    return this.sockets().filter(([, a]) => a.role === 'agent' && a.agentInfo);
+    // Peer model: identified peers (those carrying agent_info) are the agents.
+    return this.sockets().filter(([, a]) => a.agentInfo);
   }
 
   private mcpSockets(): [WebSocket, Attachment][] {
-    return this.sockets().filter(([, a]) => a.role === 'mcp');
+    // Anonymous observers (no agent_info) — e.g. browser stats/control clients.
+    return this.sockets().filter(([, a]) => !a.agentInfo);
   }
 
   private findSocketBySession(sessionId: string): WebSocket | undefined {
