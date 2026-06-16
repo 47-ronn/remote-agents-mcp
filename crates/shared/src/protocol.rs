@@ -172,9 +172,12 @@ pub enum Command {
     ScheduleList,
 
     /// Dispatch an autonomous AI task to the host (runs with the host's own
-    /// credentials). Returns immediately with a task id.
+    /// credentials). Returns immediately with a task id. `initiator` is the
+    /// dispatching peer's id, recorded as the task's leader (peer model).
     TaskDispatch {
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initiator: Option<String>,
     },
 
     /// Get a single autonomous task by id (status + result)

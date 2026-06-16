@@ -58,7 +58,7 @@ impl AutonomousStore {
 
     /// Accept a task: persist it as Queued and spawn the runner in the
     /// background. Returns the new task id immediately.
-    pub fn dispatch(self: &Arc<Self>, prompt: &str) -> Result<String> {
+    pub fn dispatch(self: &Arc<Self>, prompt: &str, initiator: Option<String>) -> Result<String> {
         if !self.config.enabled {
             bail!("autonomous mode is not enabled on this host");
         }
@@ -66,6 +66,7 @@ impl AutonomousStore {
         let id = uuid::Uuid::new_v4().to_string();
         let task = AutonomousTask {
             id: id.clone(),
+            initiator,
             prompt: prompt.to_string(),
             status: TaskStatus::Queued,
             result: None,
@@ -182,8 +183,8 @@ impl AutonomousStore {
         let conn = self.db.lock().unwrap();
         conn.execute(
             "INSERT INTO autonomous_tasks
-                (id, prompt, status, result, error, created_at, started_at, finished_at, exit_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (id, prompt, status, result, error, created_at, started_at, finished_at, exit_code, initiator)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 task.id,
                 task.prompt,
@@ -194,6 +195,7 @@ impl AutonomousStore {
                 task.started_at.map(|v| v as i64),
                 task.finished_at.map(|v| v as i64),
                 task.exit_code,
+                task.initiator,
             ],
         )
         .context("insert autonomous task")?;
@@ -242,10 +244,10 @@ impl AutonomousStore {
 }
 
 const COLUMNS: &str =
-    "id, prompt, status, result, error, created_at, started_at, finished_at, exit_code";
+    "id, prompt, status, result, error, created_at, started_at, finished_at, exit_code, initiator";
 
 const SELECT_COLUMNS_WHERE_ID: &str =
-    "SELECT id, prompt, status, result, error, created_at, started_at, finished_at, exit_code \
+    "SELECT id, prompt, status, result, error, created_at, started_at, finished_at, exit_code, initiator \
      FROM autonomous_tasks WHERE id = ?1";
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<AutonomousTask> {
@@ -259,6 +261,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<AutonomousTask> {
         started_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
         finished_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
         exit_code: row.get(8)?,
+        initiator: row.get(9)?,
     })
 }
 
@@ -305,11 +308,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
             created_at  INTEGER NOT NULL,
             started_at  INTEGER,
             finished_at INTEGER,
-            exit_code   INTEGER
+            exit_code   INTEGER,
+            initiator   TEXT
         )",
         [],
     )
     .context("create autonomous_tasks schema")?;
+
+    // Add the column to a pre-existing DB (no-op error if it already exists).
+    let _ = conn.execute("ALTER TABLE autonomous_tasks ADD COLUMN initiator TEXT", []);
     Ok(())
 }
 
@@ -362,13 +369,13 @@ mod tests {
     #[tokio::test]
     async fn disabled_rejects_dispatch() {
         let s = store(false);
-        assert!(s.dispatch("do something").is_err());
+        assert!(s.dispatch("do something", None).is_err());
     }
 
     #[tokio::test]
     async fn dispatch_runs_and_persists_result() {
         let s = store(true);
-        let id = s.dispatch("hello world").unwrap();
+        let id = s.dispatch("hello world", Some("ctrl-1".into())).unwrap();
 
         // Poll until the background runner finishes.
         let mut task = None;
@@ -384,6 +391,8 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Done, "error: {:?}", task.error);
         // `echo` echoes the prompt back.
         assert!(task.result.unwrap_or_default().contains("hello world"));
+        // The initiator (peer-model task leader) round-trips through SQLite.
+        assert_eq!(task.initiator.as_deref(), Some("ctrl-1"));
         assert_eq!(s.list().unwrap().len(), 1);
     }
 
@@ -411,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn empty_runner_marks_failed() {
         let (s, _rx) = store_runner(true, vec![]);
-        let id = s.dispatch("anything").unwrap();
+        let id = s.dispatch("anything", None).unwrap();
         let task = await_terminal(&s, &id).await;
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.error.as_deref(), Some("empty runner command"));
@@ -421,7 +430,7 @@ mod tests {
     async fn nonzero_exit_marks_failed() {
         // `false` ignores its args and exits 1.
         let (s, _rx) = store_runner(true, vec!["false"]);
-        let id = s.dispatch("anything").unwrap();
+        let id = s.dispatch("anything", None).unwrap();
         let task = await_terminal(&s, &id).await;
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.exit_code, Some(1));
@@ -430,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn completion_event_is_emitted() {
         let (s, mut rx) = store_runner(true, vec!["echo"]);
-        let id = s.dispatch("ping").unwrap();
+        let id = s.dispatch("ping", None).unwrap();
         // A TaskCompleted event for this id is pushed for the connection loop.
         // Await it directly (the event send trails the DB write inside finish()).
         let ev = timeout(Duration::from_secs(2), rx.recv())

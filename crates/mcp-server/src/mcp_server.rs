@@ -602,6 +602,9 @@ impl McpHandler {
             "schedule_list" => Command::ScheduleList,
             "task_dispatch" => Command::TaskDispatch {
                 prompt: get_str_required("prompt")?,
+                // Local tool path; the remote initiator id is stamped by
+                // McpServer::task_dispatch when routed over the relay.
+                initiator: None,
             },
             "task_get" => Command::TaskGet {
                 id: get_str_required("id")?,

@@ -197,13 +197,13 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::Schedule { tasks })
         }
 
-        Command::TaskDispatch { prompt } => {
+        Command::TaskDispatch { prompt, initiator } => {
             info!("Autonomous task dispatch ({} chars)", prompt.len());
             let store = state.autonomous();
             if !store.enabled() {
                 bail!("autonomous mode is not enabled on this host");
             }
-            let id = store.dispatch(prompt)?;
+            let id = store.dispatch(prompt, initiator.clone())?;
             Ok(CommandResult::TaskQueued { id })
         }
 
@@ -414,7 +414,7 @@ mod tests {
     async fn task_dispatch_errors_when_autonomous_disabled() {
         // Config::default() leaves autonomous mode disabled.
         let state = bypass_state().await;
-        let cmd = Command::TaskDispatch { prompt: "do a thing".into() };
+        let cmd = Command::TaskDispatch { prompt: "do a thing".into(), initiator: None };
         let err = execute(&cmd, &state).await.unwrap_err().to_string();
         assert!(err.contains("autonomous mode is not enabled"), "got: {err}");
     }

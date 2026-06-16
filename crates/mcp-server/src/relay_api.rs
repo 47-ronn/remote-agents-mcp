@@ -87,6 +87,8 @@ fn git_result_text(r: CommandResult) -> String {
 pub struct McpServer {
     /// Connection pool to relay servers
     connections: Arc<RwLock<ConnectionPool>>,
+    /// This node's own peer id, stamped as the `initiator` on tasks it dispatches.
+    self_id: Arc<RwLock<Option<String>>>,
 }
 
 impl McpServer {
@@ -94,6 +96,7 @@ impl McpServer {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(RwLock::new(ConnectionPool::new())),
+            self_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -107,6 +110,10 @@ impl McpServer {
         key: Option<&str>,
         agent_info: Option<Box<AgentInfo>>,
     ) -> Result<String> {
+        // Remember our own id so dispatched tasks can record us as initiator.
+        if let Some(info) = &agent_info {
+            *self.self_id.write().await = Some(info.id.clone());
+        }
         let mut pool = self.connections.write().await;
         pool.connect(relay_url, room, token, key, agent_info).await
     }
@@ -463,6 +470,7 @@ impl McpServer {
         agent_id: &str,
         prompt: &str,
     ) -> Result<String> {
+        let initiator = self.self_id.read().await.clone();
         let pool = self.connections.read().await;
         let results = pool
             .send_command(
@@ -472,6 +480,7 @@ impl McpServer {
                 },
                 remote_agents_shared::Command::TaskDispatch {
                     prompt: prompt.to_string(),
+                    initiator,
                 },
             )
             .await?;

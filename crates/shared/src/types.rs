@@ -190,6 +190,12 @@ pub enum TaskStatus {
 pub struct AutonomousTask {
     /// Unique task id
     pub id: String,
+    /// Peer id of the node that initiated this task (the "leader" for it; other
+    /// nodes are executors). Peer model: roles live per-task in metadata, not on
+    /// the network. `None` for tasks created before this field / by an
+    /// unidentified initiator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<String>,
     /// The prompt / instructions given to the host's AI runner
     pub prompt: String,
     /// Current status
