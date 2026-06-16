@@ -669,6 +669,58 @@ mod tests {
         }
     }
 
+    /// A `YourEndpoint` message records the relay-observed public endpoint on the
+    /// UDP transport (the reflexive address used when offering channels).
+    #[tokio::test]
+    async fn your_endpoint_sets_public_endpoint() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let state = AgentState::new(Config::default());
+        let (tx, _rx) = mpsc::channel::<ClientMessage>(8);
+        let (sig_tx, _sig_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        let udp = Arc::new(UdpTransport::new(state.cipher(), "self".into(), sig_tx, in_tx));
+
+        assert!(udp.public_endpoint().await.is_none());
+
+        let endpoint = remote_agents_shared::Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4500);
+        let msg = ServerMessage::YourEndpoint { endpoint };
+        let text = serde_json::to_string(&msg).unwrap();
+        handle_server_message(&text, &state, &tx, &udp).await.unwrap();
+
+        assert_eq!(udp.public_endpoint().await, Some(endpoint));
+    }
+
+    /// Garbage bytes that don't parse as a `UdpFrame` are dropped silently — no
+    /// reply is queued (and nothing executes).
+    #[tokio::test]
+    async fn udp_inbound_malformed_frame_is_dropped() {
+        let state = AgentState::new(Config::default());
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(8);
+        let (sig_tx, _sig_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        let udp = Arc::new(UdpTransport::new(state.cipher(), "self".into(), sig_tx, in_tx));
+
+        handle_udp_inbound("m", b"\x00\x01not-a-frame", &state, &tx, &udp).await;
+
+        assert!(rx.try_recv().is_err(), "malformed frame must not produce a reply");
+    }
+
+    /// A well-formed but non-command UDP frame (e.g. a `Result`) is ignored:
+    /// `handle_udp_inbound` only acts on `Command` frames.
+    #[tokio::test]
+    async fn udp_inbound_non_command_frame_ignored() {
+        let state = AgentState::new(Config::default());
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(8);
+        let (sig_tx, _sig_rx) = mpsc::channel(8);
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        let udp = Arc::new(UdpTransport::new(state.cipher(), "self".into(), sig_tx, in_tx));
+
+        let frame = UdpFrame::Result { request_id: "r".into(), result: "x".into() };
+        handle_udp_inbound("m", &frame.to_bytes(), &state, &tx, &udp).await;
+
+        assert!(rx.try_recv().is_err(), "non-command frame must not produce a reply");
+    }
+
     #[tokio::test]
     async fn udp_inbound_bad_payload_replies_error() {
         let state = AgentState::new(Config::default());
