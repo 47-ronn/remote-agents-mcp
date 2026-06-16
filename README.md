@@ -99,6 +99,25 @@ also works in an MCP `env` block as `REMOTE_AGENTS_*` config.
 Common flags: `--relay <wss://host>` `--room <name>` `--token <secret>`
 `--name <id>` `--tags a,b` `--no-agent`.
 
+### Keeping a host always online
+
+A `mcp` node lives only as long as the AI host (opencode / Claude) keeps it
+running — close the session and the node leaves the room. For a host that should
+stay in the fleet **24/7, independent of any AI session**, install it as a
+background service running `run`:
+
+```bash
+remote-agents install --room dev --token <secret> --relay wss://<your-relay-host>
+# systemd user service (Linux) / launchd LaunchAgent (macOS); auto-starts,
+# survives logout/reboot, auto-restarts. Remove with: remote-agents uninstall
+```
+
+A machine has **one persistent identity** (`agent-id`), and the relay keys peers
+by id, so don't run both a `run` service and an `mcp` session on the same machine
+with the same id — they'd evict each other. Typical topology: target hosts run
+the `run` service (always online); the workstation that drives the fleet runs
+`mcp` per session.
+
 ## Quick start
 
 ### 1. Run an agent on a remote host (with flags)
