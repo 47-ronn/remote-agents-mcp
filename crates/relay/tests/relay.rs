@@ -528,3 +528,59 @@ async fn agent_peer_can_initiate_command() {
         other => panic!("expected CommandResult at a2, got {:?}", other),
     }
 }
+
+/// Peer-model registration (iter80): an identified peer — even a send-only one —
+/// is visible in list_agents; an anonymous connection (no agent_info, e.g. a
+/// browser stats client) is NOT listed but can still observe and command. A
+/// broadcast skips the send-only peer.
+#[tokio::test]
+async fn peer_visibility_and_anonymous_observer() {
+    let port = start_relay().await;
+
+    // Full peer A (executes).
+    let mut a = connect(port, "dev").await;
+    auth(&mut a, Some(agent_info("a", &[]))).await;
+    assert!(matches!(recv(&mut a).await, ServerMessage::AgentList { .. }));
+
+    // Send-only peer B (--no-agent: visible, but never executes).
+    let mut b_info = agent_info("b", &[]);
+    b_info.accepts_commands = false;
+    let mut b = connect(port, "dev").await;
+    auth(&mut b, Some(b_info)).await;
+    assert!(matches!(recv(&mut b).await, ServerMessage::AgentList { .. })); // sees A
+    assert!(matches!(recv(&mut a).await, ServerMessage::AgentJoined { .. })); // A learns of B
+
+    // Anonymous observer C (no agent_info).
+    let mut c = connect(port, "dev").await;
+    auth(&mut c, None).await;
+
+    // C lists the room and sees BOTH peers (send-only B is still visible)...
+    send(&mut c, &ClientMessage::ListAgents).await;
+    match recv(&mut c).await {
+        ServerMessage::AgentList { agents } => {
+            let mut ids: Vec<String> = agents.iter().map(|a| a.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        }
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+
+    // ...and a broadcast from C reaches the executing peer A but NOT send-only B.
+    send(
+        &mut c,
+        &ClientMessage::Command {
+            request_id: "bc".into(),
+            target: Target::All,
+            payload: "P".into(),
+        },
+    )
+    .await;
+    match recv(&mut a).await {
+        ServerMessage::Command { request_id, .. } => assert_eq!(request_id, "bc"),
+        other => panic!("expected Command at A, got {:?}", other),
+    }
+    assert!(
+        try_recv(&mut b, 400).await.is_none(),
+        "send-only peer must be skipped by broadcasts"
+    );
+}
