@@ -631,7 +631,13 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
 
         ServerMessage::AgentJoined { agent } => {
             let mut list = shared.agents.write().await;
-            list.push(agent.clone());
+            // Upsert by id: a re-announce (or a second connection reusing the
+            // same persistent node id) must not create a duplicate entry.
+            if let Some(slot) = list.iter_mut().find(|a| a.id == agent.id) {
+                *slot = agent.clone();
+            } else {
+                list.push(agent.clone());
+            }
             info!("Agent joined: {} ({})", agent.name, agent.id);
 
             // Initiate UDP channel if agent has session_id.
@@ -1083,6 +1089,25 @@ mod tests {
             }
             other => panic!("expected CommandResult, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_joined_upserts_by_id() {
+        let (shared, _rx, _w, _e) = handler_shared();
+
+        let a = agent("x", Some("s1")); // id = "id-x"
+        let text = serde_json::to_string(&ServerMessage::AgentJoined { agent: a }).unwrap();
+        handle_message(&text, &shared).await.unwrap();
+
+        // A re-announce / second connection with the SAME id must not duplicate.
+        let mut a2 = agent("x", Some("s2"));
+        a2.name = "x-renamed".into();
+        let text2 = serde_json::to_string(&ServerMessage::AgentJoined { agent: a2 }).unwrap();
+        handle_message(&text2, &shared).await.unwrap();
+
+        let list = shared.agents.read().await;
+        assert_eq!(list.len(), 1, "same id must not appear twice");
+        assert_eq!(list[0].name, "x-renamed", "upsert replaces in place");
     }
 
     #[tokio::test]
