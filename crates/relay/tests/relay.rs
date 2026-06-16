@@ -584,3 +584,139 @@ async fn peer_visibility_and_anonymous_observer() {
         "send-only peer must be skipped by broadcasts"
     );
 }
+
+/// A machine may hold several connections (many terminals on the same box) under
+/// one agent-id; they collapse to ONE logical peer. When one of them closes, the
+/// host stays present (and emits no false `AgentLeft`) as long as another
+/// connection of the same id remains, and Agent-targeted commands keep reaching a
+/// live connection. Regression for duplicate `ojo` sockets in the room.
+#[tokio::test]
+async fn duplicate_connection_disconnect_keeps_host_present() {
+    let port = start_relay().await;
+
+    // An observer watching join/leave traffic, connected first so it sees both
+    // joins.
+    let mut mcp = connect(port, "dev").await;
+    auth(&mut mcp, None).await;
+
+    // First connection for id "dup".
+    let mut a1 = connect(port, "dev").await;
+    auth(&mut a1, Some(agent_info("dup", &[]))).await;
+    let _ = recv(&mut a1).await; // initial (empty) AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => assert_eq!(agent.id, "dup"),
+        other => panic!("expected AgentJoined(dup), got {:?}", other),
+    }
+
+    // Second connection for the SAME id replaces the first in the room map.
+    let mut a2 = connect(port, "dev").await;
+    auth(&mut a2, Some(agent_info("dup", &[]))).await;
+    let _ = recv(&mut a2).await; // its initial AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => assert_eq!(agent.id, "dup"),
+        other => panic!("expected re-join AgentJoined(dup), got {:?}", other),
+    }
+
+    // The stale first socket goes away.
+    a1.close(None).await.unwrap();
+    drop(a1);
+
+    // The observer must NOT receive an AgentLeft for "dup": the live socket a2
+    // still owns the id.
+    assert!(
+        try_recv(&mut mcp, 400).await.is_none(),
+        "stale disconnect must not announce a false agent_left"
+    );
+
+    // The peer is still listed, and a command targeting it reaches the live a2.
+    send(&mut mcp, &ClientMessage::ListAgents).await;
+    match recv(&mut mcp).await {
+        ServerMessage::AgentList { agents } => {
+            assert_eq!(agents.len(), 1, "exactly one live peer for the id");
+            assert_eq!(agents[0].id, "dup");
+        }
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+    send(
+        &mut mcp,
+        &ClientMessage::Command {
+            request_id: "to-live".into(),
+            target: Target::Agent { id: "dup".into() },
+            payload: "P".into(),
+        },
+    )
+    .await;
+    match recv(&mut a2).await {
+        ServerMessage::Command { request_id, .. } => assert_eq!(request_id, "to-live"),
+        other => panic!("expected Command at live replacement, got {:?}", other),
+    }
+}
+
+/// Two connections from the same machine with DIFFERENT capabilities (one
+/// autonomous terminal, one not) collapse to a single host that is autonomous
+/// (a capability is present if ANY connection has it), and an Agent-targeted
+/// command is delivered to the AUTONOMOUS connection — not the plain one. This
+/// is the exact `ojo` bug: a non-autonomous terminal answered "autonomous mode
+/// is not enabled" because the relay fanned the command out to every duplicate.
+#[tokio::test]
+async fn duplicate_connections_merge_capabilities_and_route_to_capable() {
+    let port = start_relay().await;
+
+    let mut mcp = connect(port, "dev").await;
+    auth(&mut mcp, None).await;
+
+    // First connection: NOT autonomous (a terminal where the AI CLI isn't found).
+    let mut plain = connect(port, "dev").await;
+    let mut info_plain = agent_info("ojo", &[]);
+    info_plain.autonomous = false;
+    auth(&mut plain, Some(info_plain)).await;
+    let _ = recv(&mut plain).await; // initial (empty) AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => assert_eq!(agent.id, "ojo"),
+        other => panic!("expected AgentJoined(ojo), got {:?}", other),
+    }
+
+    // Second connection from the SAME machine: autonomous.
+    let mut auto = connect(port, "dev").await;
+    let mut info_auto = agent_info("ojo", &[]);
+    info_auto.autonomous = true;
+    auth(&mut auto, Some(info_auto)).await;
+    let _ = recv(&mut auto).await; // its initial AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => {
+            assert_eq!(agent.id, "ojo");
+            assert!(agent.autonomous, "host is autonomous if any connection is");
+        }
+        other => panic!("expected merged AgentJoined, got {:?}", other),
+    }
+
+    // list_agents shows ONE host, autonomous.
+    send(&mut mcp, &ClientMessage::ListAgents).await;
+    match recv(&mut mcp).await {
+        ServerMessage::AgentList { agents } => {
+            assert_eq!(agents.len(), 1, "one logical host for the machine");
+            assert_eq!(agents[0].id, "ojo");
+            assert!(agents[0].autonomous);
+        }
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+
+    // The Agent-targeted command must land on the AUTONOMOUS connection only.
+    send(
+        &mut mcp,
+        &ClientMessage::Command {
+            request_id: "to-auto".into(),
+            target: Target::Agent { id: "ojo".into() },
+            payload: "P".into(),
+        },
+    )
+    .await;
+    match recv(&mut auto).await {
+        ServerMessage::Command { request_id, .. } => assert_eq!(request_id, "to-auto"),
+        other => panic!("expected Command at autonomous connection, got {:?}", other),
+    }
+    assert!(
+        try_recv(&mut plain, 400).await.is_none(),
+        "non-autonomous connection must not receive the Agent-targeted command"
+    );
+}

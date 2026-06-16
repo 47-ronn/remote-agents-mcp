@@ -5,7 +5,7 @@
 //! blocks on socket I/O and a slow consumer is bounded (and dropped) rather than
 //! stalling the room.
 
-use crate::routing::resolve_targets;
+use crate::routing::{dedup_agents, resolve_targets};
 use crate::state::{AgentSession, McpSession, RelayState, Room, Tx, OUTBOUND_CAP};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -109,28 +109,33 @@ pub async fn handle_socket(
             let mut info_with_session = (**info).clone();
             info_with_session.session_id = Some(session_id.clone());
 
+            // Keyed by session id: one entry per live connection. A machine may
+            // hold several connections (many terminals); they collapse to one
+            // logical peer on read via dedup_agents.
             room.agents.insert(
-                info.id.clone(),
+                session_id.clone(),
                 AgentSession {
                     info: info_with_session.clone(),
                     tx: tx.clone(),
                 },
             );
 
-            // Tell the newcomer who its peers are (everyone already here,
-            // minus itself), so it knows its surroundings immediately.
-            let peers: Vec<AgentInfo> = room
-                .agents
-                .iter()
-                .filter(|e| e.key() != &info.id)
-                .map(|e| e.info.clone())
+            // Tell the newcomer who its peers are (everyone already here, minus
+            // itself), collapsed to one logical host per machine.
+            let peers: Vec<AgentInfo> = dedup_agents(&room)
+                .into_iter()
+                .filter(|a| a.id != info.id)
                 .collect();
             send_to(&tx, &ServerMessage::AgentList { agents: peers });
 
-            // Announce the join to observers and to the other peers.
-            let joined = ServerMessage::AgentJoined {
-                agent: info_with_session,
-            };
+            // Announce the join, carrying the host's MERGED capabilities (this id
+            // may already have other connections), so caches aren't downgraded by
+            // a less-capable terminal.
+            let merged = dedup_agents(&room)
+                .into_iter()
+                .find(|a| a.id == info.id)
+                .unwrap_or_else(|| info_with_session.clone());
+            let joined = ServerMessage::AgentJoined { agent: merged };
             broadcast_mcp(&room, &joined);
             broadcast_agents(&room, &joined, Some(&info.id));
             info!("peer joined: {} ({})", info.name, info.id);
@@ -173,13 +178,20 @@ pub async fn handle_socket(
     writer.abort();
     match &agent_info {
         Some(info) => {
-            room.agents.remove(&info.id);
-            let left = ServerMessage::AgentLeft {
-                agent_id: info.id.clone(),
-            };
-            broadcast_mcp(&room, &left);
-            broadcast_agents(&room, &left, None);
-            info!("peer left: {}", info.id);
+            // Drop just THIS connection (keyed by session id). Announce the peer
+            // as gone only if no other connection of the same machine remains —
+            // a host with several open terminals stays present until its last
+            // one leaves.
+            room.agents.remove(&session_id);
+            let still_present = room.agents.iter().any(|e| e.value().info.id == info.id);
+            if !still_present {
+                let left = ServerMessage::AgentLeft {
+                    agent_id: info.id.clone(),
+                };
+                broadcast_mcp(&room, &left);
+                broadcast_agents(&room, &left, None);
+                info!("peer left: {}", info.id);
+            }
         }
         None => {
             room.mcp.remove(&session_id);
@@ -225,7 +237,8 @@ fn handle_client_msg(
     // its own choice (AgentInfo.accepts_commands / --no-agent), enforced agent-side.
     match msg {
         ClientMessage::ListAgents => {
-            let agents: Vec<AgentInfo> = room.agents.iter().map(|e| e.info.clone()).collect();
+            // One logical host per machine (collapse its several connections).
+            let agents = dedup_agents(room);
             send_to(self_tx, &ServerMessage::AgentList { agents });
         }
 
@@ -376,7 +389,9 @@ fn broadcast_mcp(room: &Room, msg: &ServerMessage) {
 fn broadcast_agents(room: &Room, msg: &ServerMessage, except_id: Option<&str>) {
     if let Ok(json) = msg.to_json() {
         for entry in room.agents.iter() {
-            if Some(entry.key().as_str()) == except_id {
+            // Skip every connection of the excepted machine (agents are keyed by
+            // session id now, so compare the agent id, not the map key).
+            if Some(entry.value().info.id.as_str()) == except_id {
                 continue;
             }
             let _ = entry.tx.try_send(json.clone());
