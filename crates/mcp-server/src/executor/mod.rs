@@ -114,7 +114,7 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                     .unwrap_or_else(|_| "unknown".to_string()),
                 tags: state.config.tags.clone(),
                 platform: remote_agents_shared::PlatformInfo::detect(),
-                autonomous: state.config.autonomous.enabled,
+                autonomous: state.autonomous().enabled(),
                 accepts_commands: state.config.accepts_commands,
                 connected_at: 0,
                 session_id: None,
@@ -412,8 +412,18 @@ mod tests {
 
     #[tokio::test]
     async fn task_dispatch_errors_when_autonomous_disabled() {
-        // Config::default() leaves autonomous mode disabled.
-        let state = bypass_state().await;
+        // Force autonomous off (default is auto-detect, which could be enabled on
+        // a machine that has the runner CLI on PATH).
+        let config = Config {
+            autonomous: crate::config::AutonomousConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let state = AgentState::new(config);
+        state.set_mode(AgentMode::Bypass).await;
+
         let cmd = Command::TaskDispatch { prompt: "do a thing".into(), initiator: None };
         let err = execute(&cmd, &state).await.unwrap_err().to_string();
         assert!(err.contains("autonomous mode is not enabled"), "got: {err}");

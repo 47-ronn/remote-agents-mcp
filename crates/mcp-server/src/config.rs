@@ -61,9 +61,12 @@ fn default_accepts_commands() -> bool {
 /// never stores any keys itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutonomousConfig {
-    /// Enable autonomous task execution on this host.
-    #[serde(default)]
-    pub enabled: bool,
+    /// Whether this host runs autonomous AI tasks. `None` (the default) means
+    /// auto-detect: available iff the `runner` program resolves on PATH. Set
+    /// `Some(true)` to force on or `Some(false)` to force off (send a node a
+    /// runner it doesn't have, or force-off, to keep it a plain executor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 
     /// Runner command + leading args. The task prompt is appended as the final
     /// argument. Default: `["claude", "-p"]` (Claude Code headless).
@@ -82,7 +85,7 @@ pub struct AutonomousConfig {
 impl Default for AutonomousConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             runner: default_runner(),
             workdir: None,
             timeout: default_task_timeout(),
@@ -92,6 +95,34 @@ impl Default for AutonomousConfig {
 
 fn default_runner() -> Vec<String> {
     vec!["claude".to_string(), "-p".to_string()]
+}
+
+/// Effective autonomous availability: an explicit `enabled` override, else
+/// auto-detect by whether the runner's program is on PATH. This is what
+/// `AgentInfo.autonomous` advertises, so the fleet can route AI tasks to hosts
+/// that can actually run them.
+pub fn autonomous_available(cfg: &AutonomousConfig) -> bool {
+    cfg.enabled.unwrap_or_else(|| ai_runner_available(&cfg.runner))
+}
+
+/// Whether the runner's program resolves (so this host can launch the AI CLI).
+/// Does NOT verify the CLI is logged in — that only surfaces when a task runs.
+fn ai_runner_available(runner: &[String]) -> bool {
+    runner.first().is_some_and(|p| program_on_path(p))
+}
+
+/// Resolve a program name to an executable: an absolute/relative path is checked
+/// directly, otherwise each `PATH` entry is searched.
+fn program_on_path(prog: &str) -> bool {
+    if prog.is_empty() {
+        return false;
+    }
+    if prog.contains('/') {
+        return std::path::Path::new(prog).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(prog).is_file()))
+        .unwrap_or(false)
 }
 
 fn default_task_timeout() -> u64 {
@@ -513,7 +544,7 @@ mod tests {
         assert_eq!(config.tags, vec!["backend", "api"]);
         assert_eq!(config.security.mode, AgentMode::Edit);
         assert_eq!(config.security.max_backup_versions, 5);
-        assert!(config.autonomous.enabled);
+        assert_eq!(config.autonomous.enabled, Some(true));
         assert_eq!(config.autonomous.timeout, 7200);
     }
 
@@ -529,10 +560,35 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_available_detects_runner_on_path() {
+        // Explicit override wins over detection.
+        let forced_on = AutonomousConfig { enabled: Some(true), runner: vec!["nope-xyz".into()], ..Default::default() };
+        assert!(autonomous_available(&forced_on));
+        let forced_off = AutonomousConfig { enabled: Some(false), runner: vec!["sh".into()], ..Default::default() };
+        assert!(!autonomous_available(&forced_off));
+
+        // Auto-detect (enabled = None): a program that's always on PATH vs a bogus one.
+        let present = AutonomousConfig { enabled: None, runner: vec!["sh".into()], ..Default::default() };
+        assert!(autonomous_available(&present), "sh should be on PATH");
+        let absent = AutonomousConfig { enabled: None, runner: vec!["definitely-not-a-real-binary-xyz".into()], ..Default::default() };
+        assert!(!autonomous_available(&absent));
+
+        // Empty runner → not available.
+        let empty = AutonomousConfig { enabled: None, runner: vec![], ..Default::default() };
+        assert!(!autonomous_available(&empty));
+
+        // Absolute path: existing executable vs missing.
+        let abs_ok = AutonomousConfig { enabled: None, runner: vec!["/bin/sh".into()], ..Default::default() };
+        assert!(autonomous_available(&abs_ok));
+        let abs_no = AutonomousConfig { enabled: None, runner: vec!["/no/such/bin".into()], ..Default::default() };
+        assert!(!autonomous_available(&abs_no));
+    }
+
+    #[test]
     fn test_autonomous_defaults() {
         let auto = AutonomousConfig::default();
 
-        assert!(!auto.enabled);
+        assert_eq!(auto.enabled, None); // None = auto-detect by runner-on-PATH
         assert_eq!(auto.runner, vec!["claude", "-p"]);
         assert_eq!(auto.timeout, 3600);
     }

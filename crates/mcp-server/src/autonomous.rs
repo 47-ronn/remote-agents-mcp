@@ -24,6 +24,9 @@ use tracing::{error, info, warn};
 
 pub struct AutonomousStore {
     config: AutonomousConfig,
+    /// Effective availability (explicit override or auto-detected runner on
+    /// PATH), computed once at load. Gates whether dispatch is accepted.
+    available: bool,
     db: Mutex<Connection>,
     /// Outbound event channel: completion is pushed here, forwarded to the relay
     /// by the connection loop.
@@ -45,21 +48,23 @@ impl AutonomousStore {
             }
         };
         let _ = init_schema(&conn);
+        let available = crate::config::autonomous_available(&config);
         Self {
             config,
+            available,
             db: Mutex::new(conn),
             events,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.config.enabled
+        self.available
     }
 
     /// Accept a task: persist it as Queued and spawn the runner in the
     /// background. Returns the new task id immediately.
     pub fn dispatch(self: &Arc<Self>, prompt: &str, initiator: Option<String>) -> Result<String> {
-        if !self.config.enabled {
+        if !self.available {
             bail!("autonomous mode is not enabled on this host");
         }
 
@@ -341,7 +346,7 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed),
         ));
         let cfg = AutonomousConfig {
-            enabled,
+            enabled: Some(enabled),
             runner: runner.into_iter().map(String::from).collect(),
             ..Default::default()
         };

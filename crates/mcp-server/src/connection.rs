@@ -452,7 +452,7 @@ pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::Agen
             .unwrap_or_else(|_| "unknown".to_string()),
         tags: config.tags.clone(),
         platform: remote_agents_shared::PlatformInfo::detect(),
-        autonomous: config.autonomous.enabled,
+        autonomous: crate::config::autonomous_available(&config.autonomous),
         accepts_commands: config.accepts_commands,
         connected_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -501,7 +501,7 @@ mod tests {
             tags: vec!["gpu".into(), "linux".into()],
             ..Default::default()
         };
-        config.autonomous.enabled = true;
+        config.autonomous.enabled = Some(true);
 
         let info = build_agent_info(&config, AgentMode::Edit);
 
