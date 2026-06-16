@@ -623,4 +623,80 @@ mod tests {
             other => panic!("expected ReduceResult, got {other:?}"),
         }
     }
+
+    #[test]
+    fn server_message_roundtrips_with_snake_case_tag() {
+        // Server messages had no roundtrip coverage; lock the wire contract.
+        let msg = ServerMessage::AuthOk { session_id: "sess-9".into() };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"type\":\"auth_ok\""), "tag: {json}");
+        match ServerMessage::from_json(&json).unwrap() {
+            ServerMessage::AuthOk { session_id } => assert_eq!(session_id, "sess-9"),
+            other => panic!("expected AuthOk, got {other:?}"),
+        }
+
+        // A Command envelope carries only clear-text routing metadata.
+        let cmd = ServerMessage::Command {
+            request_id: "r1".into(),
+            from_session: "mcp-1".into(),
+            payload: "<ciphertext>".into(),
+        };
+        let json = cmd.to_json().unwrap();
+        assert!(json.contains("\"type\":\"command\""));
+        match ServerMessage::from_json(&json).unwrap() {
+            ServerMessage::Command { request_id, from_session, .. } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(from_session, "mcp-1");
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_udp_offer_variant_roundtrips() {
+        // Newtype tuple variants inside an internally-tagged enum are subtle —
+        // lock that UdpOffer/Answer/Result survive a JSON roundtrip.
+        use crate::udp::{Endpoint, UdpOffer};
+        use std::net::{IpAddr, Ipv4Addr};
+        let offer = UdpOffer {
+            channel_id: "c1".into(),
+            from_session: "a".into(),
+            to_session: "b".into(),
+            local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1111),
+            public_endpoint: None,
+            nonce: [7u8; 16],
+        };
+        let msg = ClientMessage::UdpOffer(offer);
+        let json = msg.to_json().unwrap();
+        match ClientMessage::from_json(&json).unwrap() {
+            ClientMessage::UdpOffer(o) => {
+                assert_eq!(o.channel_id, "c1");
+                assert_eq!(o.nonce, [7u8; 16]);
+            }
+            other => panic!("expected UdpOffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_pull_defaults_remote_to_origin_on_deserialize() {
+        // An MCP client may omit `remote`; serde must fill it with "origin"
+        // (wire-compat with the #[serde(default = "default_origin")] attribute).
+        let json = r#"{"cmd":"git_pull","repo":"/srv/app"}"#;
+        match serde_json::from_str::<Command>(json).unwrap() {
+            Command::GitPull { repo, remote, branch } => {
+                assert_eq!(repo, "/srv/app");
+                assert_eq!(remote, "origin");
+                assert_eq!(branch, None);
+            }
+            other => panic!("expected GitPull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_decrypt_rejects_malformed_envelope() {
+        let cipher = Cipher::for_transport("room-token", None);
+        // Not valid base64 / not a real envelope → decrypt error, never a panic.
+        assert!(Command::decrypt("!!!not-base64!!!", &cipher).is_err());
+        assert!(Command::decrypt("", &cipher).is_err());
+    }
 }
