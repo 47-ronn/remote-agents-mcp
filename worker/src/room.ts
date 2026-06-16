@@ -40,7 +40,11 @@ export class Room implements DurableObject {
 
     if (url.pathname === '/info') {
       return Response.json({
-        agents: this.agentSockets().map(([, a]) => a.agentInfo),
+        agents: this.dedupAgents(
+          this.agentSockets()
+            .map(([, a]) => a.agentInfo)
+            .filter((a): a is AgentInfo => a !== undefined)
+        ),
         mcp_clients: this.mcpSockets().length,
       });
     }
@@ -95,9 +99,11 @@ export class Room implements DurableObject {
       case 'list_agents':
         this.send(ws, {
           type: 'agent_list',
-          agents: this.agentSockets()
-            .map(([, a]) => a.agentInfo)
-            .filter((a): a is AgentInfo => a !== undefined),
+          agents: this.dedupAgents(
+            this.agentSockets()
+              .map(([, a]) => a.agentInfo)
+              .filter((a): a is AgentInfo => a !== undefined)
+          ),
         });
         return;
 
@@ -235,25 +241,48 @@ export class Room implements DurableObject {
 
     if (agentInfo) {
       // Tell the newcomer who its peers are (everyone already here, minus
-      // itself) so a host knows its surroundings immediately.
-      const peers = this.agentSockets()
-        .map(([, a]) => a.agentInfo)
-        .filter((a): a is AgentInfo => !!a && a.id !== agentInfo.id);
+      // itself) so a host knows its surroundings immediately. Collapsed by id:
+      // one machine may hold several connections (many terminals), but it is
+      // one logical peer.
+      const peers = this.dedupAgents(
+        this.agentSockets()
+          .map(([, a]) => a.agentInfo)
+          .filter((a): a is AgentInfo => !!a && a.id !== agentInfo.id)
+      );
       this.send(ws, { type: 'agent_list', agents: peers });
 
-      // Announce the join to MCP clients and to the other agents.
-      this.broadcastToMcp({ type: 'agent_joined', agent: agentInfo });
-      this.broadcastToAgents({ type: 'agent_joined', agent: agentInfo }, agentInfo.id);
+      // Announce the join to MCP clients and to the other agents, carrying the
+      // host's MERGED capabilities (this id may already have other sockets), so
+      // controller caches don't get downgraded by a less-capable connection.
+      const merged =
+        this.dedupAgents(
+          this.agentSockets()
+            .map(([, a]) => a.agentInfo)
+            .filter((a): a is AgentInfo => !!a && a.id === agentInfo.id)
+        )[0] ?? agentInfo;
+      this.broadcastToMcp({ type: 'agent_joined', agent: merged });
+      this.broadcastToAgents({ type: 'agent_joined', agent: merged }, agentInfo.id);
     }
   }
 
   private resolveTarget(target: Target): [WebSocket, Attachment][] {
     const agents = this.agentSockets();
     switch (target.type) {
-      case 'agent':
-        // Explicit target is delivered even to a send-only node (it replies
-        // with its own --no-agent rejection).
-        return agents.filter(([, a]) => a.agentInfo?.id === target.id);
+      case 'agent': {
+        // One logical host may hold several live sockets (many terminals on the
+        // same machine). Deliver an Agent-targeted command to a SINGLE most-
+        // capable socket — preferring one that executes AND is autonomous —
+        // rather than broadcasting to all, which let a stale/less-capable
+        // socket answer first (e.g. "autonomous not enabled"). An explicit
+        // target is still delivered even to a send-only node, so it can reply
+        // with its own --no-agent rejection.
+        const matches = agents.filter(([, a]) => a.agentInfo?.id === target.id);
+        if (matches.length <= 1) return matches;
+        const score = ([, a]: [WebSocket, Attachment]) =>
+          (a.agentInfo?.accepts_commands !== false ? 1 : 0) +
+          (a.agentInfo?.autonomous ? 2 : 0);
+        return [matches.reduce((best, cur) => (score(cur) > score(best) ? cur : best))];
+      }
       case 'all':
         // Broadcasts skip send-only peers (accepts_commands === false): they
         // never execute, so fanning out to them is pointless.
@@ -279,11 +308,18 @@ export class Room implements DurableObject {
   private handleDisconnect(ws: WebSocket) {
     const att = this.att(ws);
     if (att.agentInfo) {
-      this.broadcastToMcp({ type: 'agent_left', agent_id: att.agentInfo.id });
-      this.broadcastToAgents(
-        { type: 'agent_left', agent_id: att.agentInfo.id },
-        att.agentInfo.id
+      // Only announce departure if no OTHER live socket still holds this id.
+      // On a reconnect/replacement the new socket is registered first and then
+      // the old one is closed — suppressing a spurious agent_left that would
+      // otherwise race the agent_joined and make the peer flicker out.
+      const id = att.agentInfo.id;
+      const stillPresent = this.agentSockets().some(
+        ([sock, a]) => sock !== ws && a.agentInfo?.id === id
       );
+      if (!stillPresent) {
+        this.broadcastToMcp({ type: 'agent_left', agent_id: id });
+        this.broadcastToAgents({ type: 'agent_left', agent_id: id }, id);
+      }
     }
     // Drop any in-flight requests this session initiated.
     if (att.sessionId) {
@@ -320,6 +356,31 @@ export class Room implements DurableObject {
   private agentSockets(): [WebSocket, Attachment][] {
     // Peer model: identified peers (those carrying agent_info) are the agents.
     return this.sockets().filter(([, a]) => a.agentInfo);
+  }
+
+  /** Collapse multiple live sockets that share one agent-id into a single
+   * logical host. A machine has a stable agent-id but may hold several
+   * connections at once (many terminals / AI sessions on the same box). The
+   * host is listed once, and a capability (autonomous / accepts_commands) is
+   * present if ANY of its sockets has it — kept in lock-step with the
+   * per-socket pick in resolveTarget('agent'), so a host shown as autonomous
+   * always has an autonomous socket to receive the task. */
+  private dedupAgents(infos: AgentInfo[]): AgentInfo[] {
+    const byId = new Map<string, AgentInfo>();
+    const score = (a: AgentInfo) =>
+      (a.accepts_commands !== false ? 1 : 0) + (a.autonomous ? 2 : 0);
+    for (const info of infos) {
+      const prev = byId.get(info.id);
+      const autonomous = (prev?.autonomous ?? false) || info.autonomous;
+      const accepts =
+        (prev ? prev.accepts_commands !== false : false) ||
+        info.accepts_commands !== false;
+      // Representative = the most capable socket (its session_id/platform), with
+      // the merged capability flags applied.
+      const rep = prev && score(prev) >= score(info) ? prev : info;
+      byId.set(info.id, { ...rep, autonomous, accepts_commands: accepts });
+    }
+    return [...byId.values()];
   }
 
   private mcpSockets(): [WebSocket, Attachment][] {

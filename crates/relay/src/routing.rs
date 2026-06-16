@@ -2,47 +2,99 @@
 //! `worker/src/room.ts`, kept in lock-step via the shared `Target` type.
 
 use crate::state::{Room, Tx};
-use remote_agents_shared::Target;
+use remote_agents_shared::{AgentInfo, Target};
+use std::collections::HashMap;
 
-/// Resolve the outbound senders of all agents matching `target`.
-/// Returns `(agent_id, tx)` pairs.
+/// Capability score for picking the most-capable connection of a host: a socket
+/// that executes scores 1, an autonomous one scores 2 (so an autonomous+
+/// executing socket wins). Kept in lock-step with the worker's `score` in
+/// `resolveTarget('agent')` / `dedupAgents`.
+fn score(info: &AgentInfo) -> u8 {
+    (info.accepts_commands as u8) + if info.autonomous { 2 } else { 0 }
+}
+
+/// Collapse agent sessions that share one agent-id into a single logical host.
+/// A machine may hold several live connections (many terminals on the same box);
+/// it is listed once, and a capability (autonomous / accepts_commands) is present
+/// if ANY of its connections has it. The representative carries the most-capable
+/// connection's metadata (session_id/platform) with the merged flags applied.
+pub fn dedup_agents(room: &Room) -> Vec<AgentInfo> {
+    let mut by_id: HashMap<String, AgentInfo> = HashMap::new();
+    for e in room.agents.iter() {
+        let info = &e.value().info;
+        match by_id.get_mut(&info.id) {
+            None => {
+                by_id.insert(info.id.clone(), info.clone());
+            }
+            Some(rep) => {
+                let autonomous = rep.autonomous || info.autonomous;
+                let accepts = rep.accepts_commands || info.accepts_commands;
+                if score(info) > score(rep) {
+                    *rep = info.clone();
+                }
+                rep.autonomous = autonomous;
+                rep.accepts_commands = accepts;
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// One capable `(id, tx)` per host id, among sockets matching `pred`. Used by
+/// broadcast targets so each machine receives a command once (on its most-
+/// capable connection), never several times for its several open terminals.
+fn dedup_targets(room: &Room, pred: impl Fn(&AgentInfo) -> bool) -> Vec<(String, Tx)> {
+    let mut by_id: HashMap<String, (u8, Tx)> = HashMap::new();
+    for e in room.agents.iter() {
+        let info = &e.value().info;
+        if !pred(info) {
+            continue;
+        }
+        let s = score(info);
+        match by_id.get(&info.id) {
+            Some((best, _)) if *best >= s => {}
+            _ => {
+                by_id.insert(info.id.clone(), (s, e.value().tx.clone()));
+            }
+        }
+    }
+    by_id.into_iter().map(|(id, (_, tx))| (id, tx)).collect()
+}
+
+/// Resolve the outbound senders matching `target`, one per host id (a machine
+/// with several open terminals is one logical peer and is contacted once, on
+/// its most-capable connection).
 ///
 /// Broadcast targets (All/Tagged/Platform) skip send-only peers
 /// (`accepts_commands == false`: `--no-agent` controllers/dashboards) — they
 /// never execute, so fanning out to them is pointless. An explicit
-/// `Target::Agent` is still delivered (the node replies with its own --no-agent
-/// rejection, which is informative).
+/// `Target::Agent` is still delivered even to a send-only host (it replies with
+/// its own --no-agent rejection, which is informative).
 pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
     match target {
+        // Pick the single most-capable connection for this id (prefer one that
+        // executes AND is autonomous), so a stale/less-capable terminal of the
+        // same machine can't answer first (e.g. "autonomous not enabled").
         Target::Agent { id } => room
             .agents
-            .get(id)
-            .map(|s| vec![(id.clone(), s.tx.clone())])
+            .iter()
+            .filter(|e| &e.value().info.id == id)
+            .max_by_key(|e| score(&e.value().info))
+            .map(|e| vec![(id.clone(), e.value().tx.clone())])
             .unwrap_or_default(),
 
-        Target::All => room
-            .agents
-            .iter()
-            .filter(|e| e.info.accepts_commands)
-            .map(|e| (e.key().clone(), e.tx.clone()))
-            .collect(),
+        Target::All => dedup_targets(room, |i| i.accepts_commands),
 
         // Tagged = any tag overlaps (matches the worker's `.some(...)`).
-        Target::Tagged { tags } => room
-            .agents
-            .iter()
-            .filter(|e| e.info.accepts_commands && e.info.tags.iter().any(|t| tags.contains(t)))
-            .map(|e| (e.key().clone(), e.tx.clone()))
-            .collect(),
+        Target::Tagged { tags } => dedup_targets(room, |i| {
+            i.accepts_commands && i.tags.iter().any(|t| tags.contains(t))
+        }),
 
         // Platform = OS family match (case-insensitive), against the richer
         // `platform.family` with a fallback to the legacy `os` field.
-        Target::Platform { family } => room
-            .agents
-            .iter()
-            .filter(|e| e.info.accepts_commands && platform_matches(&e.info, family))
-            .map(|e| (e.key().clone(), e.tx.clone()))
-            .collect(),
+        Target::Platform { family } => {
+            dedup_targets(room, |i| i.accepts_commands && platform_matches(i, family))
+        }
     }
 }
 
@@ -61,6 +113,11 @@ pub fn platform_matches(info: &remote_agents_shared::AgentInfo, family: &str) ->
 pub fn find_session_tx(room: &Room, session_id: &str) -> Option<Tx> {
     if let Some(mcp) = room.mcp.get(session_id) {
         return Some(mcp.tx.clone());
+    }
+    // Agents are keyed by session id, so a direct lookup wins; fall back to the
+    // info.session_id scan for robustness.
+    if let Some(s) = room.agents.get(session_id) {
+        return Some(s.tx.clone());
     }
     room.agents
         .iter()
@@ -187,10 +244,10 @@ mod tests {
     #[test]
     fn find_session_tx_resolves_by_session_id_not_agent_id() {
         let r = Room::default();
-        // Agent keyed by id "a" but assigned session_id "sess-a" at join.
+        // Agent keyed by its session id "sess-a" (its agent id is "a").
         let mut s = agent("a", &[]);
         s.info.session_id = Some("sess-a".into());
-        r.agents.insert("a".into(), s);
+        r.agents.insert("sess-a".into(), s);
         // MCP client keyed by its session id.
         let (mtx, _mrx) = mpsc::channel(8);
         r.mcp.insert("mcp-1".into(), McpSession { id: "mcp-1".into(), tx: mtx });

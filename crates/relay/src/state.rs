@@ -28,8 +28,10 @@ pub struct McpSession {
     pub tx: Tx,
 }
 
-/// A single room: connected agents (keyed by agent id) and MCP clients (keyed
-/// by session id).
+/// A single room: connected agents and MCP clients, both keyed by **session
+/// id** (one entry per live connection). A machine has a stable agent-id but may
+/// hold several connections at once (many terminals / AI sessions on the same
+/// box); those collapse to one logical peer on read (see `routing::dedup_*`).
 #[derive(Default)]
 pub struct Room {
     pub agents: DashMap<String, AgentSession>,
