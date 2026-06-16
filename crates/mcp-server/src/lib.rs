@@ -13,6 +13,7 @@ pub mod config;
 pub mod connection;
 pub mod daemon;
 pub mod executor;
+pub mod install_mcp;
 pub mod mapreduce;
 pub mod mcp_server;
 pub mod relay_api;
