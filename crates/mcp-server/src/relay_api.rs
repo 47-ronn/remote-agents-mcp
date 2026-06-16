@@ -109,13 +109,15 @@ impl McpServer {
         token: &str,
         key: Option<&str>,
         agent_info: Option<Box<AgentInfo>>,
+        executor_state: Option<Arc<crate::state::AgentState>>,
     ) -> Result<String> {
         // Remember our own id so dispatched tasks can record us as initiator.
         if let Some(info) = &agent_info {
             *self.self_id.write().await = Some(info.id.clone());
         }
         let mut pool = self.connections.write().await;
-        pool.connect(relay_url, room, token, key, agent_info).await
+        pool.connect(relay_url, room, token, key, agent_info, executor_state)
+            .await
     }
 
     /// Leave a room

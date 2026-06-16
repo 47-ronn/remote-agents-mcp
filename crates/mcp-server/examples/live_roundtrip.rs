@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "echo roundtrip-ok from $(hostname)".into());
 
     let mcp = McpServer::new();
-    let session = mcp.join_room(&relay, &room, &token, None, None).await?;
+    let session = mcp.join_room(&relay, &room, &token, None, None, None).await?;
     println!("joined room '{room}' as session {session}");
 
     // Give the relay a moment to deliver the agent list.

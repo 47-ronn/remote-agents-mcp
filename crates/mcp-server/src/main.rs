@@ -50,7 +50,9 @@ enum Commands {
         no_agent: bool,
     },
 
-    /// Run as MCP stdio server (for Claude Desktop, opencode, etc.)
+    /// Run as MCP stdio server (for Claude Desktop, opencode, etc.). The node
+    /// also joins the room as a FULL peer (executes commands from others) unless
+    /// `--no-agent` is given.
     Mcp {
         /// Agent name (default: hostname)
         #[arg(short, long)]
@@ -67,6 +69,14 @@ enum Commands {
         /// Relay server URL
         #[arg(long)]
         relay: Option<String>,
+
+        /// Tags for this node as a peer (comma-separated)
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Send-only peer: dispatch work but never execute others' commands.
+        #[arg(long)]
+        no_agent: bool,
     },
 
     /// Run BOTH an agent and an MCP server in one process: this node becomes a
@@ -152,11 +162,13 @@ async fn main() -> Result<()> {
         } => {
             run_agent(room, token, relay, name, tags, no_agent).await?;
         }
-        Commands::Mcp { name, room, token, relay } => {
-            run_mcp(name, room, token, relay).await?;
+        Commands::Mcp { name, room, token, relay, tags, no_agent } => {
+            run_mcp(name, room, token, relay, tags, no_agent).await?;
         }
         Commands::Hybrid { name, room, token, relay, tags, no_agent } => {
-            run_hybrid(room, token, relay, name, tags, no_agent).await?;
+            // `mcp` mode is already a full peer (executes + serves MCP), so hybrid
+            // is just an alias for it.
+            run_mcp(name, room, token, relay, tags, no_agent).await?;
         }
         Commands::Init => {
             config::init_config()?;
@@ -248,46 +260,18 @@ async fn run_agent(
 /// local AI) concurrently, from one process. The MCP stdio server drives the
 /// process lifetime (it returns when its client closes stdin); the agent side
 /// is then aborted.
-async fn run_hybrid(
-    room: Option<String>,
-    token: Option<String>,
-    relay: Option<String>,
-    name: Option<String>,
-    tags: Option<String>,
-    no_agent: bool,
-) -> Result<()> {
-    let cfg = build_config(room, token, relay, name, tags, no_agent);
-
-    info!(
-        "Starting HYBRID node '{}' in room '{}' at {} (agent + MCP controller)",
-        cfg.name, cfg.room, cfg.relay_url
-    );
-
-    // Agent side: a controllable peer with its own executor. connection::run
-    // reconnects internally and effectively runs until the process exits.
-    let agent_cfg = cfg.clone();
-    let agent = tokio::spawn(async move {
-        if let Err(e) = connection::run(&agent_cfg).await {
-            tracing::error!("hybrid agent side ended: {}", e);
-        }
-    });
-
-    // Controller side: MCP stdio server. Returns when the MCP client disconnects.
-    let result = mcp_server::run_mcp_server(&cfg).await;
-
-    agent.abort();
-    result
-}
-
 async fn run_mcp(
     name: Option<String>,
     room: Option<String>,
     token: Option<String>,
     relay: Option<String>,
+    tags: Option<String>,
+    no_agent: bool,
 ) -> Result<()> {
-    let cfg = build_config(room, token, relay, name, None, false);
+    let cfg = build_config(room, token, relay, name, tags, no_agent);
 
-    // MCP mode with optional relay connection for remote agent control
+    // MCP stdio server + full peer (executes commands from the room unless
+    // --no-agent). The single relay connection both serves and executes.
     mcp_server::run_mcp_server(&cfg).await
 }
 

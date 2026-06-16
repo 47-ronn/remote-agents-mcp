@@ -1000,11 +1000,17 @@ pub async fn run_mcp_server(config: &Config) -> Result<()> {
             config.room
         );
         let relay = Arc::new(crate::relay_api::McpServer::new());
-        // Advertise this controller as a visible, send-only peer (no executor on
-        // the controller side → accepts_commands = false). Peer model: it shows
-        // up in list_agents and can dispatch work, but never executes others'.
-        let mut peer_info = crate::connection::build_agent_info(config, config.security.mode);
-        peer_info.accepts_commands = false;
+        // Peer model: this node joins as a FULL peer — visible in list_agents,
+        // dispatches work via the MCP tools, AND executes commands from other
+        // peers via the shared executor (so `mcp` mode accepts commands by
+        // default, like any peer). `accepts_commands` comes from config: only
+        // `--no-agent` makes it send-only (and then we pass no executor).
+        let peer_info = crate::connection::build_agent_info(config, state.mode().await);
+        let executor = if config.accepts_commands {
+            Some(Arc::new(state.clone()))
+        } else {
+            None
+        };
         match relay
             .join_room(
                 &config.relay_url,
@@ -1012,6 +1018,7 @@ pub async fn run_mcp_server(config: &Config) -> Result<()> {
                 &config.token,
                 None,
                 Some(Box::new(peer_info)),
+                executor,
             )
             .await
         {

@@ -103,10 +103,13 @@ impl ConnectionPool {
         room: &str,
         token: &str,
         key: Option<&str>,
-        // The node's own peer identity, advertised so this controller is visible
-        // in the room's `list_agents` (peer model). Typically a send-only peer
-        // (`accepts_commands = false`) since a pure controller has no executor.
+        // The node's own peer identity, advertised so this node is visible in
+        // the room's `list_agents` (peer model).
         agent_info: Option<Box<AgentInfo>>,
+        // Local executor state. When present, incoming commands from other peers
+        // are executed here too — making this a full peer (executes + controls)
+        // on a single connection, not a send-only controller.
+        executor_state: Option<Arc<crate::state::AgentState>>,
     ) -> Result<String> {
         if self.rooms.contains_key(room) {
             return Ok(format!("Already connected to room '{}'", room));
@@ -184,6 +187,7 @@ impl ConnectionPool {
         let tx_clone = tx.clone();
         let udp_transport_clone = udp_transport.clone();
 
+        let executor_clone = executor_state.clone();
         tokio::spawn(async move {
             let shared = HandlerShared {
                 agents: agents_clone,
@@ -194,6 +198,7 @@ impl ConnectionPool {
                 watched: watched_clone,
                 tx: tx_clone,
                 udp_transport: udp_transport_clone,
+                executor_state: executor_clone,
             };
             loop {
                 tokio::select! {
@@ -575,6 +580,8 @@ struct HandlerShared {
     watched: WatchMap,
     tx: mpsc::Sender<ClientMessage>,
     udp_transport: Arc<UdpTransport>,
+    /// When set, this node also executes commands received from other peers.
+    executor_state: Option<Arc<crate::state::AgentState>>,
 }
 
 /// Agents we can open a UDP data channel to: those that the relay has assigned
@@ -675,6 +682,40 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
 
         ServerMessage::Event { agent_id, event } => {
             handle_event(shared, &agent_id, event).await;
+        }
+
+        // Incoming command from another peer — execute it locally if we have an
+        // executor (peer model: this node is a full peer, not just a controller).
+        ServerMessage::Command { request_id, payload, .. } => {
+            let Some(state) = &shared.executor_state else {
+                return Ok(()); // no executor: we don't run others' commands
+            };
+            let reply = match Command::decrypt(&payload, &shared.cipher) {
+                Ok(cmd) => match crate::executor::execute(&cmd, state).await {
+                    Ok(result) => match result.encrypt(&shared.cipher) {
+                        Ok(envelope) => ClientMessage::CommandResult {
+                            request_id,
+                            result: envelope,
+                        },
+                        Err(e) => ClientMessage::CommandError {
+                            request_id,
+                            error: format!("result encryption failed: {e}"),
+                        },
+                    },
+                    Err(e) => ClientMessage::CommandError {
+                        request_id,
+                        error: e.to_string(),
+                    },
+                },
+                Err(e) => {
+                    warn!("Failed to decrypt incoming command {}: {}", request_id, e);
+                    ClientMessage::CommandError {
+                        request_id,
+                        error: "payload decryption failed (key mismatch?)".to_string(),
+                    }
+                }
+            };
+            let _ = shared.tx.send(reply).await;
         }
 
         ServerMessage::Pong => {
@@ -922,6 +963,7 @@ mod tests {
             watched: watched.clone(),
             tx,
             udp_transport: Arc::new(UdpTransport::new(cipher, sig_tx)),
+            executor_state: None,
         };
         (shared, rx, watched, events)
     }
