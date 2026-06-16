@@ -263,6 +263,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_mode_permission_matrix() {
+        // The security gate the executor relies on: who may write / exec / backup.
+        assert!(!AgentMode::Plan.allows_write());
+        assert!(AgentMode::Edit.allows_write());
+        assert!(AgentMode::Bypass.allows_write());
+        assert!(!AgentMode::Disabled.allows_write());
+
+        // Exec is allowed in every mode except Disabled.
+        assert!(AgentMode::Plan.allows_exec());
+        assert!(AgentMode::Edit.allows_exec());
+        assert!(AgentMode::Bypass.allows_exec());
+        assert!(!AgentMode::Disabled.allows_exec());
+
+        // Only Edit takes automatic backups (Bypass is unrestricted, no backup).
+        assert!(AgentMode::Edit.requires_backup());
+        assert!(!AgentMode::Plan.requires_backup());
+        assert!(!AgentMode::Bypass.requires_backup());
+        assert!(!AgentMode::Disabled.requires_backup());
+    }
+
+    #[test]
+    fn agent_mode_default_is_plan() {
+        // The safe default: a freshly-constructed mode is read-only.
+        assert_eq!(AgentMode::default(), AgentMode::Plan);
+    }
+
+    #[test]
+    fn agent_mode_serde_is_lowercase() {
+        for (mode, tok) in [
+            (AgentMode::Plan, "\"plan\""),
+            (AgentMode::Edit, "\"edit\""),
+            (AgentMode::Bypass, "\"bypass\""),
+            (AgentMode::Disabled, "\"disabled\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), tok);
+            assert_eq!(serde_json::from_str::<AgentMode>(tok).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn target_serde_wire_format() {
+        // Internally-tagged with `type`, lowercase variant names — the on-wire
+        // contract the relay routes on.
+        let agent = serde_json::to_value(Target::Agent { id: "a1".into() }).unwrap();
+        assert_eq!(agent["type"], "agent");
+        assert_eq!(agent["id"], "a1");
+
+        assert_eq!(serde_json::to_value(Target::All).unwrap()["type"], "all");
+
+        let tagged = serde_json::to_value(Target::Tagged { tags: vec!["gpu".into()] }).unwrap();
+        assert_eq!(tagged["type"], "tagged");
+        assert_eq!(tagged["tags"][0], "gpu");
+
+        let platform = serde_json::to_value(Target::Platform { family: "linux".into() }).unwrap();
+        assert_eq!(platform["type"], "platform");
+        assert_eq!(platform["family"], "linux");
+
+        // Round-trips back to the same variant.
+        let json = r#"{"type":"agent","id":"x"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Target>(json).unwrap(),
+            Target::Agent { id } if id == "x"
+        ));
+    }
+
+    #[test]
+    fn parse_os_release_unquoted_value() {
+        // Some distros emit PRETTY_NAME without surrounding quotes.
+        assert_eq!(parse_os_release("PRETTY_NAME=Alpine\n").as_deref(), Some("Alpine"));
+    }
+
+    #[test]
     fn parse_os_release_extracts_pretty_name() {
         let body = "NAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nPRETTY_NAME=\"Ubuntu 22.04.5 LTS\"\nID=ubuntu\n";
         assert_eq!(parse_os_release(body).as_deref(), Some("Ubuntu 22.04.5 LTS"));
