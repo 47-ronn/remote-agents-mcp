@@ -38,6 +38,19 @@ Supported platforms: linux x64/arm64, macOS x64/arm64, windows x64.
 `install`, …). See the [project README](https://github.com/ObsidianMotorman/tunshell_mcp_agents#readme)
 for the full documentation.
 
+## Update checks
+
+When started in a long-running mode (`run` / `mcp` / `hybrid`), the launcher does
+a best-effort check against the npm registry and logs a notice if a newer
+version is published. It is **notify-only** — the agent never self-updates, so a
+running task is never interrupted. Update at your convenience with:
+
+```bash
+npm i -g remote-agents@latest
+```
+
+Set `REMOTE_AGENTS_NO_UPDATE_CHECK=1` to disable the check entirely.
+
 ## License
 
 MIT

@@ -41,4 +41,4 @@ jobs:
       - name: npm package — syntax check
         run: node --check npm/install.js && node --check npm/run.js
       - name: npm package — unit tests
-        run: node --test npm/install.test.js
+        run: node --test npm/install.test.js npm/run.test.js
