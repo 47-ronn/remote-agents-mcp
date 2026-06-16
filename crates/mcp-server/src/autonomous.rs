@@ -61,9 +61,21 @@ impl AutonomousStore {
         self.available
     }
 
-    /// Accept a task: persist it as Queued and spawn the runner in the
-    /// background. Returns the new task id immediately.
+    /// Accept a task with the configured runner.
     pub fn dispatch(self: &Arc<Self>, prompt: &str, initiator: Option<String>) -> Result<String> {
+        self.dispatch_with_runner(prompt, initiator, None)
+    }
+
+    /// Accept a task: persist it as Queued and spawn the runner in the
+    /// background. `runner_override` replaces the configured runner (used to
+    /// resume a specific provider session, e.g. `claude -p --resume <id>`).
+    /// Returns the new task id immediately.
+    pub fn dispatch_with_runner(
+        self: &Arc<Self>,
+        prompt: &str,
+        initiator: Option<String>,
+        runner_override: Option<Vec<String>>,
+    ) -> Result<String> {
         if !self.available {
             bail!("autonomous mode is not enabled on this host");
         }
@@ -88,7 +100,7 @@ impl AutonomousStore {
         let prompt = prompt.to_string();
         let id_bg = id.clone();
         tokio::spawn(async move {
-            store.run_task(&id_bg, &prompt).await;
+            store.run_task(&id_bg, &prompt, runner_override).await;
         });
 
         info!("Autonomous task '{}' queued", id);
@@ -123,17 +135,18 @@ impl AutonomousStore {
 
     // --- internals ---------------------------------------------------------
 
-    async fn run_task(&self, id: &str, prompt: &str) {
-        if self.config.runner.is_empty() {
+    async fn run_task(&self, id: &str, prompt: &str, runner_override: Option<Vec<String>>) {
+        let runner = runner_override.as_ref().unwrap_or(&self.config.runner);
+        if runner.is_empty() {
             self.finish(id, TaskStatus::Failed, None, Some("empty runner command".into()), None);
             return;
         }
 
         self.mark_running(id);
 
-        let program = &self.config.runner[0];
+        let program = &runner[0];
         let mut cmd = Command::new(program);
-        cmd.args(&self.config.runner[1..]);
+        cmd.args(&runner[1..]);
         cmd.arg(prompt); // prompt appended as the final argument
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(dir) = &self.config.workdir {

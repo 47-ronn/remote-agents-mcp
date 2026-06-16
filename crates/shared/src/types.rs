@@ -159,6 +159,35 @@ pub struct AgentInfo {
     pub update_available: Option<String>,
 }
 
+/// Metadata for one AI-provider conversation (claude / opencode) stored on a
+/// host. The full transcript is fetched lazily on demand (see SessionGet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// AI provider: `claude` | `opencode`.
+    pub provider: String,
+    /// Provider-native session id (claude: uuid; opencode: `ses_…`).
+    pub id: String,
+    /// Human-readable title (provider-generated or first user message).
+    pub title: String,
+    /// Last-activity timestamp (Unix ms).
+    pub updated: u64,
+    /// Working directory / project the session belongs to, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// One message in a session transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessage {
+    /// `user` | `assistant` | `system`.
+    pub role: String,
+    /// Message text (tool/structured parts are flattened to text).
+    pub text: String,
+    /// Timestamp (Unix ms), if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+}
+
 /// Lifecycle status of an autonomous task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

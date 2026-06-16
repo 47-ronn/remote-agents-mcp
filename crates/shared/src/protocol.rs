@@ -187,6 +187,29 @@ pub enum Command {
     /// List autonomous tasks on the host
     TaskList,
 
+    // === AI-provider sessions (claude / opencode history) ===
+    /// List the host's provider conversations (metadata only).
+    SessionList,
+
+    /// Fetch the full transcript of one provider session.
+    SessionGet {
+        provider: String,
+        id: String,
+    },
+
+    /// Continue a provider session with a new prompt (resume context on the host
+    /// that owns it). Runs as an autonomous task with a resume runner.
+    SessionResume {
+        provider: String,
+        id: String,
+        prompt: String,
+    },
+
+    /// Terminate a live provider session running on the host (kill its process).
+    SessionTerminate {
+        id: String,
+    },
+
     /// Change agent mode
     SetMode {
         mode: AgentMode,
@@ -387,6 +410,19 @@ pub enum CommandResult {
     /// List of autonomous tasks
     TaskList {
         tasks: Vec<AutonomousTask>,
+    },
+
+    // === AI-provider sessions ===
+    /// Provider session metadata + the ids of sessions currently live on the host.
+    SessionList {
+        sessions: Vec<SessionMeta>,
+        #[serde(default)]
+        active: Vec<String>,
+    },
+
+    /// Full transcript of one session.
+    SessionTranscript {
+        messages: Vec<SessionMessage>,
     },
 
     // === Distributed compute (MapReduce, Phase 13) ===

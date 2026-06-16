@@ -220,6 +220,45 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::TaskList { tasks })
         }
 
+        // === AI-provider sessions (claude / opencode history) ===
+        Command::SessionList => {
+            // Filesystem/CLI scans are blocking — keep them off the async runtime.
+            let (sessions, active) = tokio::task::spawn_blocking(|| {
+                (crate::sessions::list_sessions(), crate::sessions::active_sessions())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("session scan failed: {e}"))?;
+            Ok(CommandResult::SessionList { sessions, active })
+        }
+
+        Command::SessionGet { provider, id } => {
+            let (provider, id) = (provider.clone(), id.clone());
+            let messages = tokio::task::spawn_blocking(move || {
+                crate::sessions::get_transcript(&provider, &id)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("transcript fetch failed: {e}"))??;
+            Ok(CommandResult::SessionTranscript { messages })
+        }
+
+        Command::SessionResume { provider, id, prompt } => {
+            let store = state.autonomous();
+            if !store.enabled() {
+                bail!("autonomous mode is not enabled on this host");
+            }
+            let runner = crate::sessions::resume_runner(provider, id)?;
+            let new_id = store.dispatch_with_runner(prompt, None, Some(runner))?;
+            Ok(CommandResult::TaskQueued { id: new_id })
+        }
+
+        Command::SessionTerminate { id } => {
+            let id = id.clone();
+            tokio::task::spawn_blocking(move || crate::sessions::terminate(&id))
+                .await
+                .map_err(|e| anyhow::anyhow!("terminate failed: {e}"))??;
+            Ok(CommandResult::Ok)
+        }
+
         // MapReduce (Phase 13): map_fn/reduce_fn are shell commands; the
         // partition data (or collected map outputs) is fed on stdin. This
         // reuses the existing shell executor and safety policy — no separate
