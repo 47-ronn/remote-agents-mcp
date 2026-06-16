@@ -203,8 +203,10 @@ export class Room implements DurableObject {
   private handleAuth(ws: WebSocket, msg: Extract<ClientMessage, { type: 'auth' }>) {
     const att = this.att(ws);
 
-    // Cloudflare-parity soft auth: if a query token was supplied, it must match.
-    if (att.token !== '' && msg.token !== att.token) {
+    // The auth token must equal the connection's query token (our clients send
+    // the same value in both). An empty/absent query token only admits an empty
+    // auth token — it no longer admits an arbitrary one (closed open-access hole).
+    if (msg.token !== att.token) {
       this.send(ws, { type: 'auth_failed', reason: 'Invalid token' });
       ws.close(1008, 'Invalid token');
       return;

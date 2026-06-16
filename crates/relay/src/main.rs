@@ -36,6 +36,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.token.is_none() {
+        tracing::warn!(
+            "running WITHOUT --token: room access is not gated at the relay (any \
+             token-consistent client can join a room and read its metadata). \
+             E2E encryption still protects payloads. Use --token in production."
+        );
+    }
     let state = Arc::new(RelayState::new(cli.token));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await?;

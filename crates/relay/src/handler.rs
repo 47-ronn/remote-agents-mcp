@@ -193,16 +193,15 @@ pub async fn handle_socket(
 
 /// Auth parity with the Cloudflare worker, plus optional server-enforced token:
 /// - if a server token is configured, the auth token must equal it;
-/// - otherwise, if a non-empty query token was supplied, the auth token must
-///   match it; an empty query token allows any (dev parity).
+/// - otherwise, the auth token must equal the connection's query token. Our
+///   clients always send the same value in both, so legit connections are
+///   unaffected; an empty/absent query token now only admits an empty auth token
+///   (previously it admitted ANY auth token — an open-access hole).
 fn auth_ok(state: &RelayState, query_token: Option<&str>, auth_token: &str) -> bool {
     if let Some(server) = &state.token {
         return auth_token == server;
     }
-    match query_token {
-        Some(q) if !q.is_empty() => auth_token == q,
-        _ => true,
-    }
+    query_token.unwrap_or("") == auth_token
 }
 
 /// Route one client message. Returns `Break` to close the connection.
@@ -401,9 +400,13 @@ mod tests {
     #[test]
     fn auth_ok_query_token_when_no_server_token() {
         let s = RelayState::new(None);
-        assert!(auth_ok(&s, Some("q"), "q")); // non-empty query must match
+        assert!(auth_ok(&s, Some("q"), "q")); // query must equal auth
         assert!(!auth_ok(&s, Some("q"), "x")); // mismatch rejected
-        assert!(auth_ok(&s, Some(""), "whatever")); // empty query → allow (dev parity)
-        assert!(auth_ok(&s, None, "whatever")); // no query → allow
+        // Empty/absent query no longer admits an arbitrary auth token (the
+        // closed open-access hole): it must also be empty.
+        assert!(!auth_ok(&s, Some(""), "whatever"));
+        assert!(!auth_ok(&s, None, "whatever"));
+        assert!(auth_ok(&s, Some(""), "")); // empty == empty (token-less dev)
+        assert!(auth_ok(&s, None, "")); // absent query == empty auth
     }
 }
