@@ -897,4 +897,97 @@ mod tests {
         let udp = UdpTransport::new(Cipher::from_passphrase("k"), sig_tx);
         assert!(!udp.has_channel("sess-x").await);
     }
+
+    // --- handle_event: push-driven reminder auto-cancel (Phase 11) -----------
+
+    const WATCH_KEY: &str = "k";
+
+    fn handler_shared() -> (HandlerShared, mpsc::Receiver<ClientMessage>, WatchMap, EventMap) {
+        let (tx, rx) = mpsc::channel::<ClientMessage>(8);
+        let (sig_tx, _sig_rx) = mpsc::channel(4);
+        let cipher = Cipher::from_passphrase(WATCH_KEY);
+        let watched: WatchMap = Arc::new(RwLock::new(HashMap::new()));
+        let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
+        let shared = HandlerShared {
+            agents: Arc::new(RwLock::new(Vec::new())),
+            pending: Arc::new(RwLock::new(HashMap::new())),
+            cipher: cipher.clone(),
+            events: events.clone(),
+            events_notify: Arc::new(Notify::new()),
+            watched: watched.clone(),
+            tx,
+            udp_transport: Arc::new(UdpTransport::new(cipher, sig_tx)),
+        };
+        (shared, rx, watched, events)
+    }
+
+    #[tokio::test]
+    async fn completion_event_cancels_registered_watch() {
+        let (shared, mut rx, watched, events) = handler_shared();
+        watched.write().await.insert(
+            "t1".into(),
+            Watch {
+                reminder_name: "remind-t1".into(),
+                self_agent_id: "self-agent".into(),
+            },
+        );
+
+        handle_event(
+            &shared,
+            "host-agent",
+            AgentEvent::TaskCompleted { task_id: "t1".into(), status: TaskStatus::Done },
+        )
+        .await;
+
+        // Status recorded; watch consumed.
+        assert_eq!(events.read().await.get("t1").copied(), Some(TaskStatus::Done));
+        assert!(!watched.read().await.contains_key("t1"));
+
+        // A ScheduleRemove for the reminder is sent to the INITIATOR's self-agent.
+        match rx.try_recv().expect("schedule-remove should be queued") {
+            ClientMessage::Command { target, payload, .. } => {
+                assert!(matches!(target, Target::Agent { id } if id == "self-agent"));
+                let cipher = Cipher::from_passphrase(WATCH_KEY);
+                match Command::decrypt(&payload, &cipher).unwrap() {
+                    Command::ScheduleRemove { name } => assert_eq!(name, "remind-t1"),
+                    other => panic!("expected ScheduleRemove, got {other:?}"),
+                }
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_without_watch_sends_nothing() {
+        let (shared, mut rx, _watched, events) = handler_shared();
+        handle_event(
+            &shared,
+            "host",
+            AgentEvent::TaskCompleted { task_id: "t2".into(), status: TaskStatus::Failed },
+        )
+        .await;
+        assert_eq!(events.read().await.get("t2").copied(), Some(TaskStatus::Failed));
+        assert!(rx.try_recv().is_err(), "no watch → no schedule-remove emitted");
+    }
+
+    #[tokio::test]
+    async fn non_terminal_status_keeps_watch() {
+        let (shared, mut rx, watched, events) = handler_shared();
+        watched.write().await.insert(
+            "t3".into(),
+            Watch { reminder_name: "remind-t3".into(), self_agent_id: "s".into() },
+        );
+
+        // A non-terminal status records progress but must NOT cancel the reminder.
+        handle_event(
+            &shared,
+            "host",
+            AgentEvent::TaskCompleted { task_id: "t3".into(), status: TaskStatus::Running },
+        )
+        .await;
+
+        assert_eq!(events.read().await.get("t3").copied(), Some(TaskStatus::Running));
+        assert!(watched.read().await.contains_key("t3"), "watch must survive non-terminal status");
+        assert!(rx.try_recv().is_err());
+    }
 }
