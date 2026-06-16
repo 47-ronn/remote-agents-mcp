@@ -997,8 +997,19 @@ pub async fn run_mcp_server(config: &Config) -> Result<()> {
             config.room
         );
         let relay = Arc::new(crate::relay_api::McpServer::new());
+        // Advertise this controller as a visible, send-only peer (no executor on
+        // the controller side → accepts_commands = false). Peer model: it shows
+        // up in list_agents and can dispatch work, but never executes others'.
+        let mut peer_info = crate::connection::build_agent_info(config, config.security.mode);
+        peer_info.accepts_commands = false;
         match relay
-            .join_room(&config.relay_url, &config.room, &config.token, None)
+            .join_room(
+                &config.relay_url,
+                &config.room,
+                &config.token,
+                None,
+                Some(Box::new(peer_info)),
+            )
             .await
         {
             Ok(msg) => {

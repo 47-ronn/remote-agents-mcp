@@ -441,7 +441,7 @@ async fn handle_udp_inbound(
     let _ = tx.send(reply).await;
 }
 
-fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> AgentInfo {
+pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> AgentInfo {
     AgentInfo {
         id: config.id.clone(),
         name: config.name.clone(),

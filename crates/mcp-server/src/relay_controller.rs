@@ -103,6 +103,10 @@ impl ConnectionPool {
         room: &str,
         token: &str,
         key: Option<&str>,
+        // The node's own peer identity, advertised so this controller is visible
+        // in the room's `list_agents` (peer model). Typically a send-only peer
+        // (`accepts_commands = false`) since a pure controller has no executor.
+        agent_info: Option<Box<AgentInfo>>,
     ) -> Result<String> {
         if self.rooms.contains_key(room) {
             return Ok(format!("Already connected to room '{}'", room));
@@ -132,12 +136,18 @@ impl ConnectionPool {
         let (udp_signal_tx, mut udp_signal_rx) = mpsc::channel::<SignalMessage>(32);
         let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx));
 
-        // Send auth
+        // Send auth. With a peer identity we register as a visible Agent peer;
+        // without one we fall back to a legacy invisible Mcp controller.
+        let role = if agent_info.is_some() {
+            ClientRole::Agent
+        } else {
+            ClientRole::Mcp
+        };
         let auth_msg = ClientMessage::Auth {
             room: room.to_string(),
             token: token.to_string(),
-            role: ClientRole::Mcp,
-            agent_info: None,
+            role,
+            agent_info,
         };
 
         write

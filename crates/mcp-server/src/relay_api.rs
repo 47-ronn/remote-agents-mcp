@@ -105,9 +105,10 @@ impl McpServer {
         room: &str,
         token: &str,
         key: Option<&str>,
+        agent_info: Option<Box<AgentInfo>>,
     ) -> Result<String> {
         let mut pool = self.connections.write().await;
-        pool.connect(relay_url, room, token, key).await
+        pool.connect(relay_url, room, token, key, agent_info).await
     }
 
     /// Leave a room
