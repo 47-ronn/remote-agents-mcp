@@ -71,3 +71,91 @@ impl RelayState {
             .remove_if(name, |_, room| room.is_empty());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remote_agents_shared::AgentMode;
+
+    fn dummy_tx() -> Tx {
+        mpsc::channel(OUTBOUND_CAP).0
+    }
+
+    fn agent_info(id: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.to_string(),
+            name: "agent".to_string(),
+            mode: AgentMode::Edit,
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            hostname: "host".to_string(),
+            tags: vec![],
+            platform: Default::default(),
+            autonomous: false,
+            connected_at: 0,
+            session_id: None,
+        }
+    }
+
+    fn add_agent(room: &Room, id: &str) {
+        room.agents.insert(
+            id.to_string(),
+            AgentSession {
+                info: agent_info(id),
+                tx: dummy_tx(),
+            },
+        );
+    }
+
+    #[test]
+    fn room_get_or_create_is_idempotent() {
+        let state = RelayState::new(None);
+        let a = state.room("gpu");
+        let b = state.room("gpu");
+        // Same name → same shared Room, not a second instance.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(state.rooms.len(), 1);
+
+        state.room("other");
+        assert_eq!(state.rooms.len(), 2);
+    }
+
+    #[test]
+    fn room_is_empty_tracks_sessions() {
+        let room = Room::default();
+        assert!(room.is_empty());
+
+        add_agent(&room, "a1");
+        assert!(!room.is_empty());
+
+        // An MCP-only room is also non-empty.
+        let room2 = Room::default();
+        room2.mcp.insert(
+            "s1".to_string(),
+            McpSession { id: "s1".to_string(), tx: dummy_tx() },
+        );
+        assert!(!room2.is_empty());
+    }
+
+    #[test]
+    fn gc_room_removes_only_empty_rooms() {
+        let state = RelayState::new(None);
+
+        // Empty room is collected.
+        state.room("empty");
+        assert_eq!(state.rooms.len(), 1);
+        state.gc_room("empty");
+        assert_eq!(state.rooms.len(), 0);
+
+        // Occupied room survives GC.
+        let busy = state.room("busy");
+        add_agent(&busy, "a1");
+        state.gc_room("busy");
+        assert_eq!(state.rooms.len(), 1);
+
+        // After its last connection leaves, GC reclaims it.
+        busy.agents.remove("a1");
+        state.gc_room("busy");
+        assert_eq!(state.rooms.len(), 0);
+    }
+}

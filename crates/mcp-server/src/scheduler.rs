@@ -295,12 +295,101 @@ pub fn is_valid_cron(expr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A unique temp DB path per test, so parallel tests never share a file.
+    fn fresh_path(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "sched-{}-{}-{}.db",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
 
     #[test]
     fn rejects_invalid_cron() {
         assert!(Scheduler::validate_cron("not a cron").is_err());
         assert!(Scheduler::validate_cron("0 0 * * * *").is_ok());
         assert!(Scheduler::validate_cron("*/5 * * * * *").is_ok());
+    }
+
+    #[test]
+    fn is_valid_cron_checks_field_count() {
+        assert!(is_valid_cron("0 0 3 * * *")); // 6-field
+        assert!(is_valid_cron("*/5 * * * * *"));
+        assert!(!is_valid_cron("* * * * *")); // 5-field: not accepted
+        assert!(!is_valid_cron("garbage"));
+        assert!(!is_valid_cron(""));
+    }
+
+    #[test]
+    fn ms_to_dt_roundtrips() {
+        let dt = ms_to_dt(1_700_000_000_000).expect("valid ms");
+        assert_eq!(dt.timestamp_millis(), 1_700_000_000_000);
+        // Epoch is representable.
+        assert_eq!(ms_to_dt(0).unwrap().timestamp_millis(), 0);
+    }
+
+    #[tokio::test]
+    async fn add_replaces_existing_task() {
+        let path = fresh_path("upsert");
+        let sched = Scheduler::load(path.clone());
+
+        sched.add("job", "0 0 3 * * *", "echo one").await.unwrap();
+        // Same name → upsert, not a duplicate.
+        sched.add("job", "0 0 4 * * *", "echo two").await.unwrap();
+
+        let list = sched.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].command, "echo two");
+        assert_eq!(list[0].cron, "0 0 4 * * *");
+
+        // The replacement persisted to SQLite.
+        let reloaded = Scheduler::load(path.clone());
+        let rl = reloaded.list().await;
+        assert_eq!(rl.len(), 1);
+        assert_eq!(rl[0].command, "echo two");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tick_fires_due_task() {
+        let path = fresh_path("tick-due");
+        let sched = Scheduler::load(path.clone());
+        sched.add("ping", "* * * * * *", "true").await.unwrap();
+
+        // `add` sets the baseline to now; rewind it so the per-second schedule is
+        // already due on the next tick.
+        sched
+            .baseline
+            .write()
+            .await
+            .insert("ping".to_string(), Utc::now() - chrono::Duration::seconds(5));
+
+        sched.tick().await;
+
+        let task = &sched.list().await[0];
+        assert_eq!(task.run_count, 1, "due task should have fired once");
+        assert!(task.last_run.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_task_not_yet_due() {
+        let path = fresh_path("tick-skip");
+        let sched = Scheduler::load(path.clone());
+        // Daily at 03:00; baseline is now, so it isn't due this tick.
+        sched.add("nightly", "0 0 3 * * *", "true").await.unwrap();
+
+        sched.tick().await;
+
+        assert_eq!(sched.list().await[0].run_count, 0, "not-due task must not fire");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

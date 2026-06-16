@@ -14,7 +14,7 @@ npm install -g remote-agents
 npx remote-agents --help
 ```
 
-Supported platforms: linux x64, macOS x64/arm64, windows x64.
+Supported platforms: linux x64/arm64, macOS x64/arm64, windows x64.
 
 ## Use as an MCP server
 

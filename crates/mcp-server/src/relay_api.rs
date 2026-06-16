@@ -4,8 +4,55 @@
 
 use crate::relay_controller::{AgentOutcome, ConnectionPool};
 use anyhow::Result;
+use remote_agents_shared::{Command, CommandResult};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Build the wire `Command` for a fleet git operation. Pure (no I/O) so the
+/// op-name → command mapping can be unit-tested without a live relay.
+/// `op` is one of `status` | `pull` | `commit` | `push`; a `None` remote
+/// defaults to `origin`.
+fn build_git_command(
+    op: &str,
+    repo: &str,
+    remote: Option<String>,
+    branch: Option<String>,
+    message: Option<String>,
+    files: Vec<String>,
+) -> Result<Command> {
+    let remote = remote.unwrap_or_else(|| "origin".to_string());
+    Ok(match op {
+        "status" => Command::GitStatus {
+            repo: repo.to_string(),
+        },
+        "pull" => Command::GitPull {
+            repo: repo.to_string(),
+            remote,
+            branch,
+        },
+        "commit" => Command::GitCommit {
+            repo: repo.to_string(),
+            message: message.unwrap_or_default(),
+            files,
+        },
+        "push" => Command::GitPush {
+            repo: repo.to_string(),
+            remote,
+            branch,
+        },
+        other => return Err(anyhow::anyhow!("unknown git op '{}'", other)),
+    })
+}
+
+/// Render a `CommandResult` from a git operation into human-readable text.
+/// Pure, so the variant → text mapping is unit-testable.
+fn git_result_text(r: CommandResult) -> String {
+    match r {
+        CommandResult::Git { output, .. } => output,
+        CommandResult::Ok => "ok".to_string(),
+        other => format!("{:?}", other),
+    }
+}
 
 /// MCP Server state
 pub struct McpServer {
@@ -145,28 +192,7 @@ impl McpServer {
         message: Option<String>,
         files: Vec<String>,
     ) -> Result<Vec<AgentOutcome>> {
-        let remote = remote.unwrap_or_else(|| "origin".to_string());
-        let command = match op {
-            "status" => remote_agents_shared::Command::GitStatus {
-                repo: repo.to_string(),
-            },
-            "pull" => remote_agents_shared::Command::GitPull {
-                repo: repo.to_string(),
-                remote,
-                branch,
-            },
-            "commit" => remote_agents_shared::Command::GitCommit {
-                repo: repo.to_string(),
-                message: message.unwrap_or_default(),
-                files,
-            },
-            "push" => remote_agents_shared::Command::GitPush {
-                repo: repo.to_string(),
-                remote,
-                branch,
-            },
-            other => return Err(anyhow::anyhow!("unknown git op '{}'", other)),
-        };
+        let command = build_git_command(op, repo, remote, branch, message, files)?;
         let pool = self.connections.read().await;
         pool.send_command_fleet(room, target, command).await
     }
@@ -337,14 +363,7 @@ impl McpServer {
         let results = pool.send_command(room, target, command).await?;
         Ok(results
             .into_iter()
-            .map(|(id, r)| {
-                let text = match r {
-                    remote_agents_shared::CommandResult::Git { output, .. } => output,
-                    remote_agents_shared::CommandResult::Ok => "ok".to_string(),
-                    other => format!("{:?}", other),
-                };
-                (id, text)
-            })
+            .map(|(id, r)| (id, git_result_text(r)))
             .collect())
     }
 
@@ -514,5 +533,104 @@ impl McpServer {
 impl Default for McpServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_git_command_maps_each_op() {
+        match build_git_command("status", "/repo", None, None, None, vec![]).unwrap() {
+            Command::GitStatus { repo } => assert_eq!(repo, "/repo"),
+            other => panic!("expected GitStatus, got {other:?}"),
+        }
+
+        // pull: explicit remote + branch are threaded through.
+        match build_git_command(
+            "pull",
+            "/repo",
+            Some("upstream".into()),
+            Some("main".into()),
+            None,
+            vec![],
+        )
+        .unwrap()
+        {
+            Command::GitPull { repo, remote, branch } => {
+                assert_eq!(repo, "/repo");
+                assert_eq!(remote, "upstream");
+                assert_eq!(branch.as_deref(), Some("main"));
+            }
+            other => panic!("expected GitPull, got {other:?}"),
+        }
+
+        match build_git_command(
+            "commit",
+            "/repo",
+            None,
+            None,
+            Some("msg".into()),
+            vec!["a.txt".into()],
+        )
+        .unwrap()
+        {
+            Command::GitCommit { repo, message, files } => {
+                assert_eq!(repo, "/repo");
+                assert_eq!(message, "msg");
+                assert_eq!(files, vec!["a.txt".to_string()]);
+            }
+            other => panic!("expected GitCommit, got {other:?}"),
+        }
+
+        match build_git_command("push", "/repo", None, None, None, vec![]).unwrap() {
+            Command::GitPush { remote, .. } => assert_eq!(remote, "origin"),
+            other => panic!("expected GitPush, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_git_command_defaults_remote_to_origin() {
+        match build_git_command("pull", "/repo", None, None, None, vec![]).unwrap() {
+            Command::GitPull { remote, .. } => assert_eq!(remote, "origin"),
+            other => panic!("expected GitPull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_git_command_commit_defaults_empty_message() {
+        match build_git_command("commit", "/repo", None, None, None, vec![]).unwrap() {
+            Command::GitCommit { message, .. } => assert_eq!(message, ""),
+            other => panic!("expected GitCommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_git_command_rejects_unknown_op() {
+        let err = build_git_command("rebase", "/repo", None, None, None, vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown git op"), "got: {err}");
+        assert!(err.contains("rebase"), "op name should be echoed: {err}");
+    }
+
+    #[test]
+    fn git_result_text_renders_variants() {
+        assert_eq!(
+            git_result_text(CommandResult::Git {
+                output: "Already up to date.".into(),
+                success: true,
+            }),
+            "Already up to date."
+        );
+        assert_eq!(git_result_text(CommandResult::Ok), "ok");
+        // A non-git variant falls back to its Debug rendering rather than panicking.
+        let other = git_result_text(CommandResult::Exec {
+            stdout: "hi".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+        assert!(other.contains("Exec"), "got: {other}");
     }
 }

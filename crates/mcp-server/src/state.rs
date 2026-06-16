@@ -61,16 +61,13 @@ impl AgentState {
     /// Add or update one peer (from `AgentJoined`), keyed by agent id.
     pub async fn upsert_peer(&self, peer: AgentInfo) {
         let mut peers = self.peers.write().await;
-        if let Some(slot) = peers.iter_mut().find(|p| p.id == peer.id) {
-            *slot = peer;
-        } else {
-            peers.push(peer);
-        }
+        upsert_peer_in(&mut peers, peer);
     }
 
     /// Drop one peer by id (from `AgentLeft`).
     pub async fn remove_peer(&self, agent_id: &str) {
-        self.peers.write().await.retain(|p| p.id != agent_id);
+        let mut peers = self.peers.write().await;
+        remove_peer_in(&mut peers, agent_id);
     }
 
     /// Receive the next outbound event (used by the connection loop).
@@ -114,6 +111,22 @@ impl AgentState {
     }
 }
 
+/// Insert `peer`, or replace the existing entry with the same id (last write
+/// wins). Pure (operates on the locked vec) so the upsert semantics are
+/// unit-testable without a live relay or disk-backed `AgentState`.
+fn upsert_peer_in(peers: &mut Vec<AgentInfo>, peer: AgentInfo) {
+    if let Some(slot) = peers.iter_mut().find(|p| p.id == peer.id) {
+        *slot = peer;
+    } else {
+        peers.push(peer);
+    }
+}
+
+/// Remove every peer whose id matches `agent_id`.
+fn remove_peer_in(peers: &mut Vec<AgentInfo>, agent_id: &str) {
+    peers.retain(|p| p.id != agent_id);
+}
+
 /// Path to the persisted schedule database (SQLite).
 fn schedule_path() -> PathBuf {
     dirs::data_dir()
@@ -126,4 +139,54 @@ fn tasks_path() -> PathBuf {
     dirs::data_dir()
         .map(|p| p.join("remote-agents").join("tasks.db"))
         .unwrap_or_else(|| PathBuf::from("tasks.db"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(id: &str, name: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            mode: AgentMode::Edit,
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            hostname: "host".to_string(),
+            tags: vec![],
+            platform: Default::default(),
+            autonomous: false,
+            connected_at: 0,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn upsert_peer_inserts_new_then_updates_in_place() {
+        let mut peers = Vec::new();
+
+        upsert_peer_in(&mut peers, peer("a", "alice"));
+        upsert_peer_in(&mut peers, peer("b", "bob"));
+        assert_eq!(peers.len(), 2);
+
+        // Same id → replace in place (no duplicate, order preserved).
+        upsert_peer_in(&mut peers, peer("a", "alice-renamed"));
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].id, "a");
+        assert_eq!(peers[0].name, "alice-renamed");
+        assert_eq!(peers[1].name, "bob");
+    }
+
+    #[test]
+    fn remove_peer_drops_only_matching_id() {
+        let mut peers = vec![peer("a", "alice"), peer("b", "bob")];
+
+        remove_peer_in(&mut peers, "a");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "b");
+
+        // Removing an unknown id is a no-op.
+        remove_peer_in(&mut peers, "zzz");
+        assert_eq!(peers.len(), 1);
+    }
 }

@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   worker:
-    name: Worker (typecheck)
+    name: Worker + npm package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,5 +36,9 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci
-      - name: tsc --noEmit
+      - name: tsc --noEmit (worker)
         run: npx tsc --noEmit -p worker
+      - name: npm package — syntax check
+        run: node --check npm/install.js && node --check npm/run.js
+      - name: npm package — unit tests
+        run: node --test npm/install.test.js

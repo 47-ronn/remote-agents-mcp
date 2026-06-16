@@ -400,3 +400,26 @@ fn broadcast_agents(room: &Room, msg: &ServerMessage, except_id: Option<&str>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_ok_server_token_takes_precedence_and_must_match() {
+        let s = RelayState::new(Some("srv".into()));
+        // Server token is the only thing that matters when configured.
+        assert!(auth_ok(&s, Some("anything"), "srv"));
+        assert!(!auth_ok(&s, Some("srv"), "wrong")); // mismatch rejected even if query matches
+        assert!(!auth_ok(&s, None, "wrong"));
+    }
+
+    #[test]
+    fn auth_ok_query_token_when_no_server_token() {
+        let s = RelayState::new(None);
+        assert!(auth_ok(&s, Some("q"), "q")); // non-empty query must match
+        assert!(!auth_ok(&s, Some("q"), "x")); // mismatch rejected
+        assert!(auth_ok(&s, Some(""), "whatever")); // empty query → allow (dev parity)
+        assert!(auth_ok(&s, None, "whatever")); // no query → allow
+    }
+}

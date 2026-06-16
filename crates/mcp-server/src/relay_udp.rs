@@ -319,12 +319,118 @@ fn spawn_punch_then_loops(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn transport() -> (UdpTransport, mpsc::Receiver<SignalMessage>) {
+        let cipher = Cipher::from_passphrase("test-key");
+        let (tx, rx) = mpsc::channel(16);
+        (UdpTransport::new(cipher, tx), rx)
+    }
+
+    fn endpoint(port: u16) -> Endpoint {
+        Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
 
     #[tokio::test]
     async fn test_transport_creation() {
-        let cipher = Cipher::from_passphrase("test-key");
-        let (tx, _rx) = mpsc::channel(16);
-        let transport = UdpTransport::new(cipher, tx);
+        let (transport, _rx) = transport();
         assert!(transport.public_endpoint().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_and_get_public_endpoint() {
+        let (transport, _rx) = transport();
+        assert!(transport.public_endpoint().await.is_none());
+        transport.set_public_endpoint(endpoint(4500)).await;
+        assert_eq!(transport.public_endpoint().await, Some(endpoint(4500)));
+    }
+
+    #[tokio::test]
+    async fn offer_channel_requires_session_id() {
+        let (transport, _rx) = transport();
+        let err = transport
+            .offer_channel("agent-x".to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Session ID not set"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn handle_offer_requires_session_id() {
+        let (transport, _rx) = transport();
+        let offer = UdpOffer {
+            channel_id: "c1".to_string(),
+            from_session: "peer".to_string(),
+            to_session: "me".to_string(),
+            local_endpoint: endpoint(1111),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+        };
+        let err = transport.handle_offer(offer).await.unwrap_err().to_string();
+        assert!(err.contains("Session ID not set"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn handle_answer_rejected_is_noop() {
+        let (transport, _rx) = transport();
+        let answer = UdpAnswer {
+            channel_id: "c1".to_string(),
+            from_session: "peer".to_string(),
+            local_endpoint: endpoint(1111),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+            accepted: false,
+        };
+        // A rejected answer is accepted gracefully and creates no channel.
+        transport.handle_answer(answer).await.unwrap();
+        assert!(!transport.has_channel("peer").await);
+    }
+
+    #[tokio::test]
+    async fn handle_answer_unknown_channel_errors() {
+        let (transport, _rx) = transport();
+        let answer = UdpAnswer {
+            channel_id: "c1".to_string(),
+            from_session: "ghost".to_string(),
+            local_endpoint: endpoint(1111),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+            accepted: true,
+        };
+        let err = transport.handle_answer(answer).await.unwrap_err().to_string();
+        assert!(err.contains("No channel for agent"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn missing_channel_falls_back_to_ws() {
+        let (transport, _rx) = transport();
+        assert!(!transport.has_udp_channel("nobody").await);
+        assert!(!transport.has_channel("nobody").await);
+        // No channel → send returns false so the caller uses the WS fallback.
+        assert!(!transport.send_via_udp("nobody", b"data").await.unwrap());
+        assert!(!transport.send_unreliable("nobody", b"data").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn offer_channel_emits_offer_and_registers_channel() {
+        let (transport, mut rx) = transport();
+        transport.set_session_id("me".to_string()).await;
+
+        let channel_id = transport.offer_channel("agent-x".to_string()).await.unwrap();
+
+        // The offer is queued for the relay with the expected routing fields.
+        match rx.recv().await.expect("offer signaled") {
+            SignalMessage::Offer(o) => {
+                assert_eq!(o.channel_id, channel_id);
+                assert_eq!(o.from_session, "me");
+                assert_eq!(o.to_session, "agent-x");
+            }
+            other => panic!("expected Offer, got {other:?}"),
+        }
+        // A channel entry now exists (mid-handshake) so we don't re-offer.
+        assert!(transport.has_channel("agent-x").await);
+        // ...but it isn't Connected yet (no hole-punch in a unit test).
+        assert!(!transport.has_udp_channel("agent-x").await);
     }
 }

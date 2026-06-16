@@ -333,13 +333,85 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
+    type Rxs = (
+        mpsc::Receiver<SignalMessage>,
+        mpsc::Receiver<(String, Vec<u8>)>,
+    );
+
+    fn transport(session: &str) -> (UdpTransport, Rxs) {
+        let cipher = Cipher::from_passphrase("test-key");
+        let (sig_tx, sig_rx) = mpsc::channel(16);
+        let (in_tx, in_rx) = mpsc::channel(16);
+        (
+            UdpTransport::new(cipher, session.to_string(), sig_tx, in_tx),
+            (sig_rx, in_rx),
+        )
+    }
+
+    fn endpoint(port: u16) -> Endpoint {
+        Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
     #[tokio::test]
     async fn test_transport_creation() {
-        let cipher = Cipher::from_passphrase("test-key");
-        let (tx, _rx) = mpsc::channel(16);
-        let (inbound_tx, _inbound_rx) = mpsc::channel(16);
-        let transport = UdpTransport::new(cipher, "test-session".to_string(), tx, inbound_tx);
+        let (transport, _rx) = transport("test-session");
         assert!(transport.public_endpoint().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_and_get_public_endpoint() {
+        let (transport, _rx) = transport("s");
+        assert!(transport.public_endpoint().await.is_none());
+        transport.set_public_endpoint(endpoint(4500)).await;
+        assert_eq!(transport.public_endpoint().await, Some(endpoint(4500)));
+    }
+
+    #[tokio::test]
+    async fn handle_answer_rejected_is_noop() {
+        let (transport, _rx) = transport("me");
+        let answer = UdpAnswer {
+            channel_id: "c1".into(),
+            from_session: "peer".into(),
+            local_endpoint: endpoint(1111),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+            accepted: false,
+        };
+        // A rejected answer is handled gracefully and creates no channel.
+        transport.handle_answer(answer).await.unwrap();
+        assert!(!transport.has_udp_channel("peer").await);
+    }
+
+    #[tokio::test]
+    async fn handle_answer_unknown_channel_errors() {
+        let (transport, _rx) = transport("me");
+        let answer = UdpAnswer {
+            channel_id: "c1".into(),
+            from_session: "ghost".into(),
+            local_endpoint: endpoint(1111),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+            accepted: true,
+        };
+        let err = transport.handle_answer(answer).await.unwrap_err().to_string();
+        assert!(err.contains("No channel for peer"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn missing_channel_falls_back_to_ws() {
+        let (transport, _rx) = transport("me");
+        assert!(!transport.has_udp_channel("nobody").await);
+        // No channel → send returns false so the caller uses the WS fallback.
+        assert!(!transport.send_via_udp("nobody", b"data").await.unwrap());
+        assert!(!transport.send_unreliable("nobody", b"data").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn close_missing_channel_is_noop() {
+        let (transport, _rx) = transport("me");
+        // Closing an unknown channel and an empty transport both succeed.
+        transport.close_channel("nobody").await.unwrap();
+        transport.close_all().await.unwrap();
     }
 
     /// Full transport flow over real loopback sockets: offer → answer →

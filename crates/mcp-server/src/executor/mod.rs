@@ -284,10 +284,116 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    async fn bypass_state() -> AgentState {
+    async fn state_in(mode: AgentMode) -> AgentState {
         let s = AgentState::new(Config::default());
-        s.set_mode(AgentMode::Bypass).await;
+        s.set_mode(mode).await;
         s
+    }
+
+    async fn bypass_state() -> AgentState {
+        state_in(AgentMode::Bypass).await
+    }
+
+    fn tmp_file(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir()
+            .join(format!(
+                "exec-test-{}-{}-{}.txt",
+                tag,
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_rejects_commands() {
+        let state = state_in(AgentMode::Disabled).await;
+        let err = execute(&Command::GetInfo, &state).await.unwrap_err().to_string();
+        assert!(err.contains("disabled"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_mode_updates_state() {
+        let state = bypass_state().await;
+        match execute(&Command::SetMode { mode: AgentMode::Edit }, &state).await.unwrap() {
+            CommandResult::Mode { mode } => assert_eq!(mode, AgentMode::Edit),
+            other => panic!("expected Mode, got {other:?}"),
+        }
+        assert_eq!(state.mode().await, AgentMode::Edit);
+    }
+
+    #[tokio::test]
+    async fn get_info_reports_platform() {
+        let state = state_in(AgentMode::Plan).await;
+        match execute(&Command::GetInfo, &state).await.unwrap() {
+            CommandResult::Info { info } => {
+                assert_eq!(info.os, std::env::consts::OS);
+                assert_eq!(info.arch, std::env::consts::ARCH);
+                assert_eq!(info.mode, AgentMode::Plan);
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_blocked_in_plan_mode() {
+        let state = state_in(AgentMode::Plan).await;
+        let cmd = Command::WriteFile {
+            path: tmp_file("plan"),
+            content: "nope".into(),
+            create_backup: false,
+        };
+        let err = execute(&cmd, &state).await.unwrap_err().to_string();
+        assert!(err.contains("Write operations not allowed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_write_roundtrip_in_bypass() {
+        let state = bypass_state().await;
+        let path = tmp_file("rw");
+
+        let write = Command::WriteFile {
+            path: path.clone(),
+            content: "round-trip".into(),
+            create_backup: false,
+        };
+        assert!(matches!(
+            execute(&write, &state).await.unwrap(),
+            CommandResult::Ok
+        ));
+
+        match execute(&Command::ReadFile { path: path.clone() }, &state).await.unwrap() {
+            CommandResult::File { content, size } => {
+                assert_eq!(content, "round-trip");
+                assert_eq!(size, "round-trip".len() as u64);
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn git_pull_blocked_in_readonly_mode() {
+        let state = state_in(AgentMode::Plan).await;
+        let cmd = Command::GitPull {
+            repo: "/tmp/whatever".into(),
+            remote: "origin".into(),
+            branch: None,
+        };
+        let err = execute(&cmd, &state).await.unwrap_err().to_string();
+        assert!(err.contains("not allowed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn task_dispatch_errors_when_autonomous_disabled() {
+        // Config::default() leaves autonomous mode disabled.
+        let state = bypass_state().await;
+        let cmd = Command::TaskDispatch { prompt: "do a thing".into() };
+        let err = execute(&cmd, &state).await.unwrap_err().to_string();
+        assert!(err.contains("autonomous mode is not enabled"), "got: {err}");
     }
 
     #[tokio::test]

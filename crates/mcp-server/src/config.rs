@@ -257,6 +257,20 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~/.config/remote-agents/config.toml"))
 }
 
+/// Serialize the config to TOML for display, masking secrets so
+/// `remote-agent config` never prints the room token or encryption key to the
+/// terminal/logs. Set secrets show as `***`; unset ones stay empty/absent.
+pub fn redacted_toml(cfg: &Config) -> Result<String> {
+    let mut c = cfg.clone();
+    if !c.token.is_empty() {
+        c.token = "***".to_string();
+    }
+    if c.security.encryption_key.is_some() {
+        c.security.encryption_key = Some("***".to_string());
+    }
+    Ok(toml::to_string_pretty(&c)?)
+}
+
 /// Load configuration from file
 pub fn load_config() -> Result<Config> {
     let path = config_path();
@@ -303,6 +317,24 @@ mod tests {
         assert_eq!(config.security.mode, AgentMode::Plan);
         // The default relay is a neutral localhost, never a baked-in remote host.
         assert!(!config.relay_url.contains("workers.dev"));
+    }
+
+    #[test]
+    fn redacted_toml_masks_secrets() {
+        let mut cfg = Config {
+            token: "supersecret-token".into(),
+            ..Default::default()
+        };
+        cfg.security.encryption_key = Some("topsecret-key".into());
+
+        let out = redacted_toml(&cfg).unwrap();
+        assert!(!out.contains("supersecret-token"), "token leaked: {out}");
+        assert!(!out.contains("topsecret-key"), "key leaked: {out}");
+        assert!(out.contains("***"));
+
+        // An empty token is not masked to *** (stays empty, signalling "unset").
+        let empty = Config { token: String::new(), ..Default::default() };
+        assert!(redacted_toml(&empty).unwrap().contains("token = \"\""));
     }
 
     #[test]

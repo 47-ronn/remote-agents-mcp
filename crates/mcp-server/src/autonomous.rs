@@ -317,20 +317,46 @@ fn init_schema(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn store(enabled: bool) -> Arc<AutonomousStore> {
+    /// Build a store with a custom runner, returning the completion-event
+    /// receiver so tests can assert on pushed `TaskCompleted` events.
+    fn store_runner(
+        enabled: bool,
+        runner: Vec<&str>,
+    ) -> (Arc<AutonomousStore>, mpsc::UnboundedReceiver<AgentEvent>) {
+        // Unique temp DB per store: pid + ns-resolution clock + an atomic
+        // counter so stores created within the same millisecond don't collide.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "auto-test-{}-{}.db",
+            "auto-test-{}-{}-{}.db",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
         ));
         let cfg = AutonomousConfig {
             enabled,
-            // Use a trivial, always-present runner for the test.
-            runner: vec!["echo".to_string()],
+            runner: runner.into_iter().map(String::from).collect(),
             ..Default::default()
         };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        Arc::new(AutonomousStore::load(path, cfg, tx))
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Arc::new(AutonomousStore::load(path, cfg, tx)), rx)
+    }
+
+    fn store(enabled: bool) -> Arc<AutonomousStore> {
+        // Trivial, always-present runner that echoes the prompt back.
+        store_runner(enabled, vec!["echo"]).0
+    }
+
+    /// Poll a task to a terminal state (Done/Failed) or panic after ~1s.
+    async fn await_terminal(s: &Arc<AutonomousStore>, id: &str) -> AutonomousTask {
+        for _ in 0..50 {
+            let t = s.get(id).unwrap().unwrap();
+            if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("task {id} did not finish in time");
     }
 
     #[tokio::test]
@@ -359,5 +385,60 @@ mod tests {
         // `echo` echoes the prompt back.
         assert!(task.result.unwrap_or_default().contains("hello world"));
         assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_str_and_from_roundtrip() {
+        for s in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+        ] {
+            assert_eq!(status_from(status_str(s)), s);
+        }
+        // Unknown / legacy strings degrade to Queued rather than panicking.
+        assert_eq!(status_from("bogus"), TaskStatus::Queued);
+        assert_eq!(status_from(""), TaskStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn get_unknown_id_returns_none() {
+        let s = store(true);
+        assert!(s.get("does-not-exist").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_runner_marks_failed() {
+        let (s, _rx) = store_runner(true, vec![]);
+        let id = s.dispatch("anything").unwrap();
+        let task = await_terminal(&s, &id).await;
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_deref(), Some("empty runner command"));
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_marks_failed() {
+        // `false` ignores its args and exits 1.
+        let (s, _rx) = store_runner(true, vec!["false"]);
+        let id = s.dispatch("anything").unwrap();
+        let task = await_terminal(&s, &id).await;
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn completion_event_is_emitted() {
+        let (s, mut rx) = store_runner(true, vec!["echo"]);
+        let id = s.dispatch("ping").unwrap();
+        // A TaskCompleted event for this id is pushed for the connection loop.
+        // Await it directly (the event send trails the DB write inside finish()).
+        let ev = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("completion event within timeout")
+            .expect("event channel open");
+        let AgentEvent::TaskCompleted { task_id, status } = ev;
+        assert_eq!(task_id, id);
+        assert_eq!(status, TaskStatus::Done);
     }
 }

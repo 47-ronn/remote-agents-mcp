@@ -81,3 +81,40 @@ async fn room_info(
     };
     Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn peer() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1234)
+    }
+
+    #[test]
+    fn client_ip_prefers_first_x_forwarded_for() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "203.0.113.5, 70.0.0.9".parse().unwrap());
+        assert_eq!(client_ip(&h, peer()), "203.0.113.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_uses_x_real_ip_when_no_xff() {
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "198.51.100.7".parse().unwrap());
+        assert_eq!(client_ip(&h, peer()), "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_tcp_peer() {
+        assert_eq!(client_ip(&HeaderMap::new(), peer()), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn client_ip_ignores_malformed_xff() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        // No usable header → TCP peer.
+        assert_eq!(client_ip(&h, peer()), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+}

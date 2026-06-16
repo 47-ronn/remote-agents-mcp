@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
         }
         Commands::Config => {
             let cfg = config::load_config()?;
-            println!("{}", toml::to_string_pretty(&cfg)?);
+            println!("{}", config::redacted_toml(&cfg)?);
         }
         Commands::Install { room, token, relay } => {
             let mut args = Vec::new();

@@ -24,6 +24,9 @@ jobs:
           - { os: macos-latest,   target: aarch64-apple-darwin }
           # Static musl build → no glibc dependency, runs on any Linux distro.
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          # ARM64 Linux (Graviton, Raspberry Pi, …) built natively on an arm
+          # runner — no cross toolchain needed.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           # Native glibc build → dynamically linked; preferred on standard
           # distros (e.g. the relay under load, where the glibc allocator helps).
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
