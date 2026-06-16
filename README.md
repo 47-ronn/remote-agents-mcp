@@ -87,13 +87,17 @@ joins a relay room as an equal peer: visible to all, able to dispatch work, and
 
 | Mode | Command | The node… |
 |------|---------|-----------|
-| `run` | `remote-agents run …` | is a headless peer (executes + dispatches), no local AI |
-| `mcp` | `remote-agents mcp …` | exposes an MCP server for a local AI; joins as a **send-only** peer (visible, dispatches, never executes) |
-| `hybrid` | `remote-agents hybrid …` | both: local AI **and** a full executing peer |
+| `run` | `remote-agents run …` | is a headless full peer (executes + dispatches), no local AI |
+| `mcp` | `remote-agents mcp …` | is a full peer **plus** an MCP server for a local AI (opencode / Claude) |
+| `hybrid` | `remote-agents hybrid …` | alias for `mcp` (kept for compatibility) |
+
+Every mode is a **full peer that accepts commands by default**. Add `--no-agent`
+to make a node **send-only** (stays visible and dispatches work, but never runs
+others' commands — for prod controllers or browser dashboards). `--no-agent`
+also works in an MCP `env` block as `REMOTE_AGENTS_*` config.
 
 Common flags: `--relay <wss://host>` `--room <name>` `--token <secret>`
-`--name <id>` `--tags a,b` and `--no-agent` (send-only: stay visible and
-dispatch work but never run others' commands — for prod controllers / dashboards).
+`--name <id>` `--tags a,b` `--no-agent`.
 
 ## Quick start
 
@@ -132,8 +136,9 @@ CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
 ### 3. Install as an MCP server for Claude Desktop / opencode
 
 After `npm install -g remote-agents`, point your AI host at the same binary in
-`mcp` mode (stdio). Use `hybrid` instead of `mcp` if you also want this machine
-to be a fully controllable peer:
+`mcp` mode (stdio). The machine joins the room as a full peer (executes commands
+from others) — add `"--no-agent"` to the args if it should be a send-only
+controller instead:
 
 ```json
 {

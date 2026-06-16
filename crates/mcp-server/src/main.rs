@@ -79,9 +79,8 @@ enum Commands {
         no_agent: bool,
     },
 
-    /// Run BOTH an agent and an MCP server in one process: this node becomes a
-    /// peer — visible/controllable from the room (Agent role) AND able to control
-    /// the fleet via its local AI (Mcp role). Two relay connections, one process.
+    /// Alias for `mcp` (kept for compatibility): `mcp` mode is already a full
+    /// peer that executes commands AND serves the local AI over one connection.
     Hybrid {
         /// Agent name (default: hostname)
         #[arg(short, long)]
