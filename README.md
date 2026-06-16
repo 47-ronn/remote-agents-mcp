@@ -1,6 +1,6 @@
 # Remote Agents
 
-[![CI](https://github.com/ObsidianMotorman/tunshell_mcp_agents/actions/workflows/ci.yml/badge.svg)](https://github.com/ObsidianMotorman/tunshell_mcp_agents/actions/workflows/ci.yml)
+[![CI](https://github.com/47-ronn/tunshell_mcp_agents/actions/workflows/ci.yml/badge.svg)](https://github.com/47-ronn/tunshell_mcp_agents/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A unified, [MCP](https://modelcontextprotocol.io)-compatible system for

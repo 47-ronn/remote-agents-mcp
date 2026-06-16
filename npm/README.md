@@ -35,7 +35,7 @@ Supported platforms: linux x64/arm64, macOS x64/arm64, windows x64.
 ```
 
 `remote-agents <subcommand>` forwards to the native binary (`run`, `mcp`,
-`install`, …). See the [project README](https://github.com/ObsidianMotorman/tunshell_mcp_agents#readme)
+`install`, …). See the [project README](https://github.com/47-ronn/tunshell_mcp_agents#readme)
 for the full documentation.
 
 ## Update checks

@@ -7,7 +7,7 @@ const path = require("path");
 const https = require("https");
 const { version } = require("./package.json");
 
-const REPO = "ObsidianMotorman/tunshell_mcp_agents";
+const REPO = "47-ronn/tunshell_mcp_agents";
 
 function target(p = process.platform, a = process.arch) {
   if (p === "linux" && a === "x64") return { triple: "x86_64-unknown-linux-musl", exe: "" };
