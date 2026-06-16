@@ -157,7 +157,7 @@ pub async fn handle_socket(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if handle_client_msg(&text, &room, &session_id, role, &agent_info, &tx)
+                        if handle_client_msg(&text, &room, &session_id, &agent_info, &tx)
                             .is_break()
                         {
                             break;
@@ -216,7 +216,6 @@ fn handle_client_msg(
     text: &str,
     room: &Room,
     session_id: &str,
-    role: ClientRole,
     agent_info: &Option<Box<AgentInfo>>,
     self_tx: &Tx,
 ) -> ControlFlow<()> {
@@ -228,24 +227,11 @@ fn handle_client_msg(
         }
     };
 
-    // Role authorization, in lock-step with the worker: only MCP may list/command
-    // the fleet; only agents may return results/errors/events.
-    let require = |want: ClientRole| -> bool {
-        if role == want {
-            true
-        } else {
-            send_to(self_tx, &ServerMessage::Error {
-                message: "Not authorized".to_string(),
-            });
-            false
-        }
-    };
-
+    // Peer model: no network roles. Any peer may list the room, send commands,
+    // and return results/events. Whether a node *executes* a received command is
+    // its own choice (AgentInfo.accepts_commands / --no-agent), enforced agent-side.
     match msg {
         ClientMessage::ListAgents => {
-            if !require(ClientRole::Mcp) {
-                return ControlFlow::Continue(());
-            }
             let agents: Vec<AgentInfo> = room.agents.iter().map(|e| e.info.clone()).collect();
             send_to(self_tx, &ServerMessage::AgentList { agents });
         }
@@ -255,9 +241,6 @@ fn handle_client_msg(
             target,
             payload,
         } => {
-            if !require(ClientRole::Mcp) {
-                return ControlFlow::Continue(());
-            }
             let targets = resolve_targets(room, &target);
             if targets.is_empty() {
                 send_to(
@@ -286,9 +269,6 @@ fn handle_client_msg(
         }
 
         ClientMessage::CommandResult { request_id, result } => {
-            if !require(ClientRole::Agent) {
-                return ControlFlow::Continue(());
-            }
             let agent_id = agent_id_of(agent_info);
             let msg = ServerMessage::CommandResult {
                 request_id: request_id.clone(),
@@ -299,9 +279,6 @@ fn handle_client_msg(
         }
 
         ClientMessage::CommandError { request_id, error } => {
-            if !require(ClientRole::Agent) {
-                return ControlFlow::Continue(());
-            }
             let agent_id = agent_id_of(agent_info);
             let msg = ServerMessage::CommandError {
                 request_id: request_id.clone(),
@@ -312,9 +289,6 @@ fn handle_client_msg(
         }
 
         ClientMessage::Notify { event } => {
-            if !require(ClientRole::Agent) {
-                return ControlFlow::Continue(());
-            }
             let agent_id = agent_id_of(agent_info);
             broadcast_mcp(room, &ServerMessage::Event { agent_id, event });
         }

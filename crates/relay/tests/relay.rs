@@ -353,44 +353,33 @@ fn make_offer(from: &str, to: &str) -> UdpOffer {
     }
 }
 
-/// Role authorization parity with the worker: an agent may not issue fleet
-/// commands, and an MCP client may not post command results.
+/// Peer model (iter75): the relay no longer enforces network roles. An agent
+/// issuing a fleet command is PROCESSED (not rejected with "Not authorized") —
+/// here it targets a non-matching tag, so it gets a normal no-match error.
 #[tokio::test]
-async fn relay_enforces_role_authorization() {
+async fn relay_has_no_role_authorization() {
     let port = start_relay().await;
 
-    // An agent tries to command the fleet → rejected.
     let mut agent = connect(port, "dev").await;
     auth(&mut agent, ClientRole::Agent, Some(agent_info("a", &[]))).await;
     assert!(matches!(recv(&mut agent).await, ServerMessage::AgentList { .. })); // initial peers
+
     send(
         &mut agent,
         &ClientMessage::Command {
             request_id: "x".into(),
-            target: Target::All,
+            target: Target::Tagged { tags: vec!["nobody".into()] },
             payload: "P".into(),
         },
     )
     .await;
+    // The command is accepted and resolved (no match) — NOT a role rejection.
     match recv(&mut agent).await {
-        ServerMessage::Error { message } => assert!(message.contains("authorized")),
-        other => panic!("expected Not authorized error, got {:?}", other),
-    }
-
-    // An MCP client tries to post a command result → rejected.
-    let mut mcp = connect(port, "dev").await;
-    auth(&mut mcp, ClientRole::Mcp, None).await;
-    send(
-        &mut mcp,
-        &ClientMessage::CommandResult {
-            request_id: "x".into(),
-            result: "R".into(),
-        },
-    )
-    .await;
-    match recv(&mut mcp).await {
-        ServerMessage::Error { message } => assert!(message.contains("authorized")),
-        other => panic!("expected Not authorized error, got {:?}", other),
+        ServerMessage::CommandError { request_id, error, .. } => {
+            assert_eq!(request_id, "x");
+            assert!(error.contains("No matching"), "got: {error}");
+        }
+        other => panic!("expected no-match CommandError, got {:?}", other),
     }
 }
 
@@ -479,4 +468,64 @@ async fn result_routes_only_to_requesting_mcp() {
         try_recv(&mut mcp2, 400).await.is_none(),
         "result must not leak to other controllers"
     );
+}
+
+/// Peer model (iter75): roles are gone — an *agent* peer can also initiate a
+/// command and receive the result routed back to it, just like a controller.
+#[tokio::test]
+async fn agent_peer_can_initiate_command() {
+    let port = start_relay().await;
+
+    // Executor agent.
+    let mut a1 = connect(port, "dev").await;
+    auth(&mut a1, ClientRole::Agent, Some(agent_info("a1", &[]))).await;
+    match recv(&mut a1).await {
+        ServerMessage::AgentList { .. } => {}
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+
+    // Initiator agent (a second peer — NOT a controller).
+    let mut a2 = connect(port, "dev").await;
+    auth(&mut a2, ClientRole::Agent, Some(agent_info("a2", &[]))).await;
+    match recv(&mut a2).await {
+        ServerMessage::AgentList { agents } => assert_eq!(agents.len(), 1), // sees a1
+        other => panic!("expected AgentList, got {:?}", other),
+    }
+    // a1 is told a2 joined; drain it.
+    match recv(&mut a1).await {
+        ServerMessage::AgentJoined { .. } => {}
+        other => panic!("expected AgentJoined at a1, got {:?}", other),
+    }
+
+    // a2 commands a1 (an agent issuing a command — previously forbidden).
+    send(
+        &mut a2,
+        &ClientMessage::Command {
+            request_id: "p2p".into(),
+            target: Target::Agent { id: "a1".into() },
+            payload: "P".into(),
+        },
+    )
+    .await;
+    match recv(&mut a1).await {
+        ServerMessage::Command { request_id, .. } => assert_eq!(request_id, "p2p"),
+        other => panic!("expected Command at a1, got {:?}", other),
+    }
+    send(
+        &mut a1,
+        &ClientMessage::CommandResult {
+            request_id: "p2p".into(),
+            result: "R".into(),
+        },
+    )
+    .await;
+
+    // The result routes back to the initiating agent a2.
+    match recv(&mut a2).await {
+        ServerMessage::CommandResult { request_id, result, .. } => {
+            assert_eq!(request_id, "p2p");
+            assert_eq!(result, "R");
+        }
+        other => panic!("expected CommandResult at a2, got {:?}", other),
+    }
 }

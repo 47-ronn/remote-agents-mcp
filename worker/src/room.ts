@@ -94,7 +94,6 @@ export class Room implements DurableObject {
         return this.handleAuth(ws, msg);
 
       case 'list_agents':
-        if (att.role !== 'mcp') return this.sendError(ws, 'Not authorized');
         this.send(ws, {
           type: 'agent_list',
           agents: this.agentSockets()
@@ -104,7 +103,6 @@ export class Room implements DurableObject {
         return;
 
       case 'command': {
-        if (att.role !== 'mcp') return this.sendError(ws, 'Not authorized');
         const targets = this.resolveTarget(msg.target);
         if (targets.length === 0) {
           this.send(ws, {
@@ -129,7 +127,6 @@ export class Room implements DurableObject {
       }
 
       case 'command_result':
-        if (att.role !== 'agent') return this.sendError(ws, 'Not authorized');
         this.routeToOrigin(msg.request_id, {
           type: 'command_result',
           request_id: msg.request_id,
@@ -139,7 +136,6 @@ export class Room implements DurableObject {
         return;
 
       case 'command_error':
-        if (att.role !== 'agent') return this.sendError(ws, 'Not authorized');
         this.routeToOrigin(msg.request_id, {
           type: 'command_error',
           request_id: msg.request_id,
@@ -149,7 +145,6 @@ export class Room implements DurableObject {
         return;
 
       case 'notify':
-        if (att.role !== 'agent') return this.sendError(ws, 'Not authorized');
         this.broadcastToMcp({
           type: 'event',
           agent_id: att.agentInfo?.id || 'unknown',
