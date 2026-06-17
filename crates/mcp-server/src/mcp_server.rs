@@ -16,7 +16,7 @@ use crate::executor;
 use crate::state::AgentState;
 use anyhow::Result;
 use async_trait::async_trait;
-use remote_agents_shared::{AgentMode, Command, CommandResult, SearchKind, Target};
+use remote_agents_shared::{AgentMode, Command, CommandResult, FileMeta, SearchKind, Target};
 use rust_mcp_sdk::mcp_server::{server_runtime, ServerHandler};
 use rust_mcp_sdk::schema::*;
 use rust_mcp_sdk::{McpServer, StdioTransport, ToMcpServerHandler, TransportOptions};
@@ -1011,6 +1011,33 @@ fn format_outcomes(results: Vec<crate::relay_controller::AgentOutcome>) -> Strin
         .join("\n---\n")
 }
 
+/// Human-readable byte size (B / KB / MB / GB).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// One-line summary of a file: `path  (size, mime[, image])`.
+fn format_file_meta(m: &FileMeta) -> String {
+    format!(
+        "{}  ({}, {}{})",
+        m.path,
+        human_size(m.size),
+        m.mime,
+        if m.is_image { ", image" } else { "" }
+    )
+}
+
 /// Format CommandResult to human-readable text
 fn format_result(result: &CommandResult) -> String {
     match result {
@@ -1094,9 +1121,7 @@ fn format_result(result: &CommandResult) -> String {
         CommandResult::SessionTranscript { messages } => {
             serde_json::to_string_pretty(messages).unwrap_or_else(|_| format!("{:?}", messages))
         }
-        CommandResult::FileMeta { meta } => {
-            serde_json::to_string_pretty(meta).unwrap_or_else(|_| format!("{:?}", meta))
-        }
+        CommandResult::FileMeta { meta } => format_file_meta(meta),
         CommandResult::FileChunk { data, eof } => {
             format!("file chunk: {} base64 bytes (eof={})", data.len(), eof)
         }
@@ -1104,11 +1129,16 @@ fn format_result(result: &CommandResult) -> String {
             format!("thumbnail {}x{} ({} base64 bytes)", w, h, data.len())
         }
         CommandResult::FileSearch { hits } => {
-            format!(
-                "{} hit(s):\n{}",
-                hits.len(),
-                serde_json::to_string_pretty(hits).unwrap_or_default()
-            )
+            if hits.is_empty() {
+                "0 hits".to_string()
+            } else {
+                let mut s = format!("{} hit(s):", hits.len());
+                for h in hits {
+                    s.push_str("\n  ");
+                    s.push_str(&format_file_meta(h));
+                }
+                s
+            }
         }
         CommandResult::TransferQueued { id } => format!("Transfer queued: {}", id),
         CommandResult::Transfer { status } => {
@@ -1465,6 +1495,46 @@ mod tests {
         assert_eq!(format_result(&CommandResult::Ok), "OK");
         let g = CommandResult::Git { output: "pushed".into(), success: true };
         assert_eq!(format_result(&g), "pushed\n[success: true]");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn format_result_file_search_lists_paths_not_json() {
+        let hits = vec![
+            FileMeta {
+                path: "/home/u/Pictures/cat.jpg".into(),
+                size: 2048,
+                modified: None,
+                mime: "image/jpeg".into(),
+                is_image: true,
+            },
+            FileMeta {
+                path: "/home/u/notes.txt".into(),
+                size: 12,
+                modified: None,
+                mime: "text/plain".into(),
+                is_image: false,
+            },
+        ];
+        let out = format_result(&CommandResult::FileSearch { hits });
+        assert!(out.starts_with("2 hit(s):"));
+        assert!(out.contains("/home/u/Pictures/cat.jpg  (2.0 KB, image/jpeg, image)"));
+        assert!(out.contains("/home/u/notes.txt  (12 B, text/plain)"));
+        // Readable, not a raw JSON dump.
+        assert!(!out.contains('{'));
+
+        // Empty result is concise.
+        assert_eq!(
+            format_result(&CommandResult::FileSearch { hits: vec![] }),
+            "0 hits"
+        );
     }
 
     // --- build_command ------------------------------------------------------
