@@ -16,7 +16,7 @@ use crate::executor;
 use crate::state::AgentState;
 use anyhow::Result;
 use async_trait::async_trait;
-use remote_agents_shared::{AgentMode, Command, CommandResult, Target};
+use remote_agents_shared::{AgentMode, Command, CommandResult, SearchKind, Target};
 use rust_mcp_sdk::mcp_server::{server_runtime, ServerHandler};
 use rust_mcp_sdk::schema::*;
 use rust_mcp_sdk::{McpServer, StdioTransport, ToMcpServerHandler, TransportOptions};
@@ -195,7 +195,49 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             }),
             vec!["path"],
         ),
-        
+
+        // === File search & host↔host transfer ===
+        make_tool(
+            "file_search",
+            "Search a host's files by name, content, or images-only. Empty roots → host defaults (home + Pictures/Documents/Downloads/Desktop). Runs locally or on a remote agent via agent_id.",
+            json!({
+                "query": {"type": "string", "description": "Search query (substring for name, pattern for content)"},
+                "kind": {"type": "string", "description": "Search mode", "enum": ["name", "content", "image"], "default": "name"},
+                "roots": {"type": "array", "items": {"type": "string"}, "description": "Directories to search (empty = host defaults)"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["query"],
+        ),
+        make_tool(
+            "file_stat",
+            "Get a file's metadata (size, MIME type, is_image) without reading its body.",
+            json!({
+                "path": {"type": "string", "description": "Absolute path to the file"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["path"],
+        ),
+        make_tool(
+            "send_file",
+            "Send a file from one host to another over the direct UDP channel (relay fallback), verified with SHA-256. Set agent_id to the SOURCE host where the file lives; the destination must be in edit/bypass mode. Returns a transfer id (poll with transfer_get on the same source host).",
+            json!({
+                "src_path": {"type": "string", "description": "Path of the file on the source host"},
+                "dest_id": {"type": "string", "description": "Agent id of the destination host"},
+                "dest_path": {"type": "string", "description": "Absolute path to write on the destination"},
+                "agent_id": {"type": "string", "description": "Source host agent id (where the file lives)"}
+            }),
+            vec!["src_path", "dest_id", "dest_path"],
+        ),
+        make_tool(
+            "transfer_get",
+            "Get the progress/status of a host↔host file transfer by id (set agent_id to the source host that initiated it).",
+            json!({
+                "id": {"type": "string", "description": "Transfer id returned by send_file"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["id"],
+        ),
+
         // === Agent info & mode ===
         make_tool(
             "get_info",
@@ -566,6 +608,26 @@ impl McpHandler {
             "list_dir" => Command::ListDir {
                 path: get_str_required("path")?,
                 pattern: get_str("pattern"),
+            },
+            "file_search" => Command::FileSearch {
+                roots: get_str_vec("roots"),
+                query: get_str_required("query")?,
+                kind: match get_str("kind").as_deref() {
+                    Some("content") => SearchKind::Content,
+                    Some("image") => SearchKind::Image,
+                    _ => SearchKind::Name,
+                },
+            },
+            "file_stat" => Command::FileStat {
+                path: get_str_required("path")?,
+            },
+            "send_file" => Command::SendFileTo {
+                src_path: get_str_required("src_path")?,
+                dest_id: get_str_required("dest_id")?,
+                dest_path: get_str_required("dest_path")?,
+            },
+            "transfer_get" => Command::TransferGet {
+                id: get_str_required("id")?,
             },
             "get_info" => Command::GetInfo,
             "set_mode" => {
@@ -1285,7 +1347,10 @@ mod tests {
 
         let local = names(false);
         // Core tools are always present.
-        for core in ["exec", "read_file", "write_file", "list_dir", "get_info", "set_mode"] {
+        for core in [
+            "exec", "read_file", "write_file", "list_dir", "get_info", "set_mode",
+            "file_search", "file_stat", "send_file", "transfer_get",
+        ] {
             assert!(local.contains(&core.to_string()), "missing core tool {core}");
         }
         // Relay-only tools are absent without a relay.
@@ -1413,6 +1478,60 @@ mod tests {
         let h = handler();
         assert!(h
             .build_command("set_mode", &args(json!({"mode": "nope"})))
+            .is_err());
+    }
+
+    #[test]
+    fn build_command_file_search_parses_kind_and_roots() {
+        let h = handler();
+        // Explicit content kind + roots.
+        let cmd = h
+            .build_command(
+                "file_search",
+                &args(json!({"query": "report", "kind": "content", "roots": ["/a", "/b"]})),
+            )
+            .unwrap();
+        match cmd {
+            Command::FileSearch { roots, query, kind } => {
+                assert_eq!(query, "report");
+                assert_eq!(roots, vec!["/a".to_string(), "/b".to_string()]);
+                assert_eq!(kind, SearchKind::Content);
+            }
+            other => panic!("expected FileSearch, got {other:?}"),
+        }
+        // Missing/unknown kind defaults to Name; roots default to empty.
+        match h
+            .build_command("file_search", &args(json!({"query": "x"})))
+            .unwrap()
+        {
+            Command::FileSearch { kind, roots, .. } => {
+                assert_eq!(kind, SearchKind::Name);
+                assert!(roots.is_empty());
+            }
+            other => panic!("expected FileSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_command_send_file_maps_fields() {
+        let h = handler();
+        let cmd = h
+            .build_command(
+                "send_file",
+                &args(json!({"src_path": "/s/a.bin", "dest_id": "vm2", "dest_path": "/d/a.bin"})),
+            )
+            .unwrap();
+        match cmd {
+            Command::SendFileTo { src_path, dest_id, dest_path } => {
+                assert_eq!(src_path, "/s/a.bin");
+                assert_eq!(dest_id, "vm2");
+                assert_eq!(dest_path, "/d/a.bin");
+            }
+            other => panic!("expected SendFileTo, got {other:?}"),
+        }
+        // All three fields are required.
+        assert!(h
+            .build_command("send_file", &args(json!({"src_path": "/s"})))
             .is_err());
     }
 
