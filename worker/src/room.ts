@@ -20,7 +20,9 @@ export function scoreAgent(a: AgentInfo): number {
  */
 export function dedupAgents(infos: AgentInfo[]): AgentInfo[] {
   const byId = new Map<string, AgentInfo>();
+  const counts = new Map<string, number>();
   for (const info of infos) {
+    counts.set(info.id, (counts.get(info.id) ?? 0) + 1);
     const prev = byId.get(info.id);
     const autonomous = (prev?.autonomous ?? false) || info.autonomous;
     const accepts =
@@ -29,6 +31,11 @@ export function dedupAgents(infos: AgentInfo[]): AgentInfo[] {
     const rep = prev && scoreAgent(prev) >= scoreAgent(info) ? prev : info;
     byId.set(info.id, { ...rep, autonomous, accepts_commands: accepts });
   }
+  // Surface how many live connections share this machine's agent-id. >1 means
+  // several sockets (many terminals, or stale/mis-tokened processes) under one
+  // id — the situation where a wrong-keyed socket can hijack routing, so the
+  // panel can warn. The relay is E2E-blind to keys; it can only count sockets.
+  for (const [id, rep] of byId) rep.connections = counts.get(id);
   return [...byId.values()];
 }
 

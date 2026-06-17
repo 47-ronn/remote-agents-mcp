@@ -28,6 +28,10 @@ export interface AgentInfo {
   /** Running binary version (crate version), so the fleet view can show what
    * each host runs. Absent for peers that predate the field. */
   version?: string;
+  /** Relay-computed: number of live connections sharing this machine's
+   * agent-id. >1 flags duplicate sockets (a wrong-keyed one can hijack routing).
+   * Set by `dedupAgents`, not sent by agents. */
+  connections?: number;
   connected_at: number;
   session_id?: string;
 }
