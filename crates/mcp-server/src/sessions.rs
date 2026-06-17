@@ -34,6 +34,7 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     let mut all = claude_sessions();
     all.extend(opencode_sessions());
     all.extend(vscode_agent_sessions());
+    all.extend(zed_sessions());
     all.sort_by_key(|s| std::cmp::Reverse(s.updated));
     if let Ok(mut g) = CACHE.lock() {
         *g = Some((Instant::now(), all.clone()));
@@ -57,6 +58,7 @@ pub fn get_transcript(provider: &str, id: &str) -> Result<Vec<SessionMessage>> {
         "claude" => claude_transcript(id),
         "opencode" => opencode_transcript(id),
         "cline" | "roo" | "kilo" => vscode_agent_transcript(provider, id),
+        "zed" => zed_transcript(id),
         other => bail!("unknown provider '{other}'"),
     }
 }
@@ -424,6 +426,161 @@ fn cline_text(v: &serde_json::Value) -> Option<String> {
     Some(raw.to_string())
 }
 
+// --- Zed (SQLite threads.db) ------------------------------------------------
+//
+// Zed stores agent threads in `<data-dir>/zed/threads/threads.db`:
+//   threads(id, summary, updated_at TEXT/RFC3339, data_type TEXT, data BLOB, …)
+// `data` is a serde_json `DbThread` — either raw (`data_type='json'`) or a zstd
+// frame (`data_type='zstd'`); `maybe_decompress` tells them apart by magic.
+// `messages` is an externally-tagged enum array: {"User":{content:[…]}} /
+// {"Agent":{content:[…]}} / "Resume" / {"Compaction":…}, each content item a
+// {"Text":"…"} (Agent also Thinking/ToolUse, which we drop). View-only.
+
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+
+/// Candidate `threads.db` paths (linux uses `zed`, macOS `Zed`).
+fn zed_db_paths() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(data) = dirs::data_dir() {
+        for app in ["zed", "Zed"] {
+            v.push(data.join(app).join("threads").join("threads.db"));
+        }
+    }
+    v
+}
+
+/// A `file:` URI with the path percent-encoded (UTF-8 safe). `immutable=1`
+/// snapshots a possibly-live DB without taking locks or creating -wal/-shm.
+fn zed_db_uri(path: &Path) -> String {
+    let mut s = String::from("file:");
+    for &b in path.to_string_lossy().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~') {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("%{b:02x}"));
+        }
+    }
+    s.push_str("?immutable=1&mode=ro");
+    s
+}
+
+fn open_zed_db(path: &Path) -> Result<Connection> {
+    // Prefer a plain read-only open so WAL-mode writes are visible; if the DB is
+    // locked or its -shm can't be created, fall back to an immutable snapshot
+    // (no locks, but won't see rows still sitting in -wal).
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .or_else(|_| {
+            Connection::open_with_flags(
+                zed_db_uri(path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        })
+        .with_context(|| format!("open zed db {}", path.display()))
+}
+
+fn zed_sessions() -> Vec<SessionMeta> {
+    let mut out = Vec::new();
+    for path in zed_db_paths() {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(conn) = open_zed_db(&path) else {
+            continue;
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT id, summary, updated_at FROM threads ORDER BY updated_at DESC LIMIT ?1")
+        else {
+            continue;
+        };
+        let rows = stmt.query_map([MAX_PER_PROVIDER as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        });
+        let Ok(rows) = rows else {
+            continue;
+        };
+        for (id, summary, updated_at) in rows.flatten() {
+            let title = if summary.trim().is_empty() {
+                id.clone()
+            } else {
+                truncate(&summary, 80)
+            };
+            out.push(SessionMeta {
+                provider: "zed".to_string(),
+                id,
+                title,
+                updated: parse_iso_ms(&updated_at).unwrap_or(0),
+                cwd: None,
+                resumable: false,
+            });
+        }
+    }
+    out
+}
+
+fn zed_transcript(id: &str) -> Result<Vec<SessionMessage>> {
+    for path in zed_db_paths() {
+        if !path.is_file() {
+            continue;
+        }
+        let conn = open_zed_db(&path)?;
+        let row: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM threads WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(data) = row {
+            let json = remote_agents_shared::compress::maybe_decompress(&data)?;
+            return parse_zed_thread(&json);
+        }
+    }
+    bail!("zed session '{id}' not found")
+}
+
+fn parse_zed_thread(json: &[u8]) -> Result<Vec<SessionMessage>> {
+    let v: serde_json::Value = serde_json::from_slice(json)?;
+    let msgs = v.get("messages").and_then(|m| m.as_array());
+    Ok(msgs
+        .into_iter()
+        .flatten()
+        .filter_map(zed_message)
+        .collect())
+}
+
+/// One externally-tagged Zed `Message` → a transcript turn, or None for the
+/// non-conversational variants (Resume / Compaction / empty content).
+fn zed_message(m: &serde_json::Value) -> Option<SessionMessage> {
+    let obj = m.as_object()?;
+    let (role, body) = if let Some(u) = obj.get("User") {
+        ("user", u)
+    } else if let Some(a) = obj.get("Agent") {
+        ("assistant", a)
+    } else {
+        return None; // "Resume" (string) / Compaction / unknown
+    };
+    let parts: Vec<String> = body
+        .get("content")?
+        .as_array()?
+        .iter()
+        // Each content item is externally tagged; keep only {"Text": "…"}.
+        .filter_map(|c| c.get("Text").and_then(|x| x.as_str()).map(String::from))
+        .collect();
+    let text = parts.join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: role.to_string(),
+        text,
+        ts: None,
+    })
+}
+
 // --- process scanning -------------------------------------------------------
 
 /// Full command lines of running processes (`ps -eo args=`). One per line.
@@ -574,7 +731,7 @@ pub fn resume_runner(provider: &str, id: &str) -> Result<Vec<String>> {
             "-s".into(),
             id.into(),
         ]),
-        "cline" | "roo" | "kilo" => {
+        "cline" | "roo" | "kilo" | "zed" => {
             bail!("'{provider}' sessions are view-only (no headless resume)")
         }
         other => bail!("unknown provider '{other}'"),
@@ -641,8 +798,42 @@ mod tests {
     }
 
     #[test]
+    fn zed_thread_parses_externally_tagged_messages() {
+        // DbThread JSON (v0.3.0): messages is an externally-tagged enum array.
+        let thread = serde_json::json!({
+            "version": "0.3.0",
+            "title": "t",
+            "messages": [
+                {"User": {"id": "u1", "content": [{"Text": "привет"}, {"Image": {}}]}},
+                {"Agent": {"content": [
+                    {"Thinking": {"text": "hmm", "signature": null}},
+                    {"Text": "ответ"},
+                    {"ToolUse": {}}
+                ]}},
+                "Resume",
+                {"Compaction": {"Summary": "…"}},
+                {"Agent": {"content": [{"ToolUse": {}}]}}
+            ]
+        });
+        let msgs = parse_zed_thread(&serde_json::to_vec(&thread).unwrap()).unwrap();
+        // Resume/Compaction skipped; the tool-only Agent message (no Text) skipped.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].text, "привет"); // Image content dropped
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].text, "ответ"); // Thinking/ToolUse dropped
+    }
+
+    #[test]
+    fn zed_db_uri_percent_encodes_path() {
+        let uri = zed_db_uri(Path::new("/home/u/Application Support/Zed/threads.db"));
+        assert!(uri.starts_with("file:/home/u/Application%20Support/Zed/threads.db"));
+        assert!(uri.ends_with("?immutable=1&mode=ro"));
+    }
+
+    #[test]
     fn vscode_agents_are_view_only() {
-        for p in ["cline", "roo", "kilo"] {
+        for p in ["cline", "roo", "kilo", "zed"] {
             assert!(
                 resume_runner(p, "task-1").is_err(),
                 "{p} must not be resumable"
