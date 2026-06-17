@@ -259,4 +259,72 @@ mod tests {
         let r = receive_chunk(&dp, 0, &b64(b"hello"), true, Some("deadbeef"), &sec());
         assert!(r.is_err());
     }
+
+    // Pipe stream_file's FileRecv chunks straight into the receiver (the closure
+    // stands in for the network), so the whole sender→receiver core is exercised
+    // without a relay.
+    async fn round_trip(data: &[u8], chunk: u64) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        std::fs::write(&src, data).unwrap();
+
+        let mut cfg = sec();
+        cfg.transfer_chunk_size = chunk;
+        let store = TransferStore::default();
+        store.start("t", data.len() as u64);
+
+        // The closure applies each FileRecv to its own dest_path (set by
+        // stream_file), so it only needs the security config.
+        let cfg_recv = cfg.clone();
+        let send = move |cmd: Command| {
+            let cfg = cfg_recv.clone();
+            async move {
+                match cmd {
+                    Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. } => {
+                        receive_chunk(&dest_path, offset, &bytes, eof, sha256.as_deref(), &cfg)?;
+                        Ok(CommandResult::Ok)
+                    }
+                    other => anyhow::bail!("unexpected command {other:?}"),
+                }
+            }
+        };
+
+        let dst_s = dst.to_string_lossy().to_string();
+        stream_file(
+            &store,
+            &src.to_string_lossy(),
+            &dst_s,
+            "t",
+            &cfg,
+            chunk,
+            data.len() as u64,
+            send,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.get("t").unwrap().bytes,
+            data.len() as u64,
+            "progress should reach total"
+        );
+        std::fs::read(&dst).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_file_round_trips_binary_across_many_chunks() {
+        // 5000 bytes of non-UTF8 data, 1 KiB chunks → 5 chunks.
+        let data: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        assert_eq!(round_trip(&data, 1024).await, data);
+    }
+
+    #[tokio::test]
+    async fn stream_file_round_trips_exact_multiple_and_empty() {
+        // Size an exact multiple of the chunk (no short final slice).
+        let data: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        assert_eq!(round_trip(&data, 1024).await, data);
+        // Empty file → a single eof slice; receiver writes an empty file.
+        assert_eq!(round_trip(b"", 1024).await, Vec::<u8>::new());
+    }
 }
