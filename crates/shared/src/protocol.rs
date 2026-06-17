@@ -210,6 +210,50 @@ pub enum Command {
         id: String,
     },
 
+    // === File transfer (search, binary-safe chunked read, thumbnails) ===
+    /// Metadata for one file (size/mime/is_image) without reading its body.
+    FileStat {
+        path: String,
+    },
+
+    /// Read a binary-safe slice `[offset, offset+len)` of a file, base64-encoded.
+    /// The web client pulls a file chunk-by-chunk; each chunk is its own request.
+    FileChunk {
+        path: String,
+        offset: u64,
+        len: u64,
+    },
+
+    /// Produce a downscaled JPEG preview of an image (longest side `max_px`).
+    FileThumb {
+        path: String,
+        max_px: u32,
+    },
+
+    /// Search for files under `roots` matching `query` by name/content/image.
+    FileSearch {
+        /// Directories to search; empty → host's default roots (home + common dirs).
+        #[serde(default)]
+        roots: Vec<String>,
+        query: String,
+        kind: SearchKind,
+    },
+
+    /// Send a local file to another host over the UDP data channel (WS fallback).
+    /// Returns immediately with a transfer id; poll progress with `TransferGet`.
+    SendFileTo {
+        src_path: String,
+        /// Destination peer's agent id.
+        dest_id: String,
+        /// Absolute path to write on the destination.
+        dest_path: String,
+    },
+
+    /// Get the status/progress of a host↔host transfer by id.
+    TransferGet {
+        id: String,
+    },
+
     /// Change agent mode
     SetMode {
         mode: AgentMode,
@@ -410,6 +454,42 @@ pub enum CommandResult {
     /// List of autonomous tasks
     TaskList {
         tasks: Vec<AutonomousTask>,
+    },
+
+    // === File transfer ===
+    /// File metadata (response to `FileStat`; also each `FileSearch` hit shape).
+    FileMeta {
+        meta: FileMeta,
+    },
+
+    /// One binary-safe file chunk (base64) with an end-of-file marker.
+    FileChunk {
+        /// Base64 of the raw bytes for the requested slice.
+        data: String,
+        /// True when this slice reaches the end of the file.
+        eof: bool,
+    },
+
+    /// A downscaled image preview (base64 JPEG) with its pixel dimensions.
+    FileThumb {
+        data: String,
+        w: u32,
+        h: u32,
+    },
+
+    /// Files matching a `FileSearch`.
+    FileSearch {
+        hits: Vec<FileMeta>,
+    },
+
+    /// A host↔host transfer was accepted and queued.
+    TransferQueued {
+        id: String,
+    },
+
+    /// Progress/status of a host↔host transfer (response to `TransferGet`).
+    Transfer {
+        status: TransferStatus,
     },
 
     // === AI-provider sessions ===

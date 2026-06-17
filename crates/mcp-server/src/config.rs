@@ -167,6 +167,26 @@ pub struct SecurityConfig {
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
 
+    /// Max size in bytes for a chunked file transfer / download (0 = unlimited).
+    /// Separate from `max_file_size` so bulk transfers aren't capped by the
+    /// in-band 10 MiB read/write guard.
+    #[serde(default = "default_max_transfer_size")]
+    pub max_transfer_size: u64,
+
+    /// Chunk size in bytes for chunked file reads/downloads. Kept well under the
+    /// relay's ~1 MiB WebSocket frame limit after base64 + encryption overhead.
+    #[serde(default = "default_transfer_chunk_size")]
+    pub transfer_chunk_size: u64,
+
+    /// Roots for `FileSearch` when the request supplies none (empty → derived at
+    /// runtime: home + Pictures/Documents/Downloads/Desktop).
+    #[serde(default)]
+    pub search_roots: Vec<String>,
+
+    /// Max number of hits returned by a single `FileSearch`.
+    #[serde(default = "default_search_max_results")]
+    pub search_max_results: usize,
+
     /// Command timeout in seconds
     #[serde(default = "default_timeout")]
     pub command_timeout: u64,
@@ -207,6 +227,10 @@ impl Default for SecurityConfig {
             denied_commands: default_denied_commands(),
             readonly_commands: crate::safety::default_readonly_commands(),
             max_file_size: default_max_file_size(),
+            max_transfer_size: default_max_transfer_size(),
+            transfer_chunk_size: default_transfer_chunk_size(),
+            search_roots: Vec::new(),
+            search_max_results: default_search_max_results(),
             command_timeout: 300,
             encryption_key: None,
         }
@@ -292,6 +316,18 @@ fn default_denied_paths() -> Vec<String> {
 
 fn default_max_file_size() -> u64 {
     10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_max_transfer_size() -> u64 {
+    100 * 1024 * 1024 // 100 MiB
+}
+
+fn default_transfer_chunk_size() -> u64 {
+    256 * 1024 // 256 KiB
+}
+
+fn default_search_max_results() -> usize {
+    200
 }
 
 /// Get config file path

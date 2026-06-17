@@ -259,6 +259,52 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::Ok)
         }
 
+        // === File transfer: metadata / chunked read / thumbnail / search ===
+        // All are blocking (fs / image decode / spawning find|grep) → off-runtime.
+        Command::FileStat { path } => {
+            let path = path.clone();
+            let sec = state.config.security.clone();
+            let meta = tokio::task::spawn_blocking(move || crate::files::stat(&path, &sec))
+                .await
+                .map_err(|e| anyhow::anyhow!("file stat failed: {e}"))??;
+            Ok(CommandResult::FileMeta { meta })
+        }
+
+        Command::FileChunk { path, offset, len } => {
+            let (path, offset, len) = (path.clone(), *offset, *len);
+            let sec = state.config.security.clone();
+            let (data, eof) =
+                tokio::task::spawn_blocking(move || crate::files::read_chunk(&path, offset, len, &sec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("file chunk failed: {e}"))??;
+            Ok(CommandResult::FileChunk { data, eof })
+        }
+
+        Command::FileThumb { path, max_px } => {
+            let (path, max_px) = (path.clone(), *max_px);
+            let sec = state.config.security.clone();
+            let (data, w, h) =
+                tokio::task::spawn_blocking(move || crate::files::thumbnail(&path, max_px, &sec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("thumbnail failed: {e}"))??;
+            Ok(CommandResult::FileThumb { data, w, h })
+        }
+
+        Command::FileSearch { roots, query, kind } => {
+            let (roots, query, kind) = (roots.clone(), query.clone(), *kind);
+            let sec = state.config.security.clone();
+            let hits =
+                tokio::task::spawn_blocking(move || crate::files::search(&roots, &query, kind, &sec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("search failed: {e}"))??;
+            Ok(CommandResult::FileSearch { hits })
+        }
+
+        // Host↔host transfer arms are implemented in Part 3 (transfer.rs).
+        Command::SendFileTo { .. } | Command::TransferGet { .. } => {
+            bail!("host-to-host file transfer is not available yet")
+        }
+
         // MapReduce (Phase 13): map_fn/reduce_fn are shell commands; the
         // partition data (or collected map outputs) is fed on stdin. This
         // reuses the existing shell executor and safety policy — no separate
