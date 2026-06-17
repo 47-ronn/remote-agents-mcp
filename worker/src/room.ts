@@ -1,6 +1,38 @@
 import type { AgentInfo, ClientMessage, ServerMessage, Target, UdpOffer, UdpAnswer, UdpChannelResult } from './types';
 
 /**
+ * Capability score used to pick the most-capable socket of a host: a socket
+ * that executes scores 1, an autonomous one +2 (so an autonomous+executing
+ * socket wins). Kept in lock-step with the Rust relay's `routing::score`.
+ */
+export function scoreAgent(a: AgentInfo): number {
+  return (a.accepts_commands !== false ? 1 : 0) + (a.autonomous ? 2 : 0);
+}
+
+/**
+ * Collapse sockets sharing one agent-id into a single logical host. A machine
+ * has a stable agent-id but may hold several connections at once (many
+ * terminals / AI sessions on the same box); it is listed once, and a capability
+ * (autonomous / accepts_commands) is present if ANY of its sockets has it. The
+ * representative carries the most-capable socket's metadata with the merged
+ * flags applied — so a host shown as autonomous always has an autonomous socket
+ * to receive the task (lock-step with resolveTarget('agent')).
+ */
+export function dedupAgents(infos: AgentInfo[]): AgentInfo[] {
+  const byId = new Map<string, AgentInfo>();
+  for (const info of infos) {
+    const prev = byId.get(info.id);
+    const autonomous = (prev?.autonomous ?? false) || info.autonomous;
+    const accepts =
+      (prev ? prev.accepts_commands !== false : false) ||
+      info.accepts_commands !== false;
+    const rep = prev && scoreAgent(prev) >= scoreAgent(info) ? prev : info;
+    byId.set(info.id, { ...rep, autonomous, accepts_commands: accepts });
+  }
+  return [...byId.values()];
+}
+
+/**
  * Room Durable Object — routes messages between agents and MCP clients.
  *
  * IMPORTANT: this uses the WebSocket *Hibernation* API (`acceptWebSocket`), so
@@ -359,28 +391,9 @@ export class Room implements DurableObject {
   }
 
   /** Collapse multiple live sockets that share one agent-id into a single
-   * logical host. A machine has a stable agent-id but may hold several
-   * connections at once (many terminals / AI sessions on the same box). The
-   * host is listed once, and a capability (autonomous / accepts_commands) is
-   * present if ANY of its sockets has it — kept in lock-step with the
-   * per-socket pick in resolveTarget('agent'), so a host shown as autonomous
-   * always has an autonomous socket to receive the task. */
+   * logical host (delegates to the pure, unit-tested `dedupAgents`). */
   private dedupAgents(infos: AgentInfo[]): AgentInfo[] {
-    const byId = new Map<string, AgentInfo>();
-    const score = (a: AgentInfo) =>
-      (a.accepts_commands !== false ? 1 : 0) + (a.autonomous ? 2 : 0);
-    for (const info of infos) {
-      const prev = byId.get(info.id);
-      const autonomous = (prev?.autonomous ?? false) || info.autonomous;
-      const accepts =
-        (prev ? prev.accepts_commands !== false : false) ||
-        info.accepts_commands !== false;
-      // Representative = the most capable socket (its session_id/platform), with
-      // the merged capability flags applied.
-      const rep = prev && score(prev) >= score(info) ? prev : info;
-      byId.set(info.id, { ...rep, autonomous, accepts_commands: accepts });
-    }
-    return [...byId.values()];
+    return dedupAgents(infos);
   }
 
   private mcpSockets(): [WebSocket, Attachment][] {
