@@ -428,12 +428,34 @@ async fn handle_server_message(
 /// WebSocket so the MCP server's pending map resolves it by `request_id`.
 /// (Returning results over UDP is a later optimization; the inbound direction —
 /// big data to the agent — is the win here.)
+/// Encrypt a command outcome into a WS `CommandResult`/`CommandError` reply
+/// (UDP-inbound commands reply over WS, keyed by request_id).
+fn encode_udp_reply(
+    cipher: &Cipher,
+    request_id: String,
+    outcome: Result<CommandResult>,
+) -> ClientMessage {
+    match outcome {
+        Ok(result) => match result.encrypt(cipher) {
+            Ok(envelope) => ClientMessage::CommandResult { request_id, result: envelope },
+            Err(e) => ClientMessage::CommandError {
+                request_id,
+                error: format!("result encryption failed: {e}"),
+            },
+        },
+        Err(e) => ClientMessage::CommandError {
+            request_id,
+            error: e.to_string(),
+        },
+    }
+}
+
 async fn handle_udp_inbound(
     peer_session: &str,
     data: &[u8],
     state: &AgentState,
     tx: &tokio::sync::mpsc::Sender<ClientMessage>,
-    _udp_transport: &Arc<UdpTransport>,
+    udp_transport: &Arc<UdpTransport>,
     pending: &ConnPending,
 ) {
     let frame = match UdpFrame::from_bytes(data) {
@@ -450,16 +472,20 @@ async fn handle_udp_inbound(
         // the initiator's pending map resolves it by request_id.
         UdpFrame::Command { request_id, payload, .. } => {
             let reply = match Command::decrypt(&payload, &cipher) {
-                Ok(command) => match executor::execute(&command, state).await {
-                    Ok(result) => match result.encrypt(&cipher) {
-                        Ok(envelope) => ClientMessage::CommandResult { request_id, result: envelope },
-                        Err(e) => ClientMessage::CommandError {
-                            request_id,
-                            error: format!("result encryption failed: {e}"),
-                        },
-                    },
-                    Err(e) => ClientMessage::CommandError { request_id, error: e.to_string() },
-                },
+                // SendFileTo must be intercepted here too (not just on the WS
+                // path): an initiator with a UDP channel to this node dispatches
+                // it over UDP, and the generic executor can't initiate the peer
+                // sends a transfer needs.
+                Ok(Command::SendFileTo { src_path, dest_id, dest_path }) => {
+                    let begun =
+                        begin_send_file(state, tx, udp_transport, pending, src_path, dest_id, dest_path)
+                            .await
+                            .map(|id| CommandResult::TransferQueued { id });
+                    encode_udp_reply(&cipher, request_id, begun)
+                }
+                Ok(command) => {
+                    encode_udp_reply(&cipher, request_id, executor::execute(&command, state).await)
+                }
                 Err(e) => {
                     warn!("Failed to decrypt UDP command {}: {}", request_id, e);
                     ClientMessage::CommandError {
