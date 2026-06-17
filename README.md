@@ -237,6 +237,27 @@ Each agent advertises platform metadata (OS family, distro, kernel, shell) and
 is aware of its peers, so the orchestrator can target hosts by OS and tailor
 commands per platform.
 
+## File search, download & transfer
+
+Find and move files across the fleet — over the same end-to-end-encrypted
+channel:
+
+- **Search** a host's files by name, content, or images-only (`file_search`,
+  with sensible default roots: home + Pictures/Documents/Downloads/Desktop). When
+  a deterministic search comes up empty, the host's AI can locate the file.
+- **Preview & download** to the browser: images get a host-generated thumbnail;
+  any file downloads via a **binary-safe, chunked pull** through the relay (each
+  chunk is its own request, staying under the relay's frame limit — no UDP needed
+  in the browser).
+- **Host↔host transfer**: `send_file` streams a file from one host to another
+  over the **direct UDP data channel** (a channel is opened on demand, with
+  automatic relay fallback), verified end-to-end with SHA-256. Receiving writes
+  to disk and requires Edit/Bypass mode on the destination.
+
+The browser panel (`fleet-chat`) exposes all of this: a 📁 Files view to search,
+preview photos in chat, download, and move files between hosts with live
+progress.
+
 ## Security modes
 
 | Mode | Behavior |
