@@ -25,6 +25,9 @@ export interface AgentInfo {
   accepts_commands?: boolean;
   /** Newer published version available for this host, if any. */
   update_available?: string;
+  /** Running binary version (crate version), so the fleet view can show what
+   * each host runs. Absent for peers that predate the field. */
+  version?: string;
   connected_at: number;
   session_id?: string;
 }

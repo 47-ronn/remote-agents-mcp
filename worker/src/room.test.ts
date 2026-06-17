@@ -67,6 +67,21 @@ describe('dedupAgents', () => {
     expect(out).toHaveLength(1);
     expect(out[0].accepts_commands).toBe(false);
   });
+
+  it('preserves the version field through dedup (fleet version visibility)', () => {
+    // Single socket: version carried straight through.
+    const one = dedupAgents([agent({ id: 'a', version: '0.1.9' })]);
+    expect(one[0].version).toBe('0.1.9');
+
+    // Multiple sockets of one machine: the representative (most-capable) socket's
+    // version is kept — the relay must forward what each host runs.
+    const dup = dedupAgents([
+      agent({ id: 'm', session_id: 's1', autonomous: false, version: '0.1.8' }),
+      agent({ id: 'm', session_id: 's2', autonomous: true, version: '0.1.9' }),
+    ]);
+    expect(dup).toHaveLength(1);
+    expect(dup[0].version).toBe('0.1.9');
+  });
 });
 
 describe('selectTargets', () => {
