@@ -252,6 +252,11 @@ impl AutonomousStore {
         );
         info!("Autonomous task '{}' -> {:?}", id, status);
 
+        // The runner (claude/opencode) just created or extended a provider
+        // session; drop the 30s session-list cache so the web can adopt it now
+        // and resume it for conversation context.
+        crate::sessions::invalidate_cache();
+
         // Push a completion event so the initiator learns early (and cancels its
         // reminder cron) without polling. Ignored if no one is listening.
         let _ = self.events.send(AgentEvent::TaskCompleted {
