@@ -19,6 +19,13 @@ const MAX_PER_PROVIDER: usize = 60;
 const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Bound on a provider CLI call.
 const CLI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Keep at most this many of the most-recent messages in a returned transcript.
+const MAX_TRANSCRIPT_MESSAGES: usize = 1000;
+/// …and at most this many text bytes. A long session can reach ~1 MiB of text
+/// (the relay's per-frame limit even before JSON/encryption overhead), and the
+/// panel re-fetches an open live dialog every few seconds — so bound it to the
+/// most recent turns. Both caps keep the tail; a marker notes what was dropped.
+const MAX_TRANSCRIPT_BYTES: usize = 700_000;
 
 static CACHE: Mutex<Option<(Instant, Vec<SessionMeta>)>> = Mutex::new(None);
 
@@ -52,15 +59,48 @@ pub fn invalidate_cache() {
     }
 }
 
-/// Full transcript of one session.
+/// Full transcript of one session (capped to the most recent messages so it
+/// fits the relay frame and the panel stays responsive).
 pub fn get_transcript(provider: &str, id: &str) -> Result<Vec<SessionMessage>> {
-    match provider {
+    let msgs = match provider {
         "claude" => claude_transcript(id),
         "opencode" => opencode_transcript(id),
         "cline" | "roo" | "kilo" => vscode_agent_transcript(provider, id),
         "zed" => zed_transcript(id),
         other => bail!("unknown provider '{other}'"),
+    }?;
+    Ok(cap_transcript(msgs))
+}
+
+/// Keep the most-recent messages within the message/byte caps. If anything was
+/// dropped, prepend a `system` marker so the reader knows the head is truncated.
+fn cap_transcript(msgs: Vec<SessionMessage>) -> Vec<SessionMessage> {
+    let total = msgs.len();
+    // Walk from the end, accumulating until either cap is reached.
+    let mut bytes = 0usize;
+    let mut keep = 0usize;
+    for m in msgs.iter().rev() {
+        let next = bytes + m.text.len();
+        if keep >= MAX_TRANSCRIPT_MESSAGES || (keep > 0 && next > MAX_TRANSCRIPT_BYTES) {
+            break;
+        }
+        bytes = next;
+        keep += 1;
     }
+    if keep >= total {
+        return msgs;
+    }
+    let dropped = total - keep;
+    let mut out = Vec::with_capacity(keep + 1);
+    out.push(SessionMessage {
+        role: "system".to_string(),
+        text: format!(
+            "… показаны последние {keep} из {total} сообщений ({dropped} более ранних опущены) …"
+        ),
+        ts: None,
+    });
+    out.extend(msgs.into_iter().skip(total - keep));
+    out
 }
 
 /// Session ids currently live (a running `opencode -s …` / `claude --resume …`).
@@ -838,6 +878,44 @@ mod tests {
             vec!["opencode", "run", "-s", "ses_x"]
         );
         assert!(resume_runner("bogus", "x").is_err());
+    }
+
+    fn msg(text: &str) -> SessionMessage {
+        SessionMessage { role: "assistant".into(), text: text.into(), ts: None }
+    }
+
+    #[test]
+    fn cap_transcript_keeps_short_history_untouched() {
+        let v = vec![msg("a"), msg("b"), msg("c")];
+        let out = cap_transcript(v.clone());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].text, "a"); // no marker prepended
+    }
+
+    #[test]
+    fn cap_transcript_truncates_by_message_count_keeping_the_tail() {
+        let v: Vec<_> = (0..MAX_TRANSCRIPT_MESSAGES + 50).map(|i| msg(&i.to_string())).collect();
+        let out = cap_transcript(v);
+        assert_eq!(out.len(), MAX_TRANSCRIPT_MESSAGES + 1); // +1 marker
+        assert_eq!(out[0].role, "system");
+        assert!(out[0].text.contains("опущены"));
+        // The tail is preserved; the last original message is still last.
+        assert_eq!(out.last().unwrap().text, (MAX_TRANSCRIPT_MESSAGES + 49).to_string());
+    }
+
+    #[test]
+    fn cap_transcript_truncates_by_bytes() {
+        // Each message ~10 KiB; well past the byte cap in far fewer than the
+        // message-count cap, so the byte limit is what triggers truncation.
+        let big = "x".repeat(10_000);
+        let v: Vec<_> = (0..200).map(|_| msg(&big)).collect();
+        let out = cap_transcript(v);
+        assert_eq!(out[0].role, "system"); // truncated → marker present
+        let kept = out.len() - 1;
+        assert!(kept < 200, "should have dropped some (kept {kept})");
+        // Kept text stays within the byte budget.
+        let bytes: usize = out.iter().skip(1).map(|m| m.text.len()).sum();
+        assert!(bytes <= MAX_TRANSCRIPT_BYTES, "kept {bytes} bytes");
     }
 
     #[cfg(unix)]
