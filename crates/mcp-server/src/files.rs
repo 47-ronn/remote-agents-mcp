@@ -12,7 +12,8 @@ use base64::Engine;
 use remote_agents_shared::{FileMeta, SearchKind};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::sync::mpsc;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Best-effort MIME type from a path's extension.
 pub fn mime_of(path: &str) -> String {
@@ -138,8 +139,18 @@ fn default_roots(sec: &SecurityConfig) -> Vec<String> {
 }
 
 /// Run a search program, collecting up to `max` newline-separated paths from its
-/// stdout, then killing it early so a huge tree doesn't run to completion.
-fn run_collecting(program: &str, args: &[String], max: usize) -> Result<Vec<String>> {
+/// stdout. Stops on any of: enough results, the program finishing, or `timeout`
+/// elapsing — then kills the child so a huge tree (slow to traverse, few matches)
+/// can neither hang nor run to completion. `timeout` of 0 disables the deadline.
+///
+/// stdout is drained on a helper thread so the deadline is enforced even while a
+/// blocking read would otherwise stall between lines.
+fn run_collecting(
+    program: &str,
+    args: &[String],
+    max: usize,
+    timeout: Duration,
+) -> Result<Vec<String>> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -149,21 +160,43 @@ fn run_collecting(program: &str, args: &[String], max: usize) -> Result<Vec<Stri
 
     let mut out = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if !line.is_empty() {
-                out.push(line);
+        let (tx, rx) = mpsc::channel::<String>();
+        // Reader thread: forwards lines until the pipe closes (child killed/done).
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
             }
+        });
+
+        let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
+        loop {
             if out.len() >= max {
                 break;
             }
+            let recv = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    rx.recv_timeout(remaining)
+                }
+                None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            match recv {
+                Ok(line) => {
+                    if !line.is_empty() {
+                        out.push(line);
+                    }
+                }
+                // Channel closed (reader finished) or deadline elapsed.
+                Err(_) => break,
+            }
         }
     }
-    // We have enough (or hit EOF): stop the search and reap it.
+    // Enough / done / timed out: stop the search and reap it.
     let _ = child.kill();
     let _ = child.wait();
     Ok(out)
@@ -196,6 +229,7 @@ pub fn search(
     }
 
     let max = sec.search_max_results.max(1);
+    let timeout = Duration::from_secs(sec.search_timeout_secs);
     let paths = match kind {
         SearchKind::Name | SearchKind::Image => {
             // find <roots...> -type f -iname '*query*'
@@ -204,13 +238,13 @@ pub fn search(
             args.push("f".into());
             args.push("-iname".into());
             args.push(format!("*{query}*"));
-            run_collecting("find", &args, max * 2)?
+            run_collecting("find", &args, max * 2, timeout)?
         }
         SearchKind::Content => {
             // grep -rIl -e query <roots...>   (-I skips binary, -l lists files)
             let mut args: Vec<String> = vec!["-rIl".into(), "-e".into(), query.into()];
             args.extend(roots.clone());
-            run_collecting("grep", &args, max)?
+            run_collecting("grep", &args, max, timeout)?
         }
     };
 
@@ -307,6 +341,62 @@ mod tests {
         let imgs = search(&roots, "vacation", SearchKind::Image, &sec()).unwrap();
         assert!(imgs.iter().all(|h| h.is_image));
         assert!(imgs.iter().any(|h| h.path.ends_with("vacation-photo.jpg")));
+    }
+
+    #[test]
+    fn search_by_content_finds_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"the needle is here\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"nothing relevant\n").unwrap();
+        let roots = vec![dir.path().to_string_lossy().to_string()];
+
+        let hits = search(&roots, "needle", SearchKind::Content, &sec()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("a.txt"));
+    }
+
+    #[test]
+    fn run_collecting_honors_result_cap() {
+        let out = run_collecting(
+            "sh",
+            &["-c".into(), "seq 100".into()],
+            3,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3, "should stop at the result cap");
+        assert_eq!(out, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn run_collecting_returns_all_lines_before_timeout() {
+        let out = run_collecting(
+            "sh",
+            &["-c".into(), "printf 'a\\nb\\nc\\n'".into()],
+            100,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn run_collecting_aborts_on_timeout() {
+        let start = Instant::now();
+        // The match is printed only after a 5s sleep; a 300ms deadline must win.
+        let out = run_collecting(
+            "sh",
+            &["-c".into(), "sleep 5; echo late".into()],
+            10,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(out.is_empty(), "no output should arrive before the deadline");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must return at the deadline, not wait for the child ({}ms)",
+            start.elapsed().as_millis()
+        );
     }
 
     #[test]
