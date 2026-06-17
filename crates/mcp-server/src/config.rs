@@ -187,6 +187,11 @@ pub struct SecurityConfig {
     #[serde(default = "default_search_max_results")]
     pub search_max_results: usize,
 
+    /// Wall-clock cap (seconds) for a single `FileSearch`, so a scan of a huge
+    /// tree with few matches can't hang. 0 = no timeout.
+    #[serde(default = "default_search_timeout_secs")]
+    pub search_timeout_secs: u64,
+
     /// Command timeout in seconds
     #[serde(default = "default_timeout")]
     pub command_timeout: u64,
@@ -231,6 +236,7 @@ impl Default for SecurityConfig {
             transfer_chunk_size: default_transfer_chunk_size(),
             search_roots: Vec::new(),
             search_max_results: default_search_max_results(),
+            search_timeout_secs: default_search_timeout_secs(),
             command_timeout: 300,
             encryption_key: None,
         }
@@ -328,6 +334,10 @@ fn default_transfer_chunk_size() -> u64 {
 
 fn default_search_max_results() -> usize {
     200
+}
+
+fn default_search_timeout_secs() -> u64 {
+    10
 }
 
 /// Get config file path
