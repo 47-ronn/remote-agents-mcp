@@ -43,6 +43,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Set crate version from tag
+        # Force bash so this runs identically on the Windows runner (whose
+        # default shell is PowerShell, with no `sed` and no `${VAR#v}`); Git
+        # Bash on windows-latest provides both.
+        shell: bash
         run: |
           ver="${GITHUB_REF_NAME#v}"
           # Stamp the workspace version so the binary reports the release version
