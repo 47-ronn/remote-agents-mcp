@@ -164,13 +164,15 @@ pub struct AgentInfo {
     pub update_available: Option<String>,
 }
 
-/// Metadata for one AI-provider conversation (claude / opencode) stored on a
-/// host. The full transcript is fetched lazily on demand (see SessionGet).
+/// Metadata for one AI-provider conversation stored on a host (claude /
+/// opencode, and the read-only VS Code agents cline / roo / kilo). The full
+/// transcript is fetched lazily on demand (see SessionGet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
-    /// AI provider: `claude` | `opencode`.
+    /// AI provider: `claude` | `opencode` | `cline` | `roo` | `kilo`.
     pub provider: String,
-    /// Provider-native session id (claude: uuid; opencode: `ses_…`).
+    /// Provider-native session id (claude: uuid; opencode: `ses_…`; vscode
+    /// agents: the task-folder id).
     pub id: String,
     /// Human-readable title (provider-generated or first user message).
     pub title: String,
@@ -179,6 +181,16 @@ pub struct SessionMeta {
     /// Working directory / project the session belongs to, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Whether the session can be continued non-interactively (a `--resume`-style
+    /// CLI exists). True for claude/opencode; false for the VS Code agents
+    /// (cline/roo/kilo), whose history is view-only. Defaults true for payloads
+    /// that predate the field.
+    #[serde(default = "default_true")]
+    pub resumable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One message in a session transcript.

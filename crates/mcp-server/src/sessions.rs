@@ -33,6 +33,7 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     }
     let mut all = claude_sessions();
     all.extend(opencode_sessions());
+    all.extend(vscode_agent_sessions());
     all.sort_by_key(|s| std::cmp::Reverse(s.updated));
     if let Ok(mut g) = CACHE.lock() {
         *g = Some((Instant::now(), all.clone()));
@@ -55,6 +56,7 @@ pub fn get_transcript(provider: &str, id: &str) -> Result<Vec<SessionMessage>> {
     match provider {
         "claude" => claude_transcript(id),
         "opencode" => opencode_transcript(id),
+        "cline" | "roo" | "kilo" => vscode_agent_transcript(provider, id),
         other => bail!("unknown provider '{other}'"),
     }
 }
@@ -124,6 +126,7 @@ fn claude_sessions() -> Vec<SessionMeta> {
                 title,
                 updated: mtime,
                 cwd,
+                resumable: true,
             })
         })
         .collect()
@@ -231,6 +234,7 @@ fn opencode_sessions() -> Vec<SessionMeta> {
                     .get("directory")
                     .and_then(|d| d.as_str())
                     .map(String::from),
+                resumable: true,
             })
         })
         .collect()
@@ -255,6 +259,169 @@ fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
             Some(SessionMessage { role, text, ts: m.get("time").and_then(|t| t.as_u64()) })
         })
         .collect())
+}
+
+// --- VS Code agents: Cline / Roo / Kilo (filesystem JSON) -------------------
+//
+// All three are forks of the same base and share an identical on-disk layout:
+//   <globalStorage>/<ext-id>/tasks/<task-id>/ui_messages.json
+// `ui_messages.json` is an array of ClineMessage `{ ts, type:"ask"|"say",
+// say?, ask?, text? }`. History is read-only — these are VS Code-extension
+// tasks with no headless `--resume`, so the panel surfaces them view-only.
+
+/// (provider label, globalStorage extension-id) for each supported agent.
+const VSCODE_AGENTS: &[(&str, &str)] = &[
+    ("cline", "saoudrizwan.claude-dev"),
+    ("roo", "rooveterinaryinc.roo-cline"),
+    ("kilo", "kilocode.kilo-code"),
+];
+
+/// VS Code `globalStorage` roots across the common editor variants (incl. forks
+/// the agents can also be installed into) and the remote/server layout.
+fn vscode_global_storage_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(cfg) = dirs::config_dir() {
+        // dirs::config_dir() = ~/.config (linux), ~/Library/Application Support
+        // (macOS), %APPDATA% (windows) — the VS Code `User` parent on every OS.
+        for app in ["Code", "Code - OSS", "VSCodium", "Cursor", "Windsurf"] {
+            roots.push(cfg.join(app).join("User").join("globalStorage"));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(
+            home.join(".vscode-server")
+                .join("data")
+                .join("User")
+                .join("globalStorage"),
+        );
+    }
+    roots
+}
+
+/// All `tasks/` dirs for one extension id, across every globalStorage root.
+fn vscode_task_dirs(ext_id: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in vscode_global_storage_roots() {
+        let tasks = root.join(ext_id).join("tasks");
+        let Ok(entries) = std::fs::read_dir(&tasks) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+    dirs
+}
+
+fn vscode_agent_sessions() -> Vec<SessionMeta> {
+    let mut out = Vec::new();
+    for (provider, ext_id) in VSCODE_AGENTS {
+        let mut dirs: Vec<(PathBuf, u64)> = vscode_task_dirs(ext_id)
+            .into_iter()
+            .filter_map(|d| {
+                let msgs = d.join("ui_messages.json");
+                msgs.is_file().then(|| (d, mtime_ms(&msgs)))
+            })
+            .collect();
+        dirs.sort_by_key(|f| std::cmp::Reverse(f.1));
+        dirs.truncate(MAX_PER_PROVIDER);
+        for (dir, updated) in dirs {
+            let Some(id) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            let title = vscode_title(&dir.join("ui_messages.json")).unwrap_or_else(|| id.clone());
+            out.push(SessionMeta {
+                provider: provider.to_string(),
+                id,
+                title,
+                updated,
+                cwd: None,
+                resumable: false,
+            });
+        }
+    }
+    out
+}
+
+/// Title = the initial `say:"task"` text (truncated), else first user turn.
+fn vscode_title(msgs_path: &Path) -> Option<String> {
+    let content = read_head(msgs_path, 256 * 1024)?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
+    for v in &arr {
+        if v.get("say").and_then(|s| s.as_str()) == Some("task") {
+            if let Some(t) = cline_text(v) {
+                return Some(truncate(&t, 80));
+            }
+        }
+    }
+    arr.iter()
+        .find_map(cline_message)
+        .filter(|m| m.role == "user")
+        .map(|m| truncate(&m.text, 80))
+}
+
+fn vscode_agent_transcript(provider: &str, id: &str) -> Result<Vec<SessionMessage>> {
+    let ext_id = VSCODE_AGENTS
+        .iter()
+        .find(|(p, _)| *p == provider)
+        .map(|(_, e)| *e)
+        .with_context(|| format!("unknown vscode agent '{provider}'"))?;
+    // Reject path-traversal in the id; it indexes a directory name.
+    if id.contains('/') || id.contains("..") {
+        bail!("invalid session id");
+    }
+    let path = vscode_global_storage_roots()
+        .into_iter()
+        .map(|r| r.join(ext_id).join("tasks").join(id).join("ui_messages.json"))
+        .find(|p| p.is_file())
+        .with_context(|| format!("{provider} session '{id}' not found"))?;
+    let content = std::fs::read_to_string(&path)?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+    Ok(arr.iter().filter_map(cline_message).collect())
+}
+
+/// Map one ClineMessage to a transcript turn, or None for tool/api noise.
+fn cline_message(v: &serde_json::Value) -> Option<SessionMessage> {
+    let say = v.get("say").and_then(|s| s.as_str());
+    let ask = v.get("ask").and_then(|s| s.as_str());
+    let role = match (say, ask) {
+        // User's own turns: the initial task and feedback replies.
+        (Some("task"), _) | (Some("user_feedback"), _) => "user",
+        // Assistant prose / final answers / reasoning.
+        (Some("text"), _) | (Some("completion_result"), _) | (Some("reasoning"), _) => "assistant",
+        // Assistant asking the user something (followup / plan response).
+        (_, Some("followup")) | (_, Some("plan_mode_respond")) | (_, Some("completion_result")) => {
+            "assistant"
+        }
+        // api_req_started, tool, command, command_output, … → skip.
+        _ => return None,
+    };
+    let text = cline_text(v)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(SessionMessage {
+        role: role.to_string(),
+        text: text.to_string(),
+        ts: v.get("ts").and_then(|t| t.as_u64()),
+    })
+}
+
+/// Extract display text from a ClineMessage `text`. Most are plain strings; some
+/// (followup/plan_mode_respond) wrap it as JSON `{question|response, …}`.
+fn cline_text(v: &serde_json::Value) -> Option<String> {
+    let raw = v.get("text").and_then(|t| t.as_str())?;
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw) {
+        for key in ["question", "response", "result"] {
+            if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
+                return Some(s.to_string());
+            }
+        }
+    }
+    Some(raw.to_string())
 }
 
 // --- process scanning -------------------------------------------------------
@@ -407,6 +574,9 @@ pub fn resume_runner(provider: &str, id: &str) -> Result<Vec<String>> {
             "-s".into(),
             id.into(),
         ]),
+        "cline" | "roo" | "kilo" => {
+            bail!("'{provider}' sessions are view-only (no headless resume)")
+        }
         other => bail!("unknown provider '{other}'"),
     }
 }
@@ -468,5 +638,72 @@ mod tests {
             vec!["opencode", "run", "-s", "ses_x"]
         );
         assert!(resume_runner("bogus", "x").is_err());
+    }
+
+    #[test]
+    fn vscode_agents_are_view_only() {
+        for p in ["cline", "roo", "kilo"] {
+            assert!(
+                resume_runner(p, "task-1").is_err(),
+                "{p} must not be resumable"
+            );
+        }
+    }
+
+    #[test]
+    fn cline_message_maps_roles_and_skips_noise() {
+        let task = serde_json::json!({"ts":1,"type":"say","say":"task","text":"做 X"});
+        let m = cline_message(&task).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.text, "做 X");
+        assert_eq!(m.ts, Some(1));
+
+        let say_text = serde_json::json!({"ts":2,"type":"say","say":"text","text":"done"});
+        assert_eq!(cline_message(&say_text).unwrap().role, "assistant");
+
+        let feedback = serde_json::json!({"type":"say","say":"user_feedback","text":"no, retry"});
+        assert_eq!(cline_message(&feedback).unwrap().role, "user");
+
+        // Tool / api noise is dropped from the transcript.
+        for noise in ["api_req_started", "tool", "command", "command_output"] {
+            let v = serde_json::json!({"type":"say","say":noise,"text":"{}"});
+            assert!(cline_message(&v).is_none(), "{noise} should be skipped");
+        }
+
+        // Empty text is dropped even for a conversational role.
+        let empty = serde_json::json!({"type":"say","say":"text","text":"   "});
+        assert!(cline_message(&empty).is_none());
+    }
+
+    #[test]
+    fn cline_text_unwraps_json_followup() {
+        // followup asks wrap the prompt as JSON {question, options}.
+        let v = serde_json::json!({
+            "type":"ask","ask":"followup",
+            "text":"{\"question\":\"which env?\",\"options\":[\"dev\",\"prod\"]}"
+        });
+        let m = cline_message(&v).unwrap();
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.text, "which env?");
+
+        // A plain (non-JSON) text passes through untouched.
+        let plain = serde_json::json!({"type":"say","say":"text","text":"plain answer"});
+        assert_eq!(cline_message(&plain).unwrap().text, "plain answer");
+    }
+
+    #[test]
+    fn vscode_title_prefers_task_then_first_user() {
+        let dir = std::env::temp_dir().join(format!("ra-vsc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ui_messages.json");
+
+        let msgs = serde_json::json!([
+            {"type":"say","say":"api_req_started","text":"{}"},
+            {"type":"say","say":"task","text":"Fix the build on CI"},
+            {"type":"say","say":"text","text":"Sure, looking now"},
+        ]);
+        std::fs::write(&p, serde_json::to_vec(&msgs).unwrap()).unwrap();
+        assert_eq!(vscode_title(&p).as_deref(), Some("Fix the build on CI"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
