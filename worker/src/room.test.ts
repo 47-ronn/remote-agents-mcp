@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { scoreAgent, dedupAgents } from './room';
-import type { AgentInfo } from './types';
+import { scoreAgent, dedupAgents, selectTargets } from './room';
+import type { AgentInfo, Target } from './types';
 
 // Minimal AgentInfo factory; capabilities default to a plain executing peer.
 function agent(over: Partial<AgentInfo> & { id: string }): AgentInfo {
@@ -66,5 +66,55 @@ describe('dedupAgents', () => {
     ]);
     expect(out).toHaveLength(1);
     expect(out[0].accepts_commands).toBe(false);
+  });
+});
+
+describe('selectTargets', () => {
+  // Candidates pair an agent_info with a tag we can assert on (the "socket").
+  const cand = (info: AgentInfo) => ({ info, item: `${info.id}:${info.session_id ?? ''}` });
+
+  it('agent target picks the single most-capable socket of a machine', () => {
+    const candidates = [
+      cand(agent({ id: 'dup', session_id: 's1', autonomous: false })),
+      cand(agent({ id: 'dup', session_id: 's2', autonomous: true })),
+    ];
+    const picked = selectTargets(candidates, { type: 'agent', id: 'dup' } as Target);
+    expect(picked).toEqual(['dup:s2']); // the autonomous socket
+  });
+
+  it('agent target reaches even a send-only node (self-rejects)', () => {
+    const candidates = [cand(agent({ id: 'so', accepts_commands: false }))];
+    expect(selectTargets(candidates, { type: 'agent', id: 'so' } as Target)).toEqual(['so:']);
+  });
+
+  it('all broadcast dedups one machine and skips send-only peers', () => {
+    const candidates = [
+      cand(agent({ id: 'm', session_id: 's1', autonomous: false })),
+      cand(agent({ id: 'm', session_id: 's2', autonomous: true })),
+      cand(agent({ id: 'other' })),
+      cand(agent({ id: 'sendonly', accepts_commands: false })),
+    ];
+    const picked = selectTargets(candidates, { type: 'all' } as Target);
+    // one delivery per machine, send-only excluded, most-capable socket chosen
+    expect(picked.sort()).toEqual(['m:s2', 'other:'].sort());
+  });
+
+  it('tagged matches any overlapping tag and skips send-only', () => {
+    const candidates = [
+      cand(agent({ id: 'a', tags: ['backend', 'db'] })),
+      cand(agent({ id: 'b', tags: ['frontend'] })),
+      cand(agent({ id: 'c', tags: ['backend'], accepts_commands: false })),
+    ];
+    const picked = selectTargets(candidates, { type: 'tagged', tags: ['backend'] } as Target);
+    expect(picked).toEqual(['a:']);
+  });
+
+  it('platform matches os family (case-insensitive), send-only excluded', () => {
+    const candidates = [
+      cand(agent({ id: 'lin', os: 'linux' })),
+      cand(agent({ id: 'mac', os: 'macos' })),
+    ];
+    const picked = selectTargets(candidates, { type: 'platform', family: 'LINUX' } as Target);
+    expect(picked).toEqual(['lin:']);
   });
 });

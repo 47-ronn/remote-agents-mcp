@@ -38,6 +38,8 @@ jobs:
       - run: npm ci
       - name: tsc --noEmit (worker)
         run: npx tsc --noEmit -p worker
+      - name: worker — unit tests (vitest)
+        run: npm test --prefix worker
       - name: npm package — syntax check
         run: node --check npm/install.js && node --check npm/run.js
       - name: npm package — unit tests
