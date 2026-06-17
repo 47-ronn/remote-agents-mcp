@@ -15,6 +15,9 @@ use tokio::sync::RwLock;
 pub struct UpdateRecommendation {
     pub agent_id: String,
     pub name: String,
+    /// The version the host is currently running (`AgentInfo.version`); empty if
+    /// the host predates the version field.
+    pub current_version: String,
     /// The newer version published for this host (from `AgentInfo.update_available`).
     pub latest_version: String,
 }
@@ -31,6 +34,7 @@ fn update_recommendations(agents: &[AgentInfo]) -> Vec<UpdateRecommendation> {
             a.update_available.as_ref().map(|latest| UpdateRecommendation {
                 agent_id: a.id.clone(),
                 name: a.name.clone(),
+                current_version: a.version.clone(),
                 latest_version: latest.clone(),
             })
         })
@@ -628,7 +632,7 @@ mod tests {
             autonomous: false,
             accepts_commands: true,
             connected_at: 0,
-            version: String::new(),
+            version: "0.1.8".into(),
             session_id: None,
             update_available: update.map(String::from),
         }
@@ -646,6 +650,7 @@ mod tests {
         assert_eq!(recs.len(), 2, "only idle hosts with an update: {recs:?}");
         assert_eq!(recs[0].agent_id, "a");
         assert_eq!(recs[0].name, "name-a");
+        assert_eq!(recs[0].current_version, "0.1.8", "reports what the host runs now");
         assert_eq!(recs[0].latest_version, "0.1.2");
         assert_eq!(recs[1].agent_id, "d");
         assert_eq!(recs[1].latest_version, "0.2.0");
