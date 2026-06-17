@@ -651,6 +651,7 @@ pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::Agen
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         // session_id is set by the relay, not the agent
         session_id: None,
         // Surfaced from the launcher's cached npm-registry check.
@@ -713,6 +714,9 @@ mod tests {
         // os/arch come from the build target and are always populated.
         assert!(!info.os.is_empty());
         assert!(!info.arch.is_empty());
+        // The running binary version is advertised (so list_agents shows it).
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(!info.version.is_empty());
     }
 
     // --- handle_server_message ---------------------------------------------
@@ -812,7 +816,7 @@ mod tests {
             accepts_commands: true,
             connected_at: 0,
             session_id: None,
-            update_available: None,
+            version: String::new(), update_available: None,
         };
         peer_a.platform.distro = Some("Ubuntu 22.04".into());
 

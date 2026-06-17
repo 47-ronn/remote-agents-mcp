@@ -627,7 +627,7 @@ mod tests {
                 accepts_commands: true,
                 connected_at: 1234567890,
                 session_id: None,
-                update_available: None,
+                version: String::new(), update_available: None,
             })),
         };
 

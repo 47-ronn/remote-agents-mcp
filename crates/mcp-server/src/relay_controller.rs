@@ -1129,7 +1129,7 @@ mod tests {
             accepts_commands: true,
             connected_at: 0,
             session_id: session.map(String::from),
-            update_available: None,
+            version: String::new(), update_available: None,
         }
     }
 

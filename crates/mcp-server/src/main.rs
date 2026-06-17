@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "remote-agent")]
+#[command(version)]
 #[command(about = "Remote agent for distributed shell access")]
 struct Cli {
     #[command(subcommand)]

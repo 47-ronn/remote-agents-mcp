@@ -628,6 +628,7 @@ mod tests {
             autonomous: false,
             accepts_commands: true,
             connected_at: 0,
+            version: String::new(),
             session_id: None,
             update_available: update.map(String::from),
         }

@@ -149,6 +149,11 @@ pub struct AgentInfo {
     pub accepts_commands: bool,
     /// Connection timestamp (Unix ms)
     pub connected_at: u64,
+    /// Running binary version (crate `CARGO_PKG_VERSION`), so `list_agents` shows
+    /// what each host actually runs. `#[serde(default)]` → empty for peers that
+    /// predate this field (wire-compat).
+    #[serde(default)]
+    pub version: String,
     /// Session ID for this connection (used for UDP signaling)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
