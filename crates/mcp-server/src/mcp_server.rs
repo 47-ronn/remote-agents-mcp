@@ -987,6 +987,26 @@ fn format_result(result: &CommandResult) -> String {
         CommandResult::SessionTranscript { messages } => {
             serde_json::to_string_pretty(messages).unwrap_or_else(|_| format!("{:?}", messages))
         }
+        CommandResult::FileMeta { meta } => {
+            serde_json::to_string_pretty(meta).unwrap_or_else(|_| format!("{:?}", meta))
+        }
+        CommandResult::FileChunk { data, eof } => {
+            format!("file chunk: {} base64 bytes (eof={})", data.len(), eof)
+        }
+        CommandResult::FileThumb { data, w, h } => {
+            format!("thumbnail {}x{} ({} base64 bytes)", w, h, data.len())
+        }
+        CommandResult::FileSearch { hits } => {
+            format!(
+                "{} hit(s):\n{}",
+                hits.len(),
+                serde_json::to_string_pretty(hits).unwrap_or_default()
+            )
+        }
+        CommandResult::TransferQueued { id } => format!("Transfer queued: {}", id),
+        CommandResult::Transfer { status } => {
+            serde_json::to_string_pretty(status).unwrap_or_else(|_| format!("{:?}", status))
+        }
     }
 }
 

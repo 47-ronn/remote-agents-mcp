@@ -29,6 +29,12 @@ rand = { workspace = true }
 sysinfo = "0.32"
 hostname = "0.4"
 
+# File transfer: MIME by extension, image thumbnails, checksum, base64
+mime_guess = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+sha2 = "0.10"
+base64 = "0.22"
+
 # Scheduling
 cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

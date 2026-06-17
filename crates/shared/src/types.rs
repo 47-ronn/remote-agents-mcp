@@ -188,6 +188,64 @@ pub struct SessionMessage {
     pub ts: Option<u64>,
 }
 
+/// Metadata for one file on a host — used both as the `FileStat` result and as
+/// a `FileSearch` hit. The body is never included; fetch it in chunks via
+/// `FileChunk` (binary-safe) or preview an image via `FileThumb`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMeta {
+    /// Absolute path on the host.
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Last-modified timestamp (Unix ms), if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
+    /// Best-effort MIME type (by extension), e.g. `image/jpeg`.
+    pub mime: String,
+    /// Whether `mime` is an image type (drives inline preview in the web UI).
+    pub is_image: bool,
+}
+
+/// Which kind of file search to run (mirrors the human's "know exactly / roughly
+/// / not at all"): by name/glob, by file content, or images-only by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchKind {
+    /// Match the query against file names (substring / glob).
+    Name,
+    /// Match the query against file contents (grep).
+    Content,
+    /// Image files whose name matches the query.
+    Image,
+}
+
+/// Lifecycle status of a host↔host file transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferState {
+    /// Accepted, not yet sending.
+    Queued,
+    /// Bytes are in flight.
+    Running,
+    /// Completed; checksum verified.
+    Done,
+    /// Aborted (channel error, checksum mismatch, write failure).
+    Failed,
+}
+
+/// Progress of one host↔host file transfer, polled via `TransferGet`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferStatus {
+    pub id: String,
+    pub state: TransferState,
+    /// Bytes transferred so far.
+    pub bytes: u64,
+    /// Total bytes to transfer.
+    pub total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Lifecycle status of an autonomous task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
