@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scoreAgent, dedupAgents, selectTargets } from './room';
+import { scoreAgent, dedupAgents, selectTargets, selectStale, STALE_MS } from './room';
 import type { AgentInfo, Target } from './types';
 
 // Minimal AgentInfo factory; capabilities default to a plain executing peer.
@@ -94,6 +94,34 @@ describe('dedupAgents', () => {
     ]);
     expect(dup).toHaveLength(1);
     expect(dup[0].version).toBe('0.1.9');
+  });
+});
+
+describe('selectStale', () => {
+  const now = 1_000_000;
+
+  it('reaps only sockets past the staleness window', () => {
+    const entries = [
+      { id: 'fresh', lastSeen: now - 1_000 }, // 1s ago
+      { id: 'edge', lastSeen: now - STALE_MS }, // exactly at threshold → not stale
+      { id: 'dead', lastSeen: now - STALE_MS - 1 }, // just over → stale
+      { id: 'ancient', lastSeen: now - 10 * STALE_MS },
+    ];
+    const reaped = selectStale(entries, now, STALE_MS).map((e) => e.id);
+    expect(reaped.sort()).toEqual(['ancient', 'dead']);
+  });
+
+  it('never reaps an entry that has no lastSeen (treated as fresh)', () => {
+    const entries = [{ id: 'unknown' }, { id: 'old', lastSeen: now - 10 * STALE_MS }];
+    expect(selectStale(entries, now, STALE_MS).map((e) => e.id)).toEqual(['old']);
+  });
+
+  it('reaps nothing when all sockets are within the window', () => {
+    const entries = [
+      { id: 'a', lastSeen: now - 5_000 },
+      { id: 'b', lastSeen: now - 30_000 },
+    ];
+    expect(selectStale(entries, now, STALE_MS)).toEqual([]);
   });
 });
 
