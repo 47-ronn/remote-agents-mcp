@@ -300,9 +300,40 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::FileSearch { hits })
         }
 
-        // Host↔host transfer arms are implemented in Part 3 (transfer.rs).
-        Command::SendFileTo { .. } | Command::TransferGet { .. } => {
-            bail!("host-to-host file transfer is not available yet")
+        // Receiver side of a host↔host transfer: write one slice to disk.
+        Command::FileRecv {
+            transfer_id: _,
+            dest_path,
+            offset,
+            bytes,
+            eof,
+            sha256,
+        } => {
+            if !mode.allows_write() {
+                bail!("Receiving a file requires Edit/Bypass mode (got {:?})", mode);
+            }
+            let (dest_path, bytes, sha) = (dest_path.clone(), bytes.clone(), sha256.clone());
+            let (offset, eof) = (*offset, *eof);
+            let sec = state.config.security.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::transfer::receive_chunk(&dest_path, offset, &bytes, eof, sha.as_deref(), &sec)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("receive chunk failed: {e}"))??;
+            Ok(CommandResult::Ok)
+        }
+
+        // Status of a host↔host transfer this node initiated.
+        Command::TransferGet { id } => match state.transfers().get(id) {
+            Some(status) => Ok(CommandResult::Transfer { status }),
+            None => bail!("no such transfer: {id}"),
+        },
+
+        // SendFileTo is intercepted by the relay handler (it needs the
+        // connection's peer-send primitives); reaching here means it was issued
+        // on a path without an outbound connection (e.g. the local MCP tool).
+        Command::SendFileTo { .. } => {
+            bail!("send_file must be issued to a connected peer node")
         }
 
         // MapReduce (Phase 13): map_fn/reduce_fn are shell commands; the

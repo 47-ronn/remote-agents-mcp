@@ -249,6 +249,23 @@ pub enum Command {
         dest_path: String,
     },
 
+    /// Receive one slice of a host↔host transfer and write it to `dest_path` at
+    /// `offset` (the destination side of `SendFileTo`; rides the peer command
+    /// path, UDP-preferred). On `eof`, the whole file is verified against
+    /// `sha256`. Requires write mode + path allow-list on the receiver.
+    FileRecv {
+        transfer_id: String,
+        dest_path: String,
+        offset: u64,
+        /// Base64 of the raw bytes for this slice.
+        bytes: String,
+        eof: bool,
+        /// Lowercase-hex SHA-256 of the whole file, present only on the final
+        /// (`eof`) slice for verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+
     /// Get the status/progress of a host↔host transfer by id.
     TransferGet {
         id: String,
