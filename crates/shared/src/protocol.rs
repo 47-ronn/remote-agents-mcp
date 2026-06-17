@@ -669,6 +669,37 @@ mod tests {
     }
 
     #[test]
+    fn large_result_compresses_on_the_wire_and_roundtrips() {
+        let cipher = Cipher::for_transport("room-token", None);
+        // A big, highly compressible result — like a provider transcript or a
+        // file-transfer chunk of text.
+        let big = "compress me please ".repeat(2000); // ~38 KB
+        let result = CommandResult::Exec {
+            stdout: big.clone(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let envelope = result.encrypt(&cipher).unwrap();
+        // The base64 envelope is far smaller than the plaintext — proving the
+        // zstd layer engaged INSIDE the encrypted envelope (not just in the
+        // unit-tested helper). Encryption alone would keep it ~same size.
+        assert!(
+            envelope.len() < big.len() / 2,
+            "compressible result should shrink on the wire (envelope {} vs plaintext {})",
+            envelope.len(),
+            big.len()
+        );
+        // ...and it decrypts + decompresses back to the original.
+        match CommandResult::decrypt(&envelope, &cipher).unwrap() {
+            CommandResult::Exec { stdout, exit_code, .. } => {
+                assert_eq!(stdout, big);
+                assert_eq!(exit_code, 0);
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn envelope_wrong_key_fails() {
         let a = Cipher::for_transport("token-a", None);
         let b = Cipher::for_transport("token-b", None);
