@@ -117,6 +117,7 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 autonomous: state.autonomous().enabled(),
                 accepts_commands: state.config.accepts_commands,
                 connected_at: 0,
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 session_id: None,
                 update_available: crate::config::update_available(),
             };

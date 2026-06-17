@@ -97,7 +97,7 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
         accepts_commands: true,
         connected_at: 0,
         session_id: None,
-        update_available: None,
+        version: String::new(), update_available: None,
     }
 }
 
