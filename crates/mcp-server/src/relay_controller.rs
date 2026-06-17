@@ -771,7 +771,7 @@ async fn begin_send_file(
 
     let shared = shared.clone();
     let tid = transfer_id.clone();
-    let chunk = state.config.security.transfer_chunk_size.max(1);
+    let chunk = state.config.security.transfer_chunk_size;
     let punched = dest_session.is_some();
     tokio::spawn(async move {
         // Give a freshly-offered channel a moment to hole-punch before the first
@@ -779,10 +779,16 @@ async fn begin_send_file(
         if punched {
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
-        let result = stream_file(
-            &shared, &store, &src_path, &dest_id, &dest_path, &tid, &sec, chunk, size,
-        )
-        .await;
+        // Each chunk is pushed to the destination over this connection's peer
+        // dispatch (UDP-preferred, WS fallback).
+        let send = |cmd: Command| {
+            let shared = shared.clone();
+            let dest_id = dest_id.clone();
+            async move { send_peer_command(&shared, Target::Agent { id: dest_id }, cmd).await }
+        };
+        let result =
+            crate::transfer::stream_file(&store, &src_path, &dest_path, &tid, &sec, chunk, size, send)
+                .await;
         match result {
             Ok(()) => store.done(&tid),
             Err(e) => store.fail(&tid, e.to_string()),
@@ -790,60 +796,6 @@ async fn begin_send_file(
     });
 
     Ok(transfer_id)
-}
-
-/// Stream a local file to a peer as a sequence of `FileRecv` commands. Slice
-/// lengths are derived from the known size (so the base64'd chunk doesn't need
-/// to report its raw length); the whole-file SHA-256 rides the final slice.
-#[allow(clippy::too_many_arguments)]
-async fn stream_file(
-    shared: &HandlerShared,
-    store: &crate::transfer::TransferStore,
-    src_path: &str,
-    dest_id: &str,
-    dest_path: &str,
-    transfer_id: &str,
-    sec: &crate::config::SecurityConfig,
-    chunk: u64,
-    size: u64,
-) -> Result<()> {
-    // Hash the source once (off-runtime) for end-to-end verification.
-    let sha = {
-        let sp = src_path.to_string();
-        tokio::task::spawn_blocking(move || crate::transfer::sha256_file(&sp))
-            .await
-            .map_err(|e| anyhow::anyhow!("hash failed: {e}"))??
-    };
-
-    let mut offset = 0u64;
-    loop {
-        let want = chunk.min(size - offset);
-        let (data, _) = {
-            let (sp, sec2) = (src_path.to_string(), sec.clone());
-            tokio::task::spawn_blocking(move || crate::files::read_chunk(&sp, offset, want, &sec2))
-                .await
-                .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))??
-        };
-        let eof = offset + want >= size;
-        let cmd = Command::FileRecv {
-            transfer_id: transfer_id.to_string(),
-            dest_path: dest_path.to_string(),
-            offset,
-            bytes: data,
-            eof,
-            sha256: if eof { Some(sha.clone()) } else { None },
-        };
-        match send_peer_command(shared, Target::Agent { id: dest_id.to_string() }, cmd).await? {
-            CommandResult::Ok => {}
-            other => bail!("destination rejected chunk: {other:?}"),
-        }
-        offset += want;
-        store.progress(transfer_id, offset);
-        if eof {
-            break;
-        }
-    }
-    Ok(())
 }
 
 /// Shared per-connection state handed to the message handler.

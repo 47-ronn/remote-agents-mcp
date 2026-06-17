@@ -4,15 +4,25 @@ use crate::config::Config;
 use crate::executor;
 use crate::state::AgentState;
 use crate::udp_transport::{SignalMessage, UdpTransport};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
-use remote_agents_shared::{AgentInfo, ClientMessage, Command, ServerMessage, UdpFrame};
+use remote_agents_shared::{
+    AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, UdpFrame,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+
+/// Reply to a peer command we initiated (decrypted result, or an error string).
+type ConnReply = std::result::Result<CommandResult, String>;
+/// Outbound peer commands awaiting their reply, keyed by request_id. A `run`
+/// agent is normally a responder, but it also initiates commands when it is the
+/// SOURCE of a host↔host transfer (pushing `FileRecv` slices to the dest).
+type ConnPending = Arc<RwLock<HashMap<String, oneshot::Sender<ConnReply>>>>;
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
@@ -151,6 +161,9 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     // Create channels for communication
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientMessage>(32);
 
+    // Replies to commands THIS node initiates (host↔host transfer source).
+    let pending: ConnPending = Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn ping task
     let ping_tx = tx.clone();
     tokio::spawn(async move {
@@ -181,7 +194,7 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                         if matches!(ServerMessage::from_json(&text), Ok(ServerMessage::Command { .. })) {
                             commands_handled += 1;
                         }
-                        if let Err(e) = handle_server_message(&text, state, &tx, &udp_transport).await {
+                        if let Err(e) = handle_server_message(&text, state, &tx, &udp_transport, &pending).await {
                             error!("Error handling message: {}", e);
                         }
                     }
@@ -230,7 +243,7 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
             inbound = udp_inbound_rx.recv() => {
                 if let Some((peer_session, data)) = inbound {
                     commands_handled += 1;
-                    handle_udp_inbound(&peer_session, &data, state, &tx, &udp_transport).await;
+                    handle_udp_inbound(&peer_session, &data, state, &tx, &udp_transport, &pending).await;
                 }
             }
 
@@ -263,6 +276,7 @@ async fn handle_server_message(
     state: &AgentState,
     tx: &tokio::sync::mpsc::Sender<ClientMessage>,
     udp_transport: &Arc<UdpTransport>,
+    pending: &ConnPending,
 ) -> Result<()> {
     let msg: ServerMessage = ServerMessage::from_json(text)?;
 
@@ -291,24 +305,27 @@ async fn handle_server_message(
 
             debug!("Received command: {:?}", command);
 
-            // Execute and re-encrypt the result.
-            let response = match executor::execute(&command, state).await {
+            // SendFileTo is the SOURCE side of a host↔host transfer: it must
+            // initiate commands to the destination peer, so it's handled here
+            // (begin returns a transfer id immediately; streaming runs detached).
+            let exec_result: Result<CommandResult> = match command {
+                Command::SendFileTo { src_path, dest_id, dest_path } => {
+                    begin_send_file(state, tx, udp_transport, pending, src_path, dest_id, dest_path)
+                        .await
+                        .map(|id| CommandResult::TransferQueued { id })
+                }
+                other => executor::execute(&other, state).await,
+            };
+
+            // Re-encrypt the result (prefer the UDP channel back to the caller).
+            let response = match exec_result {
                 Ok(result) => match result.encrypt(&cipher) {
                     Ok(envelope) => {
-                        // Try to send result via UDP if channel is available
-                        let _sent_via_udp = if udp_transport.has_udp_channel(&from_session).await {
-                            match udp_transport.send_via_udp(&from_session, envelope.as_bytes()).await {
-                                Ok(true) => {
-                                    debug!("Sent result via UDP to {}", from_session);
-                                    true
-                                }
-                                Ok(false) | Err(_) => false,
-                            }
-                        } else {
-                            false
-                        };
-
-                        // Always send via WS as fallback/confirmation
+                        if udp_transport.has_udp_channel(&from_session).await {
+                            let _ = udp_transport
+                                .send_via_udp(&from_session, envelope.as_bytes())
+                                .await;
+                        }
                         ClientMessage::CommandResult {
                             request_id,
                             result: envelope,
@@ -326,6 +343,21 @@ async fn handle_server_message(
             };
 
             tx.send(response).await?;
+        }
+
+        // Replies to commands WE initiated (e.g. FileRecv slices when this node
+        // is a transfer source) — route to the waiting sender.
+        ServerMessage::CommandResult { request_id, result, .. } => {
+            if let Some(otx) = pending.write().await.remove(&request_id) {
+                let decoded = CommandResult::decrypt(&result, &state.cipher())
+                    .map_err(|e| e.to_string());
+                let _ = otx.send(decoded);
+            }
+        }
+        ServerMessage::CommandError { request_id, error, .. } => {
+            if let Some(otx) = pending.write().await.remove(&request_id) {
+                let _ = otx.send(Err(error));
+            }
         }
 
         // UDP Signaling messages
@@ -402,6 +434,7 @@ async fn handle_udp_inbound(
     state: &AgentState,
     tx: &tokio::sync::mpsc::Sender<ClientMessage>,
     _udp_transport: &Arc<UdpTransport>,
+    pending: &ConnPending,
 ) {
     let frame = match UdpFrame::from_bytes(data) {
         Some(f) => f,
@@ -411,33 +444,167 @@ async fn handle_udp_inbound(
         }
     };
 
-    let UdpFrame::Command { request_id, payload, .. } = frame else {
-        debug!("Ignoring non-command UDP frame from {}", peer_session);
-        return;
-    };
-
     let cipher = state.cipher();
-    let reply = match Command::decrypt(&payload, &cipher) {
-        Ok(command) => match executor::execute(&command, state).await {
-            Ok(result) => match result.encrypt(&cipher) {
-                Ok(envelope) => ClientMessage::CommandResult { request_id, result: envelope },
-                Err(e) => ClientMessage::CommandError {
-                    request_id,
-                    error: format!("result encryption failed: {e}"),
+    match frame {
+        // Inbound command (its bulk data travelled over UDP). Reply over WS so
+        // the initiator's pending map resolves it by request_id.
+        UdpFrame::Command { request_id, payload, .. } => {
+            let reply = match Command::decrypt(&payload, &cipher) {
+                Ok(command) => match executor::execute(&command, state).await {
+                    Ok(result) => match result.encrypt(&cipher) {
+                        Ok(envelope) => ClientMessage::CommandResult { request_id, result: envelope },
+                        Err(e) => ClientMessage::CommandError {
+                            request_id,
+                            error: format!("result encryption failed: {e}"),
+                        },
+                    },
+                    Err(e) => ClientMessage::CommandError { request_id, error: e.to_string() },
                 },
-            },
-            Err(e) => ClientMessage::CommandError { request_id, error: e.to_string() },
-        },
-        Err(e) => {
-            warn!("Failed to decrypt UDP command {}: {}", request_id, e);
-            ClientMessage::CommandError {
-                request_id,
-                error: "payload decryption failed (key mismatch?)".to_string(),
+                Err(e) => {
+                    warn!("Failed to decrypt UDP command {}: {}", request_id, e);
+                    ClientMessage::CommandError {
+                        request_id,
+                        error: "payload decryption failed (key mismatch?)".to_string(),
+                    }
+                }
+            };
+            let _ = tx.send(reply).await;
+        }
+        // Replies to commands WE initiated, arriving over the UDP channel.
+        UdpFrame::Result { request_id, result } => {
+            if let Some(otx) = pending.write().await.remove(&request_id) {
+                let _ = otx.send(CommandResult::decrypt(&result, &cipher).map_err(|e| e.to_string()));
             }
         }
+        UdpFrame::Error { request_id, error } => {
+            if let Some(otx) = pending.write().await.remove(&request_id) {
+                let _ = otx.send(Err(error));
+            }
+        }
+    }
+}
+
+/// Initiate a single-target command from the `run`-agent loop and await its
+/// reply (UDP-preferred with a WS fallback, correlated by request_id). Used by
+/// the host↔host transfer source to push each `FileRecv` slice.
+async fn send_peer_command(
+    cipher: &Cipher,
+    tx: &mpsc::Sender<ClientMessage>,
+    udp: &Arc<UdpTransport>,
+    pending: &ConnPending,
+    dest_id: &str,
+    dest_session: Option<&str>,
+    cmd: Command,
+) -> Result<CommandResult> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let envelope = cmd
+        .encrypt(cipher)
+        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
+
+    let (otx, orx) = oneshot::channel::<ConnReply>();
+    pending.write().await.insert(request_id.clone(), otx);
+
+    let mut via_udp = false;
+    if let Some(sess) = dest_session {
+        if udp.has_udp_channel(sess).await {
+            let frame = UdpFrame::Command {
+                request_id: request_id.clone(),
+                from_session: String::new(),
+                payload: envelope.clone(),
+            };
+            if let Ok(true) = udp.send_via_udp(sess, &frame.to_bytes()).await {
+                via_udp = true;
+            }
+        }
+    }
+    if !via_udp {
+        if let Err(e) = tx
+            .send(ClientMessage::Command {
+                request_id: request_id.clone(),
+                target: Target::Agent { id: dest_id.to_string() },
+                payload: envelope,
+            })
+            .await
+        {
+            pending.write().await.remove(&request_id);
+            return Err(anyhow::anyhow!("send command: {e}"));
+        }
+    }
+
+    match timeout(Duration::from_secs(60), orx).await {
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(e))) => bail!("{e}"),
+        _ => {
+            pending.write().await.remove(&request_id);
+            bail!("transfer chunk timed out")
+        }
+    }
+}
+
+/// Start a host↔host transfer from the `run`-agent loop: register progress, open
+/// a UDP channel best-effort, and spawn the streaming task. Returns the transfer
+/// id immediately.
+async fn begin_send_file(
+    state: &AgentState,
+    tx: &mpsc::Sender<ClientMessage>,
+    udp: &Arc<UdpTransport>,
+    pending: &ConnPending,
+    src_path: String,
+    dest_id: String,
+    dest_path: String,
+) -> Result<String> {
+    let sec = state.config.security.clone();
+    let size = {
+        let (sp, sec2) = (src_path.clone(), sec.clone());
+        tokio::task::spawn_blocking(move || crate::files::stat(&sp, &sec2))
+            .await
+            .map_err(|e| anyhow::anyhow!("stat failed: {e}"))??
+            .size
     };
 
-    let _ = tx.send(reply).await;
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let store = state.transfers();
+    store.start(&transfer_id, size);
+
+    let dest_session = state
+        .peers()
+        .await
+        .into_iter()
+        .find(|a| a.id == dest_id)
+        .and_then(|a| a.session_id);
+    if let Some(sess) = &dest_session {
+        if !udp.has_udp_channel(sess).await {
+            let _ = udp.offer_channel(sess.clone()).await;
+        }
+    }
+
+    let cipher = state.cipher();
+    let (tx2, udp2, pending2) = (tx.clone(), udp.clone(), pending.clone());
+    let chunk = sec.transfer_chunk_size;
+    let tid = transfer_id.clone();
+    let punched = dest_session.is_some();
+    tokio::spawn(async move {
+        if punched {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        let send = |cmd: Command| {
+            let (cipher, tx3, udp3, pending3) =
+                (cipher.clone(), tx2.clone(), udp2.clone(), pending2.clone());
+            let (did, dsess) = (dest_id.clone(), dest_session.clone());
+            async move {
+                send_peer_command(&cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), cmd).await
+            }
+        };
+        let result =
+            crate::transfer::stream_file(&store, &src_path, &dest_path, &tid, &sec, chunk, size, send)
+                .await;
+        match result {
+            Ok(()) => store.done(&tid),
+            Err(e) => store.fail(&tid, e.to_string()),
+        }
+    });
+
+    Ok(transfer_id)
 }
 
 pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> AgentInfo {
@@ -468,6 +635,11 @@ pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::Agen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty outbound-pending map for handler tests that don't initiate.
+    fn empty_pending() -> ConnPending {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
     use remote_agents_shared::{AgentMode, Cipher, CommandResult};
 
     // --- jitter -------------------------------------------------------------
@@ -544,7 +716,7 @@ mod tests {
         };
         let text = serde_json::to_string(&msg).unwrap();
 
-        handle_server_message(&text, &state, &tx, &udp)
+        handle_server_message(&text, &state, &tx, &udp, &empty_pending())
             .await
             .unwrap();
 
@@ -576,7 +748,7 @@ mod tests {
         };
         let text = serde_json::to_string(&msg).unwrap();
 
-        handle_server_message(&text, &state, &tx, &udp)
+        handle_server_message(&text, &state, &tx, &udp, &empty_pending())
             .await
             .unwrap();
 
@@ -621,7 +793,7 @@ mod tests {
         let deliver = |state: &AgentState, msg: &ServerMessage| {
             let text = serde_json::to_string(msg).unwrap();
             let (state, udp, tx) = (state.clone(), udp.clone(), tx.clone());
-            async move { handle_server_message(&text, &state, &tx, &udp).await.unwrap() }
+            async move { handle_server_message(&text, &state, &tx, &udp, &empty_pending()).await.unwrap() }
         };
 
         // Initial full list with one peer (carrying platform metadata).
@@ -661,7 +833,7 @@ mod tests {
             payload,
         };
 
-        handle_udp_inbound("mcp-1", &frame.to_bytes(), &state, &tx, &udp).await;
+        handle_udp_inbound("mcp-1", &frame.to_bytes(), &state, &tx, &udp, &empty_pending()).await;
 
         match rx.try_recv().expect("a WS reply should be queued") {
             ClientMessage::CommandResult { request_id, result } => {
@@ -689,7 +861,7 @@ mod tests {
         let endpoint = remote_agents_shared::Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4500);
         let msg = ServerMessage::YourEndpoint { endpoint };
         let text = serde_json::to_string(&msg).unwrap();
-        handle_server_message(&text, &state, &tx, &udp).await.unwrap();
+        handle_server_message(&text, &state, &tx, &udp, &empty_pending()).await.unwrap();
 
         assert_eq!(udp.public_endpoint().await, Some(endpoint));
     }
@@ -704,7 +876,7 @@ mod tests {
         let (in_tx, _in_rx) = mpsc::channel(8);
         let udp = Arc::new(UdpTransport::new(state.cipher(), "self".into(), sig_tx, in_tx));
 
-        handle_udp_inbound("m", b"\x00\x01not-a-frame", &state, &tx, &udp).await;
+        handle_udp_inbound("m", b"\x00\x01not-a-frame", &state, &tx, &udp, &empty_pending()).await;
 
         assert!(rx.try_recv().is_err(), "malformed frame must not produce a reply");
     }
@@ -720,7 +892,7 @@ mod tests {
         let udp = Arc::new(UdpTransport::new(state.cipher(), "self".into(), sig_tx, in_tx));
 
         let frame = UdpFrame::Result { request_id: "r".into(), result: "x".into() };
-        handle_udp_inbound("m", &frame.to_bytes(), &state, &tx, &udp).await;
+        handle_udp_inbound("m", &frame.to_bytes(), &state, &tx, &udp, &empty_pending()).await;
 
         assert!(rx.try_recv().is_err(), "non-command frame must not produce a reply");
     }
@@ -738,7 +910,7 @@ mod tests {
         let payload = Command::GetInfo.encrypt(&wrong).unwrap();
         let frame = UdpFrame::Command { request_id: "u2".into(), from_session: "m".into(), payload };
 
-        handle_udp_inbound("m", &frame.to_bytes(), &state, &tx, &udp).await;
+        handle_udp_inbound("m", &frame.to_bytes(), &state, &tx, &udp, &empty_pending()).await;
 
         match rx.try_recv().expect("an error reply should be queued") {
             ClientMessage::CommandError { request_id, error } => {
