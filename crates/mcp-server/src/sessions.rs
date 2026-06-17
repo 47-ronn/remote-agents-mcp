@@ -40,6 +40,16 @@ pub fn list_sessions() -> Vec<SessionMeta> {
     all
 }
 
+/// Drop the cached session list so the next `list_sessions` re-scans. Called
+/// when an autonomous task finishes: a chat turn (`claude -p` / `opencode run`)
+/// just created or extended a provider session, and the web wants to adopt it
+/// immediately (to resume it for context), not after the 30s TTL.
+pub fn invalidate_cache() {
+    if let Ok(mut g) = CACHE.lock() {
+        *g = None;
+    }
+}
+
 /// Full transcript of one session.
 pub fn get_transcript(provider: &str, id: &str) -> Result<Vec<SessionMessage>> {
     match provider {
