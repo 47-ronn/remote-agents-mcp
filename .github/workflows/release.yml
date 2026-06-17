@@ -42,6 +42,13 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Set crate version from tag
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # Stamp the workspace version so the binary reports the release version
+          # (remote-agent --version / AgentInfo.version), not the in-repo 0.1.0.
+          sed -i -E "0,/^version = \".*\"/s//version = \"$ver\"/" Cargo.toml
+
       - name: Build binaries
         run: cargo build --release --target ${{ matrix.target }} -p remote-agent -p remote-agents-relay
 
@@ -113,6 +120,8 @@ jobs:
       - name: Set version from tag
         working-directory: npm
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Publish the repo README to npm (single source of truth)
+        run: cp README.md npm/README.md
       - name: Publish to npm
         working-directory: npm
         env:
