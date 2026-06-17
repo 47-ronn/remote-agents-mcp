@@ -334,35 +334,6 @@ pub enum UdpFrame {
     Result { request_id: String, result: String },
     /// A command error (decrypt/exec failure) for `request_id`.
     Error { request_id: String, error: String },
-
-    // === Host↔host file transfer (carried over the reliable UDP channel; the
-    // channel already fragments/ACKs/reassembles, so each frame is delivered
-    // whole). `bytes` is base64 of the raw file slice. ===
-    /// Start of a file transfer: announce name/size before the data frames.
-    FileStart {
-        transfer_id: String,
-        /// Suggested file name (the destination decides the final path).
-        name: String,
-        size: u64,
-    },
-    /// One slice of file data at `offset`. `bytes` is base64 of raw bytes.
-    FileData {
-        transfer_id: String,
-        offset: u64,
-        bytes: String,
-    },
-    /// End of transfer with a lowercase hex SHA-256 of the whole file.
-    FileEnd {
-        transfer_id: String,
-        sha256: String,
-    },
-    /// Receiver → sender acknowledgement once the file is written & verified.
-    FileAck {
-        transfer_id: String,
-        ok: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
 }
 
 impl UdpFrame {

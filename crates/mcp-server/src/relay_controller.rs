@@ -645,7 +645,209 @@ async fn collect_replies(
     (successes, errors)
 }
 
+/// Wrap a command result into an encrypted `CommandResult` reply (or an error
+/// reply if encryption fails). Shared by the incoming-command handler.
+fn encrypt_result(cipher: &Cipher, request_id: String, result: CommandResult) -> ClientMessage {
+    match result.encrypt(cipher) {
+        Ok(envelope) => ClientMessage::CommandResult {
+            request_id,
+            result: envelope,
+        },
+        Err(e) => ClientMessage::CommandError {
+            request_id,
+            error: format!("result encryption failed: {e}"),
+        },
+    }
+}
+
+/// Send a single-target command to a peer from within a connection handler and
+/// await its reply. Mirrors `ConnectionPool::dispatch` (UDP-preferred with a WS
+/// fallback, correlated by request_id) but works off `HandlerShared` — used by
+/// the host↔host transfer sender to push each file slice to the destination.
+async fn send_peer_command(
+    shared: &HandlerShared,
+    target: Target,
+    payload: Command,
+) -> Result<CommandResult> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let envelope = payload
+        .encrypt(&shared.cipher)
+        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
+
+    let udp_session = {
+        let agents = shared.agents.read().await;
+        udp_session_for(&agents, &target)
+    };
+
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
+    shared
+        .pending
+        .write()
+        .await
+        .insert(request_id.clone(), reply_tx);
+
+    let mut sent_via_udp = false;
+    if let Some(session) = &udp_session {
+        if shared.udp_transport.has_udp_channel(session).await {
+            let frame = UdpFrame::Command {
+                request_id: request_id.clone(),
+                from_session: String::new(),
+                payload: envelope.clone(),
+            };
+            if let Ok(true) = shared
+                .udp_transport
+                .send_via_udp(session, &frame.to_bytes())
+                .await
+            {
+                sent_via_udp = true;
+            }
+        }
+    }
+    if !sent_via_udp {
+        if let Err(e) = shared
+            .tx
+            .send(ClientMessage::Command {
+                request_id: request_id.clone(),
+                target,
+                payload: envelope,
+            })
+            .await
+        {
+            shared.pending.write().await.remove(&request_id);
+            return Err(e.into());
+        }
+    }
+
+    let (mut ok, mut err) = collect_replies(reply_rx, 1, true).await;
+    shared.pending.write().await.remove(&request_id);
+    if let Some((_, result)) = ok.drain(..).next() {
+        return Ok(result);
+    }
+    if let Some((_, e)) = err.drain(..).next() {
+        bail!("{e}");
+    }
+    bail!("transfer chunk timed out")
+}
+
+/// Start a host↔host file transfer: register progress, best-effort open a direct
+/// UDP channel to the destination, and spawn the streaming task. Returns the
+/// transfer id immediately (progress is polled with `TransferGet`).
+async fn begin_send_file(
+    shared: &HandlerShared,
+    state: &Arc<crate::state::AgentState>,
+    src_path: String,
+    dest_id: String,
+    dest_path: String,
+) -> Result<String> {
+    let sec = state.config.security.clone();
+
+    // Size up-front (instant) — also validates the source is readable & allowed.
+    let size = {
+        let (sp, sec2) = (src_path.clone(), sec.clone());
+        tokio::task::spawn_blocking(move || crate::files::stat(&sp, &sec2))
+            .await
+            .map_err(|e| anyhow::anyhow!("stat failed: {e}"))??
+            .size
+    };
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let store = state.transfers();
+    store.start(&transfer_id, size);
+
+    // Best-effort: open a direct UDP channel before streaming so chunks take the
+    // fast path. Failure is fine — send_peer_command falls back to the relay.
+    let dest_session = {
+        let agents = shared.agents.read().await;
+        agents
+            .iter()
+            .find(|a| a.id == dest_id)
+            .and_then(|a| a.session_id.clone())
+    };
+    if let Some(session) = &dest_session {
+        if !shared.udp_transport.has_udp_channel(session).await {
+            let _ = shared.udp_transport.offer_channel(session.clone()).await;
+        }
+    }
+
+    let shared = shared.clone();
+    let tid = transfer_id.clone();
+    let chunk = state.config.security.transfer_chunk_size.max(1);
+    let punched = dest_session.is_some();
+    tokio::spawn(async move {
+        // Give a freshly-offered channel a moment to hole-punch before the first
+        // chunk decides UDP-vs-WS.
+        if punched {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        let result = stream_file(
+            &shared, &store, &src_path, &dest_id, &dest_path, &tid, &sec, chunk, size,
+        )
+        .await;
+        match result {
+            Ok(()) => store.done(&tid),
+            Err(e) => store.fail(&tid, e.to_string()),
+        }
+    });
+
+    Ok(transfer_id)
+}
+
+/// Stream a local file to a peer as a sequence of `FileRecv` commands. Slice
+/// lengths are derived from the known size (so the base64'd chunk doesn't need
+/// to report its raw length); the whole-file SHA-256 rides the final slice.
+#[allow(clippy::too_many_arguments)]
+async fn stream_file(
+    shared: &HandlerShared,
+    store: &crate::transfer::TransferStore,
+    src_path: &str,
+    dest_id: &str,
+    dest_path: &str,
+    transfer_id: &str,
+    sec: &crate::config::SecurityConfig,
+    chunk: u64,
+    size: u64,
+) -> Result<()> {
+    // Hash the source once (off-runtime) for end-to-end verification.
+    let sha = {
+        let sp = src_path.to_string();
+        tokio::task::spawn_blocking(move || crate::transfer::sha256_file(&sp))
+            .await
+            .map_err(|e| anyhow::anyhow!("hash failed: {e}"))??
+    };
+
+    let mut offset = 0u64;
+    loop {
+        let want = chunk.min(size - offset);
+        let (data, _) = {
+            let (sp, sec2) = (src_path.to_string(), sec.clone());
+            tokio::task::spawn_blocking(move || crate::files::read_chunk(&sp, offset, want, &sec2))
+                .await
+                .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))??
+        };
+        let eof = offset + want >= size;
+        let cmd = Command::FileRecv {
+            transfer_id: transfer_id.to_string(),
+            dest_path: dest_path.to_string(),
+            offset,
+            bytes: data,
+            eof,
+            sha256: if eof { Some(sha.clone()) } else { None },
+        };
+        match send_peer_command(shared, Target::Agent { id: dest_id.to_string() }, cmd).await? {
+            CommandResult::Ok => {}
+            other => bail!("destination rejected chunk: {other:?}"),
+        }
+        offset += want;
+        store.progress(transfer_id, offset);
+        if eof {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Shared per-connection state handed to the message handler.
+#[derive(Clone)]
 struct HandlerShared {
     agents: Arc<RwLock<Vec<AgentInfo>>>,
     pending: PendingMap,
@@ -772,17 +974,22 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
                 return Ok(()); // no executor: we don't run others' commands
             };
             let reply = match Command::decrypt(&payload, &shared.cipher) {
-                Ok(cmd) => match crate::executor::execute(&cmd, state).await {
-                    Ok(result) => match result.encrypt(&shared.cipher) {
-                        Ok(envelope) => ClientMessage::CommandResult {
-                            request_id,
-                            result: envelope,
-                        },
+                // SendFileTo needs the connection's peer-send primitives, so it's
+                // handled here (not in the generic executor): start a background
+                // transfer and reply immediately with its id.
+                Ok(Command::SendFileTo { src_path, dest_path, dest_id }) => {
+                    match begin_send_file(shared, state, src_path, dest_id, dest_path).await {
+                        Ok(id) => {
+                            encrypt_result(&shared.cipher, request_id, CommandResult::TransferQueued { id })
+                        }
                         Err(e) => ClientMessage::CommandError {
                             request_id,
-                            error: format!("result encryption failed: {e}"),
+                            error: e.to_string(),
                         },
-                    },
+                    }
+                }
+                Ok(cmd) => match crate::executor::execute(&cmd, state).await {
+                    Ok(result) => encrypt_result(&shared.cipher, request_id, result),
                     Err(e) => ClientMessage::CommandError {
                         request_id,
                         error: e.to_string(),

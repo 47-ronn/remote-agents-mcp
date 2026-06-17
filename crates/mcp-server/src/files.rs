@@ -52,15 +52,15 @@ pub fn stat(path: &str, sec: &SecurityConfig) -> Result<FileMeta> {
     meta_for(path, sec)
 }
 
-/// Read a binary-safe slice `[offset, offset+len)` of a file and base64-encode
-/// it. Returns `(base64, eof)`. The whole-file size is bounded by
-/// `max_transfer_size` (0 = unlimited).
-pub fn read_chunk(
+/// Read a binary-safe slice `[offset, offset+len)` of a file as raw bytes.
+/// Returns `(bytes, eof)`. The whole-file size is bounded by `max_transfer_size`
+/// (0 = unlimited). Backs [`read_chunk`], which base64's the result.
+fn read_chunk_raw(
     path: &str,
     offset: u64,
     len: u64,
     sec: &SecurityConfig,
-) -> Result<(String, bool)> {
+) -> Result<(Vec<u8>, bool)> {
     safety::check_path_allowed(path, sec)?;
     let md = std::fs::metadata(path).with_context(|| format!("stat {path}"))?;
     let size = md.len();
@@ -83,6 +83,17 @@ pub fn read_chunk(
     f.read_exact(&mut buf)?;
 
     let eof = offset + to_read as u64 >= size;
+    Ok((buf, eof))
+}
+
+/// Like [`read_chunk_raw`] but base64-encodes the slice for the JSON/WS path.
+pub fn read_chunk(
+    path: &str,
+    offset: u64,
+    len: u64,
+    sec: &SecurityConfig,
+) -> Result<(String, bool)> {
+    let (buf, eof) = read_chunk_raw(path, offset, len, sec)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok((data, eof))
 }

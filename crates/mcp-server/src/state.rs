@@ -8,6 +8,7 @@
 use crate::autonomous::AutonomousStore;
 use crate::config::Config;
 use crate::scheduler::Scheduler;
+use crate::transfer::TransferStore;
 use remote_agents_shared::{AgentEvent, AgentInfo, AgentMode, Cipher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ pub struct AgentState {
     /// it" — their OS/platform/tags — and can tailor tasks accordingly).
     /// Maintained from the relay's AgentList/AgentJoined/AgentLeft messages.
     peers: Arc<RwLock<Vec<AgentInfo>>>,
+    /// Progress registry for host↔host transfers this node initiated.
+    transfers: Arc<TransferStore>,
 }
 
 impl AgentState {
@@ -45,7 +48,13 @@ impl AgentState {
             autonomous,
             events_rx: Arc::new(Mutex::new(events_rx)),
             peers: Arc::new(RwLock::new(Vec::new())),
+            transfers: Arc::new(TransferStore::default()),
         }
+    }
+
+    /// The shared host↔host transfer registry.
+    pub fn transfers(&self) -> Arc<TransferStore> {
+        self.transfers.clone()
     }
 
     /// Snapshot of the peer agents currently known to share this room.
