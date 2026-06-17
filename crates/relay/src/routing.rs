@@ -259,4 +259,67 @@ mod tests {
         assert!(find_session_tx(&r, "a").is_none(), "agent id is not a session id");
         assert!(find_session_tx(&r, "nope").is_none());
     }
+
+    /// Build an agent session for `id` keyed by `session`, with explicit
+    /// capabilities and a controllable tx (its rx is returned for assertions).
+    fn sess(
+        id: &str,
+        session: &str,
+        autonomous: bool,
+        accepts: bool,
+    ) -> (AgentSession, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut s = agent(id, &[]);
+        s.info.session_id = Some(session.to_string());
+        s.info.autonomous = autonomous;
+        s.info.accepts_commands = accepts;
+        s.tx = tx;
+        (s, rx)
+    }
+
+    #[test]
+    fn dedup_merges_capabilities_and_routes_agent_to_most_capable() {
+        // Two live sockets for the SAME machine id "dup": one plain, one that
+        // both executes and is autonomous (many terminals on one box, iter89).
+        let r = Room::default();
+        let (plain, _rx_plain) = sess("dup", "s1", false, true);
+        let (auto, mut rx_auto) = sess("dup", "s2", true, true);
+        r.agents.insert("s1".into(), plain);
+        r.agents.insert("s2".into(), auto);
+
+        // Collapsed to ONE logical host, capability flags merged (true if any).
+        let merged = dedup_agents(&r);
+        assert_eq!(merged.len(), 1, "two sockets of one machine = one host");
+        assert_eq!(merged[0].id, "dup");
+        assert!(merged[0].autonomous, "autonomous if any socket is");
+        assert!(merged[0].accepts_commands);
+
+        // An Agent-targeted command goes to exactly one socket — the autonomous
+        // one — not fanned out to both (the bug that surfaced "not enabled").
+        let t = resolve_targets(&r, &Target::Agent { id: "dup".into() });
+        assert_eq!(t.len(), 1, "single most-capable socket per id");
+        t[0].1.try_send("X".to_string()).unwrap();
+        assert_eq!(
+            rx_auto.try_recv().unwrap(),
+            "X",
+            "command must reach the autonomous socket"
+        );
+
+        // Broadcast (All) also collapses the machine to one delivery.
+        assert_eq!(resolve_targets(&r, &Target::All).len(), 1, "one delivery per machine");
+    }
+
+    #[test]
+    fn dedup_target_all_skips_machine_with_all_send_only_sockets() {
+        // A machine whose every socket is send-only (--no-agent) is skipped by
+        // broadcasts, even with several connections.
+        let r = Room::default();
+        let (a, _ra) = sess("x", "s1", false, false);
+        let (b, _rb) = sess("x", "s2", false, false);
+        r.agents.insert("s1".into(), a);
+        r.agents.insert("s2".into(), b);
+        assert_eq!(resolve_targets(&r, &Target::All).len(), 0);
+        // ...but an explicit Agent target still reaches it (self-rejects).
+        assert_eq!(resolve_targets(&r, &Target::Agent { id: "x".into() }).len(), 1);
+    }
 }
