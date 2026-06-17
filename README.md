@@ -230,7 +230,8 @@ the registered entry.
 | `schedule_add` / `schedule_remove` / `schedule_list` | Cron-style tasks on a host |
 | `task_dispatch` / `task_get` / `task_list` / `task_wait` | Autonomous AI tasks run with the host's own credentials |
 | `list_agents` | List agents connected to the relay room |
-| `fleet_exec` / `fleet_read` / `fleet_write` / `fleet_git` | Run an operation across the fleet — `target = all \| tag1,tag2 \| os:<family>` |
+| `fleet_exec` / `fleet_read` / `fleet_write` / `fleet_git` / `fleet_search` | Run an operation across the fleet — `target = all \| tag1,tag2 \| os:<family>` |
+| `file_search` / `file_stat` / `send_file` / `transfer_get` | Find files on a host, and move a file host→host (UDP, SHA-256 verified) |
 | `mapreduce` | Distributed map/reduce over the fleet (shell map/reduce functions) |
 
 Each agent advertises platform metadata (OS family, distro, kernel, shell) and
