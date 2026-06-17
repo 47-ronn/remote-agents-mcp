@@ -3,6 +3,7 @@
 //! This crate contains the WebSocket message protocol and common types
 //! used by both the agent and MCP server.
 
+pub mod compress;
 pub mod crypto;
 mod protocol;
 mod types;

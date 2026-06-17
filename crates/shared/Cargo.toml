@@ -18,6 +18,7 @@ base64 = "0.22"
 
 # UDP P2P transport (optional feature)
 tokio = { workspace = true, optional = true }
+ruzstd = "0.8.3"
 
 [features]
 default = []

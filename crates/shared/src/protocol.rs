@@ -18,6 +18,8 @@ pub enum EnvelopeError {
     Crypto(#[from] CryptoError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("decompression failed: {0}")]
+    Decompress(#[from] std::io::Error),
 }
 
 // ============================================================================
@@ -552,30 +554,34 @@ pub enum CommandResult {
 // ============================================================================
 
 impl Command {
-    /// Serialize and encrypt this command into a base64 envelope string.
+    /// Serialize, transparently compress (large payloads), and encrypt this
+    /// command into a base64 envelope string.
     pub fn encrypt(&self, cipher: &Cipher) -> Result<String, EnvelopeError> {
-        let json = serde_json::to_string(self)?;
-        Ok(cipher.encrypt_str(&json)?)
+        let json = serde_json::to_vec(self)?;
+        Ok(cipher.encrypt(&crate::compress::maybe_compress(&json))?)
     }
 
-    /// Decrypt and deserialize a command from a base64 envelope string.
+    /// Decrypt, decompress if needed, and deserialize a command.
     pub fn decrypt(envelope: &str, cipher: &Cipher) -> Result<Self, EnvelopeError> {
-        let json = cipher.decrypt_str(envelope)?;
-        Ok(serde_json::from_str(&json)?)
+        let raw = cipher.decrypt(envelope)?;
+        let json = crate::compress::maybe_decompress(&raw)?;
+        Ok(serde_json::from_slice(&json)?)
     }
 }
 
 impl CommandResult {
-    /// Serialize and encrypt this result into a base64 envelope string.
+    /// Serialize, transparently compress (large payloads), and encrypt this
+    /// result into a base64 envelope string.
     pub fn encrypt(&self, cipher: &Cipher) -> Result<String, EnvelopeError> {
-        let json = serde_json::to_string(self)?;
-        Ok(cipher.encrypt_str(&json)?)
+        let json = serde_json::to_vec(self)?;
+        Ok(cipher.encrypt(&crate::compress::maybe_compress(&json))?)
     }
 
-    /// Decrypt and deserialize a result from a base64 envelope string.
+    /// Decrypt, decompress if needed, and deserialize a result.
     pub fn decrypt(envelope: &str, cipher: &Cipher) -> Result<Self, EnvelopeError> {
-        let json = cipher.decrypt_str(envelope)?;
-        Ok(serde_json::from_str(&json)?)
+        let raw = cipher.decrypt(envelope)?;
+        let json = crate::compress::maybe_decompress(&raw)?;
+        Ok(serde_json::from_slice(&json)?)
     }
 }
 
