@@ -207,6 +207,29 @@ impl McpServer {
         .await
     }
 
+    /// Search files across a fleet (single agent, all, or tagged) — "find this
+    /// file on any of my machines". Each host returns its own hits.
+    pub async fn fleet_search(
+        &self,
+        room: &str,
+        target: remote_agents_shared::Target,
+        query: &str,
+        kind: remote_agents_shared::SearchKind,
+        roots: Vec<String>,
+    ) -> Result<Vec<AgentOutcome>> {
+        let pool = self.connections.read().await;
+        pool.send_command_fleet(
+            room,
+            target,
+            remote_agents_shared::Command::FileSearch {
+                roots,
+                query: query.to_string(),
+                kind,
+            },
+        )
+        .await
+    }
+
     /// Write a file across a fleet (single agent, all, or tagged).
     pub async fn fleet_write(
         &self,

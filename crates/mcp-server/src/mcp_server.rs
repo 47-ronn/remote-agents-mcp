@@ -414,6 +414,17 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
                 vec!["target", "path"],
             ),
             make_tool(
+                "fleet_search",
+                "Find a file across the fleet at once — 'is this on any of my machines?'. Searches all agents, tags, or 'os:<family>'; each host returns its own hits.",
+                json!({
+                    "target": {"type": "string", "description": "Target: 'all', comma-separated tags, or 'os:<family>'"},
+                    "query": {"type": "string", "description": "Search query (substring for name, pattern for content)"},
+                    "kind": {"type": "string", "description": "Search mode", "enum": ["name", "content", "image"], "default": "name"},
+                    "roots": {"type": "array", "items": {"type": "string"}, "description": "Directories to search on each host (empty = host defaults)"}
+                }),
+                vec!["target", "query"],
+            ),
+            make_tool(
                 "fleet_write",
                 "Write a file to multiple agents at once (all, tags, or 'os:<family>'). Backup is created on hosts in Edit mode.",
                 json!({
@@ -533,6 +544,7 @@ impl ServerHandler for McpHandler {
             "fleet_update_check" => return self.handle_fleet_update_check().await,
             "fleet_exec" => return self.handle_fleet_exec(args).await,
             "fleet_read" => return self.handle_fleet_read(args).await,
+            "fleet_search" => return self.handle_fleet_search(args).await,
             "fleet_write" => return self.handle_fleet_write(args).await,
             "fleet_git" => return self.handle_fleet_git(args).await,
             "mapreduce" => return self.handle_mapreduce(args).await,
@@ -790,6 +802,39 @@ impl McpHandler {
             .ok_or_else(|| parse_error("fleet_read", "missing required field 'path'"))?;
 
         let results = relay.fleet_read(room, target, path).await.map_err(exec_error)?;
+        Ok(text_result(format_outcomes(results)))
+    }
+
+    /// Handle fleet_search tool — find a file across the fleet.
+    async fn handle_fleet_search(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, CallToolError> {
+        let (relay, room) = self.relay_room()?;
+        let target = parse_target(
+            args.get("target")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| parse_error("fleet_search", "missing required field 'target'"))?,
+        );
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| parse_error("fleet_search", "missing required field 'query'"))?;
+        let kind = match args.get("kind").and_then(|v| v.as_str()) {
+            Some("content") => SearchKind::Content,
+            Some("image") => SearchKind::Image,
+            _ => SearchKind::Name,
+        };
+        let roots = args
+            .get("roots")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let results = relay
+            .fleet_search(room, target, query, kind, roots)
+            .await
+            .map_err(exec_error)?;
         Ok(text_result(format_outcomes(results)))
     }
 
@@ -1364,13 +1409,14 @@ mod tests {
             "fleet_exec",
             "mapreduce",
             "fleet_read",
+            "fleet_search",
             "fleet_write",
             "fleet_git",
         ] {
             assert!(relay.contains(&t.to_string()), "missing relay tool {t}");
         }
         // Enabling the relay only adds tools, never removes them.
-        assert_eq!(relay.len(), local.len() + 7);
+        assert_eq!(relay.len(), local.len() + 8);
     }
 
     // --- format_result ------------------------------------------------------
