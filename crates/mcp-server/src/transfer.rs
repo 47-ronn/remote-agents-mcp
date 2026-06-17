@@ -10,9 +10,10 @@ use crate::config::SecurityConfig;
 use crate::safety;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use remote_agents_shared::{TransferState, TransferStatus};
+use remote_agents_shared::{Command, CommandResult, TransferState, TransferStatus};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::RwLock;
 
@@ -114,6 +115,65 @@ pub fn receive_chunk(
             if !actual.eq_ignore_ascii_case(expected) {
                 bail!("sha256 mismatch (got {actual}, expected {expected})");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Stream a local file to a peer as a sequence of `FileRecv` commands, updating
+/// `store` as it goes. Transport-agnostic: `send_chunk` delivers one `FileRecv`
+/// to the destination and returns its reply (the caller supplies the WS/UDP
+/// peer-send for its connection type). Slice lengths come from the known `size`
+/// (so the base64'd chunk needn't report its raw length); the whole-file SHA-256
+/// rides the final slice for end-to-end verification.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_file<F, Fut>(
+    store: &TransferStore,
+    src_path: &str,
+    dest_path: &str,
+    transfer_id: &str,
+    sec: &SecurityConfig,
+    chunk: u64,
+    size: u64,
+    send_chunk: F,
+) -> Result<()>
+where
+    F: Fn(Command) -> Fut,
+    Fut: Future<Output = Result<CommandResult>>,
+{
+    let sha = {
+        let sp = src_path.to_string();
+        tokio::task::spawn_blocking(move || sha256_file(&sp))
+            .await
+            .map_err(|e| anyhow::anyhow!("hash failed: {e}"))??
+    };
+    let chunk = chunk.max(1);
+    let mut offset = 0u64;
+    loop {
+        let want = chunk.min(size - offset);
+        let (data, _) = {
+            let (sp, sec2) = (src_path.to_string(), sec.clone());
+            tokio::task::spawn_blocking(move || crate::files::read_chunk(&sp, offset, want, &sec2))
+                .await
+                .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))??
+        };
+        let eof = offset + want >= size;
+        let cmd = Command::FileRecv {
+            transfer_id: transfer_id.to_string(),
+            dest_path: dest_path.to_string(),
+            offset,
+            bytes: data,
+            eof,
+            sha256: if eof { Some(sha.clone()) } else { None },
+        };
+        match send_chunk(cmd).await? {
+            CommandResult::Ok => {}
+            other => bail!("destination rejected chunk: {other:?}"),
+        }
+        offset += want;
+        store.progress(transfer_id, offset);
+        if eof {
+            break;
         }
     }
     Ok(())
