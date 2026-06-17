@@ -68,6 +68,19 @@ describe('dedupAgents', () => {
     expect(out[0].accepts_commands).toBe(false);
   });
 
+  it('reports the connection count per machine (duplicate-socket warning)', () => {
+    const out = dedupAgents([
+      agent({ id: 'm', session_id: 's1' }),
+      agent({ id: 'm', session_id: 's2' }),
+      agent({ id: 'm', session_id: 's3' }),
+      agent({ id: 'solo' }),
+    ]);
+    const m = out.find((a) => a.id === 'm');
+    const solo = out.find((a) => a.id === 'solo');
+    expect(m?.connections).toBe(3);
+    expect(solo?.connections).toBe(1);
+  });
+
   it('preserves the version field through dedup (fleet version visibility)', () => {
     // Single socket: version carried straight through.
     const one = dedupAgents([agent({ id: 'a', version: '0.1.9' })]);
