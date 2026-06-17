@@ -1,5 +1,24 @@
 import type { AgentInfo, ClientMessage, ServerMessage, Target, UdpOffer, UdpAnswer, UdpChannelResult } from './types';
 
+/** Reap a socket after this long with no inbound frame. Agents ping every 30s
+ * (PING_INTERVAL in connection.rs), so 90s = three missed pings — a socket
+ * whose TCP died silently (NAT/idle timeout) without Cloudflare firing
+ * webSocketClose. This is what produces phantom "N connections under one
+ * agent-id" duplicates, since send() failures don't reap a hibernating socket. */
+export const STALE_MS = 90_000;
+/** How often the reaper alarm runs while any socket is connected. */
+export const REAP_INTERVAL_MS = 60_000;
+
+/** Pure: which entries are stale (no frame seen within `staleMs`). Anything
+ * without a `lastSeen` is treated as fresh (never reaped on absence alone). */
+export function selectStale<T extends { lastSeen?: number }>(
+  entries: T[],
+  now: number,
+  staleMs: number
+): T[] {
+  return entries.filter((e) => e.lastSeen !== undefined && now - e.lastSeen > staleMs);
+}
+
 /**
  * Capability score used to pick the most-capable socket of a host: a socket
  * that executes scores 1, an autonomous one +2 (so an autonomous+executing
@@ -102,6 +121,9 @@ interface Attachment {
   agentInfo?: AgentInfo;
   token: string;
   clientIp?: string;
+  /** Last time an inbound frame was seen on this socket (ms). Drives the
+   * stale-socket reaper; updated on every message, set on accept. */
+  lastSeen?: number;
 }
 
 export class Room implements DurableObject {
@@ -140,18 +162,38 @@ export class Room implements DurableObject {
     return new Response('Not Found', { status: 404 });
   }
 
-  private handleWebSocket(token: string, clientIp: string): Response {
+  private async handleWebSocket(token: string, clientIp: string): Promise<Response> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
-    // Stash the query token + client IP for use when the auth frame arrives.
-    server.serializeAttachment({ token, clientIp } as Attachment);
+    // Stash the query token + client IP for use when the auth frame arrives;
+    // seed lastSeen so a socket that never authenticates is still reapable.
+    server.serializeAttachment({ token, clientIp, lastSeen: Date.now() } as Attachment);
+    await this.ensureReaper();
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Ensure the stale-socket reaper alarm is scheduled (idempotent). */
+  private async ensureReaper() {
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + REAP_INTERVAL_MS);
+    }
+  }
+
+  /** Merge a patch into a socket's attachment, preserving existing fields. */
+  private patchAtt(ws: WebSocket, patch: Partial<Attachment>) {
+    try {
+      ws.serializeAttachment({ ...this.att(ws), ...patch } as Attachment);
+    } catch {
+      // Socket already dead — nothing to persist.
+    }
   }
 
   // --- hibernation handlers ------------------------------------------------
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    // Any inbound frame (including the 30s ping) proves the socket is alive.
+    this.patchAtt(ws, { lastSeen: Date.now() });
     if (typeof message !== 'string') {
       this.sendError(ws, 'Binary messages not supported');
       return;
@@ -173,6 +215,28 @@ export class Room implements DurableObject {
   async webSocketError(ws: WebSocket, error: unknown) {
     console.error('WebSocket error:', error);
     this.handleDisconnect(ws);
+  }
+
+  /** Periodic reaper: close sockets whose TCP died silently (no frame within
+   * STALE_MS) so Cloudflare drops them, clearing phantom duplicate connections
+   * that webSocketClose never fired for. Reschedules while any socket remains. */
+  async alarm() {
+    const now = Date.now();
+    const entries = this.sockets().map(([ws, a]) => ({ ws, lastSeen: a.lastSeen }));
+    for (const { ws } of selectStale(entries, now, STALE_MS)) {
+      // Announce departure once (reads the live attachment), strip identity so a
+      // socket that lingers a cycle isn't re-announced, then force the close.
+      this.handleDisconnect(ws);
+      this.patchAtt(ws, { agentInfo: undefined, sessionId: undefined });
+      try {
+        ws.close(1001, 'stale connection reaped');
+      } catch {
+        // Already dead — closing is best-effort.
+      }
+    }
+    if (this.state.getWebSockets().length > 0) {
+      await this.state.storage.setAlarm(now + REAP_INTERVAL_MS);
+    }
   }
 
   // --- message routing -----------------------------------------------------
@@ -314,6 +378,7 @@ export class Room implements DurableObject {
       sessionId,
       agentInfo,
       clientIp: att.clientIp,
+      lastSeen: Date.now(),
     } as Attachment);
 
     // auth_ok MUST be the first frame the client sees (the agent reads it as
