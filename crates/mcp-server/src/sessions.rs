@@ -245,22 +245,51 @@ fn opencode_sessions() -> Vec<SessionMeta> {
 fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
     let out = run_cli("opencode", &["export", id]).context("opencode export failed")?;
     let v: serde_json::Value = serde_json::from_str(&out)?;
-    // opencode export shape can vary; pull a `messages` array of {role, ...}.
-    let msgs = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let msgs = v.get("messages").and_then(|m| m.as_array());
     Ok(msgs
-        .iter()
-        .filter_map(|m| {
-            let role = m.get("role").and_then(|r| r.as_str())?.to_string();
-            let text = message_text(Some(m)).or_else(|| {
-                m.get("content").and_then(|c| c.as_str()).map(String::from)
-            })?;
-            Some(SessionMessage { role, text, ts: m.get("time").and_then(|t| t.as_u64()) })
-        })
+        .into_iter()
+        .flatten()
+        .filter_map(opencode_message)
         .collect())
+}
+
+/// One opencode export message → a transcript turn. Current opencode (1.x)
+/// nests `{info:{role,time:{created}}, parts:[{type:"text",text}, …]}`; older
+/// exports used a flat `{role, content}`. Handle both; drop non-text parts
+/// (tool / step-start / step-finish) and empty turns.
+fn opencode_message(m: &serde_json::Value) -> Option<SessionMessage> {
+    // Current shape: role/time under `info`, text under `parts`.
+    if let Some(info) = m.get("info") {
+        let role = info.get("role").and_then(|r| r.as_str())?.to_string();
+        let text = m
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            return None;
+        }
+        let ts = info
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|c| c.as_u64());
+        return Some(SessionMessage { role, text, ts });
+    }
+    // Legacy flat shape: {role, content, time}.
+    let role = m.get("role").and_then(|r| r.as_str())?.to_string();
+    let text = message_text(Some(m))
+        .or_else(|| m.get("content").and_then(|c| c.as_str()).map(String::from))?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(SessionMessage { role, text, ts: m.get("time").and_then(|t| t.as_u64()) })
 }
 
 // --- VS Code agents: Cline / Roo / Kilo (filesystem JSON) -------------------
@@ -631,29 +660,43 @@ fn pid_for_session(id: &str, _ps: &str) -> Option<u32> {
 // --- helpers ----------------------------------------------------------------
 
 /// Run a CLI, capturing stdout, killed after `CLI_TIMEOUT`. None on any failure.
+///
+/// Captures into a temp FILE, not a pipe, on purpose: some CLIs (notably
+/// `opencode`, on Bun) exit without flushing buffered stdout when it's a pipe,
+/// truncating large output non-deterministically at the OS pipe buffer (64/128
+/// KiB) — which corrupted `opencode export` of long transcripts so the dialog
+/// wouldn't load. A regular file gets the complete output every time, and also
+/// avoids the pipe-buffer deadlock (a child blocking mid-write while we wait).
 fn run_cli(program: &str, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + CLI_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let _ = child.kill();
-                return None;
+    let tmp = std::env::temp_dir().join(format!("ra-cli-{}.out", uuid::Uuid::new_v4()));
+    let status = (|| {
+        let file = std::fs::File::create(&tmp).ok()?;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdout(file)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + CLI_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    break None;
+                }
             }
         }
-    }
-    let out = child.wait_with_output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    })();
+    let out = std::fs::read(&tmp)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).to_string());
+    let _ = std::fs::remove_file(&tmp);
+    if status?.success() {
+        out
     } else {
         None
     }
@@ -795,6 +838,50 @@ mod tests {
             vec!["opencode", "run", "-s", "ses_x"]
         );
         assert!(resume_runner("bogus", "x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cli_captures_output_larger_than_pipe_buffer() {
+        // `seq 1 50000` emits ~250 KiB — well past the 64 KiB OS pipe buffer
+        // that truncated pipe-captured output. Temp-file capture gets it whole.
+        let out = run_cli("seq", &["1", "50000"]).expect("seq ran");
+        assert!(out.len() > 64 * 1024, "truncated to {} bytes", out.len());
+        assert_eq!(out.lines().next_back(), Some("50000")); // got the full tail
+    }
+
+    #[test]
+    fn opencode_message_parses_current_and_legacy_shapes() {
+        // Current opencode 1.x: role/time under `info`, text under `parts`;
+        // tool/step-start/step-finish parts are dropped.
+        let cur = serde_json::json!({
+            "info": {"role": "assistant", "time": {"created": 1781625315855u64}},
+            "parts": [
+                {"type": "step-start"},
+                {"type": "text", "text": "Проверю список"},
+                {"type": "tool", "tool": "exec"},
+                {"type": "text", "text": "готово"},
+                {"type": "step-finish"}
+            ]
+        });
+        let m = opencode_message(&cur).unwrap();
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.text, "Проверю список\nготово");
+        assert_eq!(m.ts, Some(1781625315855));
+
+        // A message with only non-text parts yields nothing.
+        let toolonly = serde_json::json!({
+            "info": {"role": "assistant"},
+            "parts": [{"type": "tool"}, {"type": "step-finish"}]
+        });
+        assert!(opencode_message(&toolonly).is_none());
+
+        // Legacy flat shape still works.
+        let legacy = serde_json::json!({"role": "user", "content": "привет", "time": 123u64});
+        let lm = opencode_message(&legacy).unwrap();
+        assert_eq!(lm.role, "user");
+        assert_eq!(lm.text, "привет");
+        assert_eq!(lm.ts, Some(123));
     }
 
     #[test]
