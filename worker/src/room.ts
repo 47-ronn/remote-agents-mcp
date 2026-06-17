@@ -33,6 +33,55 @@ export function dedupAgents(infos: AgentInfo[]): AgentInfo[] {
 }
 
 /**
+ * Resolve a `Target` to the connections that should receive a command, one per
+ * logical host (a machine with several open terminals is contacted once, on its
+ * most-capable socket). Pure over a candidate list of `{ info, item }`, where
+ * `item` is whatever the caller wants back (the socket tuple).
+ *
+ * Broadcasts (all/tagged/platform) skip send-only peers (`accepts_commands ===
+ * false`) and DEDUP by id (so a multi-terminal machine isn't hit N times). An
+ * explicit `agent` target is delivered to the single most-capable socket — even
+ * a send-only one (it self-rejects). Mirrors the Rust relay's `resolve_targets`.
+ */
+export function selectTargets<T>(
+  candidates: { info: AgentInfo; item: T }[],
+  target: Target
+): T[] {
+  const accepts = (i: AgentInfo) => i.accepts_commands !== false;
+
+  if (target.type === 'agent') {
+    const matches = candidates.filter((c) => c.info.id === target.id);
+    if (matches.length <= 1) return matches.map((c) => c.item);
+    const best = matches.reduce((b, c) =>
+      scoreAgent(c.info) > scoreAgent(b.info) ? c : b
+    );
+    return [best.item];
+  }
+
+  const fam = target.type === 'platform' ? target.family.toLowerCase() : '';
+  const matchesTarget = (i: AgentInfo): boolean => {
+    if (!accepts(i)) return false;
+    switch (target.type) {
+      case 'all':
+        return true;
+      case 'tagged':
+        return i.tags.some((t) => target.tags.includes(t));
+      case 'platform':
+        return i.platform?.family.toLowerCase() === fam || i.os.toLowerCase() === fam;
+    }
+  };
+
+  // One most-capable socket per machine id.
+  const byId = new Map<string, { info: AgentInfo; item: T }>();
+  for (const c of candidates) {
+    if (!matchesTarget(c.info)) continue;
+    const prev = byId.get(c.info.id);
+    if (!prev || scoreAgent(c.info) > scoreAgent(prev.info)) byId.set(c.info.id, c);
+  }
+  return [...byId.values()].map((c) => c.item);
+}
+
+/**
  * Room Durable Object — routes messages between agents and MCP clients.
  *
  * IMPORTANT: this uses the WebSocket *Hibernation* API (`acceptWebSocket`), so
@@ -298,43 +347,12 @@ export class Room implements DurableObject {
   }
 
   private resolveTarget(target: Target): [WebSocket, Attachment][] {
-    const agents = this.agentSockets();
-    switch (target.type) {
-      case 'agent': {
-        // One logical host may hold several live sockets (many terminals on the
-        // same machine). Deliver an Agent-targeted command to a SINGLE most-
-        // capable socket — preferring one that executes AND is autonomous —
-        // rather than broadcasting to all, which let a stale/less-capable
-        // socket answer first (e.g. "autonomous not enabled"). An explicit
-        // target is still delivered even to a send-only node, so it can reply
-        // with its own --no-agent rejection.
-        const matches = agents.filter(([, a]) => a.agentInfo?.id === target.id);
-        if (matches.length <= 1) return matches;
-        const score = ([, a]: [WebSocket, Attachment]) =>
-          (a.agentInfo?.accepts_commands !== false ? 1 : 0) +
-          (a.agentInfo?.autonomous ? 2 : 0);
-        return [matches.reduce((best, cur) => (score(cur) > score(best) ? cur : best))];
-      }
-      case 'all':
-        // Broadcasts skip send-only peers (accepts_commands === false): they
-        // never execute, so fanning out to them is pointless.
-        return agents.filter(([, a]) => a.agentInfo?.accepts_commands !== false);
-      case 'tagged':
-        return agents.filter(
-          ([, a]) =>
-            a.agentInfo?.accepts_commands !== false &&
-            a.agentInfo?.tags.some((t) => target.tags.includes(t))
-        );
-      case 'platform': {
-        const fam = target.family.toLowerCase();
-        return agents.filter(
-          ([, a]) =>
-            a.agentInfo?.accepts_commands !== false &&
-            (a.agentInfo?.platform?.family.toLowerCase() === fam ||
-              a.agentInfo?.os.toLowerCase() === fam)
-        );
-      }
-    }
+    // Pair each identified socket with its agent_info, then delegate to the
+    // pure, unit-tested selector (one most-capable connection per machine).
+    const candidates = this.agentSockets()
+      .filter(([, a]) => a.agentInfo)
+      .map(([ws, a]) => ({ info: a.agentInfo as AgentInfo, item: [ws, a] as [WebSocket, Attachment] }));
+    return selectTargets(candidates, target);
   }
 
   private handleDisconnect(ws: WebSocket) {
