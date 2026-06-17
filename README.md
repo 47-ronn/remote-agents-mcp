@@ -261,8 +261,8 @@ progress.
 
 It also surfaces each host's **local AI-chat history**, labelled by host and
 provider. Resumable providers (`claude`, `opencode`) can be continued from the
-panel; the VS Code agents (`cline`, `roo`, `kilo`) are imported read-only — their
-transcripts are shown for browsing but have no headless resume.
+panel; the VS Code agents (`cline`, `roo`, `kilo`) and `zed` are imported
+read-only — their transcripts are shown for browsing but have no headless resume.
 
 ## Security modes
 
