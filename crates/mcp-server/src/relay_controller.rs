@@ -649,10 +649,9 @@ async fn collect_replies(
 /// reply if encryption fails). Shared by the incoming-command handler.
 fn encrypt_result(cipher: &Cipher, request_id: String, result: CommandResult) -> ClientMessage {
     match result.encrypt(cipher) {
-        Ok(envelope) => ClientMessage::CommandResult {
-            request_id,
-            result: envelope,
-        },
+        // Same relay-frame guard as the run-mode agent: an oversized result
+        // becomes a clear error instead of being silently dropped by the relay.
+        Ok(envelope) => crate::connection::relay_safe_result(request_id, envelope),
         Err(e) => ClientMessage::CommandError {
             request_id,
             error: format!("result encryption failed: {e}"),

@@ -32,6 +32,35 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 /// A connection that stayed up at least this long resets the backoff.
 const STABLE_THRESHOLD: Duration = Duration::from_secs(30);
+/// Max size of an encrypted result envelope sent over the relay WebSocket. The
+/// Cloudflare Worker caps a WS message at ~1 MiB, and the relay re-wraps it when
+/// forwarding — so an oversized result (e.g. `read_file` of a multi-MB file)
+/// would be silently dropped. Stay comfortably under the limit and return a
+/// clear error instead, pointing the caller at chunked reads.
+const MAX_RELAY_PAYLOAD: usize = 900_000;
+
+/// Build a relayed reply from an encrypted result envelope, substituting a clear
+/// error when the envelope is too big for the relay's WS frame (a silent drop
+/// otherwise). Used by both the WS- and UDP-inbound command paths (and the
+/// mcp-mode peer in `relay_controller`).
+pub(crate) fn relay_safe_result(request_id: String, envelope: String) -> ClientMessage {
+    if envelope.len() > MAX_RELAY_PAYLOAD {
+        ClientMessage::CommandError {
+            request_id,
+            error: format!(
+                "result too large for relay ({} bytes > {} limit); read in smaller \
+                 chunks (file_chunk) or narrow the request",
+                envelope.len(),
+                MAX_RELAY_PAYLOAD
+            ),
+        }
+    } else {
+        ClientMessage::CommandResult {
+            request_id,
+            result: envelope,
+        }
+    }
+}
 
 /// Run the agent connection loop with auto-reconnect and exponential backoff,
 /// shutting down cleanly on SIGTERM/SIGINT so spawned children (quick tunnels)
@@ -365,10 +394,9 @@ async fn handle_server_message(
                                 .send_via_udp(&from_session, envelope.as_bytes())
                                 .await;
                         }
-                        ClientMessage::CommandResult {
-                            request_id,
-                            result: envelope,
-                        }
+                        // Guard the WS-relay frame size (UDP, if used, has no such
+                        // cap; if it already delivered, the caller ignores this).
+                        relay_safe_result(request_id, envelope)
                     }
                     Err(e) => ClientMessage::CommandError {
                         request_id,
@@ -477,7 +505,7 @@ fn encode_udp_reply(
 ) -> ClientMessage {
     match outcome {
         Ok(result) => match result.encrypt(cipher) {
-            Ok(envelope) => ClientMessage::CommandResult { request_id, result: envelope },
+            Ok(envelope) => relay_safe_result(request_id, envelope),
             Err(e) => ClientMessage::CommandError {
                 request_id,
                 error: format!("result encryption failed: {e}"),
@@ -712,6 +740,33 @@ mod tests {
     use remote_agents_shared::{AgentMode, Cipher, CommandResult};
 
     // --- jitter -------------------------------------------------------------
+
+    #[test]
+    fn relay_safe_result_guards_oversized_envelopes() {
+        // A small envelope passes through as a CommandResult.
+        match relay_safe_result("r1".into(), "small".into()) {
+            ClientMessage::CommandResult { request_id, result } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(result, "small");
+            }
+            other => panic!("expected CommandResult, got {other:?}"),
+        }
+        // An over-limit envelope becomes a clear error (not a silent relay drop).
+        let big = "x".repeat(MAX_RELAY_PAYLOAD + 1);
+        match relay_safe_result("r2".into(), big) {
+            ClientMessage::CommandError { request_id, error } => {
+                assert_eq!(request_id, "r2");
+                assert!(error.contains("too large for relay"), "got: {error}");
+            }
+            other => panic!("expected CommandError, got {other:?}"),
+        }
+        // Exactly at the limit still passes.
+        let edge = "x".repeat(MAX_RELAY_PAYLOAD);
+        assert!(matches!(
+            relay_safe_result("r3".into(), edge),
+            ClientMessage::CommandResult { .. }
+        ));
+    }
 
     #[test]
     fn jitter_is_zero_when_backoff_too_small() {
