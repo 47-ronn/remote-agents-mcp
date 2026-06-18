@@ -33,7 +33,9 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 /// A connection that stayed up at least this long resets the backoff.
 const STABLE_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// Run the agent connection loop with auto-reconnect and exponential backoff.
+/// Run the agent connection loop with auto-reconnect and exponential backoff,
+/// shutting down cleanly on SIGTERM/SIGINT so spawned children (quick tunnels)
+/// don't linger as orphans.
 pub async fn run(config: &Config) -> Result<()> {
     // Built once so a runtime mode change (SetMode) survives reconnects.
     let state = AgentState::new(config.clone());
@@ -41,11 +43,26 @@ pub async fn run(config: &Config) -> Result<()> {
     // Run scheduled tasks independently of relay connectivity.
     state.start_scheduler();
 
-    let mut backoff = RECONNECT_MIN;
+    let result = tokio::select! {
+        r = reconnect_loop(config, &state) => r,
+        _ = shutdown_signal() => {
+            info!("Shutdown signal received; stopping");
+            Ok(())
+        }
+    };
 
+    // Kill any Cloudflare quick tunnels so cloudflared children don't outlive us.
+    state.tunnels().shutdown();
+    result
+}
+
+/// The auto-reconnect loop (runs until a graceful close or until cancelled by a
+/// shutdown signal in [`run`]).
+async fn reconnect_loop(config: &Config, state: &AgentState) -> Result<()> {
+    let mut backoff = RECONNECT_MIN;
     loop {
         let started = Instant::now();
-        let result = connect_and_run(config, &state).await;
+        let result = connect_and_run(config, state).await;
         let uptime = started.elapsed();
 
         // A connection that lasted a while was healthy; reset backoff.
@@ -56,7 +73,7 @@ pub async fn run(config: &Config) -> Result<()> {
         match result {
             Ok(()) => {
                 info!("Connection closed gracefully");
-                break;
+                return Ok(());
             }
             Err(e) => {
                 error!("Connection error: {}", e);
@@ -67,7 +84,29 @@ pub async fn run(config: &Config) -> Result<()> {
             }
         }
     }
-    Ok(())
+}
+
+/// Resolve when the process is asked to terminate (SIGTERM or SIGINT on unix,
+/// Ctrl-C elsewhere). If signal handlers can't be installed, never resolves —
+/// so the reconnect loop keeps running exactly as before.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Small deterministic jitter (0..backoff/2) derived from the current nanos to

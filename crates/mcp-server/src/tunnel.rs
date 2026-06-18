@@ -42,10 +42,19 @@ impl TunnelStore {
         // pipe, so a full pipe can never block the long-lived child.
         let log = std::env::temp_dir().join(format!("ra-tunnel-{id}.log"));
         let logfile = std::fs::File::create(&log).context("create tunnel log")?;
-        let child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .args(["tunnel", "--no-autoupdate", "--url", &target])
             .stdout(Stdio::null())
-            .stderr(logfile)
+            .stderr(logfile);
+        // Lead its own process group so we can tear down cloudflared AND any
+        // helper children it spawns in one kill (see `kill_reap`).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = command
             .spawn()
             .context("spawn cloudflared (is it executable?)")?;
 
@@ -67,7 +76,7 @@ impl TunnelStore {
             }
             None => {
                 let mut child = child;
-                let _ = child.kill();
+                kill_reap(&mut child);
                 let _ = std::fs::remove_file(&log);
                 bail!("cloudflared did not report a tunnel URL within {URL_TIMEOUT:?}");
             }
@@ -85,10 +94,50 @@ impl TunnelStore {
     pub fn stop(&self, id: &str) -> Result<()> {
         match self.inner.lock().unwrap().remove(id) {
             Some(mut h) => {
-                let _ = h.child.kill();
+                kill_reap(&mut h.child);
                 Ok(())
             }
             None => bail!("no running tunnel with id '{id}'"),
+        }
+    }
+
+    /// Kill every running tunnel. Called on agent shutdown so `cloudflared`
+    /// children don't linger as orphans after the agent exits.
+    pub fn shutdown(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            for (_, mut h) in g.drain() {
+                kill_reap(&mut h.child);
+            }
+        }
+    }
+}
+
+/// SIGKILL a child (and, on unix, its whole process group, since cloudflared can
+/// spawn helper children) and reap it, so nothing lingers as a zombie/orphan.
+fn kill_reap(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // The child leads its own group (`process_group(0)` at spawn), so its
+        // pid == pgid; `kill -<pid>` signals the whole group.
+        let pgid = child.id();
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl Drop for TunnelStore {
+    fn drop(&mut self) {
+        // Belt-and-suspenders for the graceful path (the registry being dropped):
+        // `std::process::Child` does NOT kill on drop, so do it explicitly.
+        if let Ok(g) = self.inner.get_mut() {
+            for h in g.values_mut() {
+                kill_reap(&mut h.child);
+            }
         }
     }
 }
@@ -287,6 +336,39 @@ mod tests {
         assert_eq!(parse_tunnel_url("INF starting cloudflared\n"), None);
         // A non-trycloudflare https URL is ignored.
         assert_eq!(parse_tunnel_url("see https://example.com for docs"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_kills_running_children() {
+        // Register a real long-running child, then shut down: it must be killed
+        // and the registry emptied (so cloudflared can't orphan on agent exit).
+        let store = TunnelStore::default();
+        let child = Command::new("sleep").arg("60").spawn().expect("spawn sleep");
+        let pid = child.id();
+        let info = TunnelInfo {
+            id: "t1".into(),
+            target: "http://localhost:1".into(),
+            public_url: "https://x.trycloudflare.com".into(),
+            status: "running".into(),
+        };
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert("t1".into(), Handle { info, child });
+        assert_eq!(store.list().len(), 1);
+
+        store.shutdown();
+        assert!(store.list().is_empty(), "registry cleared");
+        // The child process is gone (SIGKILL delivered).
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(!alive, "child pid {pid} should be dead");
     }
 
     #[test]
