@@ -148,8 +148,32 @@ fn is_readonly_segment(segment: &str, sec: &SecurityConfig) -> bool {
         "git" => matches!(sub, Some(s) if GIT_RO.contains(&s)),
         "cargo" => sub.is_none_or(|s| CARGO_RO.contains(&s)),
         "npm" => matches!(sub, Some(s) if NPM_RO.contains(&s)),
+        // Whitelisted, but each can write or run other commands via specific
+        // flags/builtins — allow only when used purely for reading.
+        "find" => find_is_readonly(segment),
+        "sed" => !sed_in_place(segment),
+        "awk" | "gawk" | "mawk" => !segment.contains("system("),
         _ => true,
     }
+}
+
+/// `find` action predicates that write files or run commands — disallowed in
+/// read-only mode (`-printf`/`-print` to stdout stay allowed).
+const FIND_WRITE_ACTIONS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprintf", "-fprint", "-fls",
+];
+
+fn find_is_readonly(segment: &str) -> bool {
+    !segment
+        .split_whitespace()
+        .any(|t| FIND_WRITE_ACTIONS.contains(&t))
+}
+
+/// `sed -i` / `--in-place` edits files in place — a write.
+fn sed_in_place(segment: &str) -> bool {
+    segment.split_whitespace().any(|t| {
+        t == "-i" || t.starts_with("-i") || t == "--in-place" || t.starts_with("--in-place=")
+    })
 }
 
 /// Check whether a path may be read or written under the current policy.
@@ -250,6 +274,29 @@ mod tests {
         assert!(check_command_allowed("echo ${HOME}", AgentMode::Plan, &s).is_ok());
         // Edit/Bypass are unaffected by this read-only-only restriction.
         assert!(check_command_allowed("echo $(date)", AgentMode::Edit, &s).is_ok());
+    }
+
+    #[test]
+    fn plan_blocks_write_capable_whitelisted_tools() {
+        let s = sec();
+        // find: read-only traversal is fine; write/exec actions are not.
+        assert!(check_command_allowed("find . -name '*.rs'", AgentMode::Plan, &s).is_ok());
+        assert!(check_command_allowed("find . -printf '%p\\n'", AgentMode::Plan, &s).is_ok());
+        assert!(check_command_allowed("find /tmp -exec touch {} ;", AgentMode::Plan, &s).is_err());
+        assert!(check_command_allowed("find /tmp -delete", AgentMode::Plan, &s).is_err());
+        assert!(check_command_allowed("find . -fprint out", AgentMode::Plan, &s).is_err());
+
+        // sed: stream edit to stdout ok; in-place is a write.
+        assert!(check_command_allowed("sed 's/a/b/' f", AgentMode::Plan, &s).is_ok());
+        assert!(check_command_allowed("sed -i 's/a/b/' f", AgentMode::Plan, &s).is_err());
+        assert!(check_command_allowed("sed -i.bak 's/a/b/' f", AgentMode::Plan, &s).is_err());
+
+        // awk: text processing ok; system() runs a command.
+        assert!(check_command_allowed("awk '{print $1}' f", AgentMode::Plan, &s).is_ok());
+        assert!(check_command_allowed("awk 'BEGIN{system(\"touch f\")}'", AgentMode::Plan, &s).is_err());
+
+        // Edit mode is unaffected.
+        assert!(check_command_allowed("find /tmp -delete", AgentMode::Edit, &s).is_ok());
     }
 
     #[test]
