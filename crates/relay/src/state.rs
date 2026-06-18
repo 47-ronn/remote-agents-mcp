@@ -53,6 +53,10 @@ pub struct RelayState {
     pub rooms: DashMap<String, Arc<Room>>,
     /// When set, every connection's auth token MUST equal this value.
     pub token: Option<String>,
+    /// Close a connection that sends no frame within this window. Agents ping
+    /// every 30s, so a silent gap means the TCP died without a close (NAT/idle
+    /// timeout); reaping it stops a phantom session lingering in the room.
+    pub idle_timeout: std::time::Duration,
 }
 
 impl RelayState {
@@ -60,7 +64,14 @@ impl RelayState {
         Self {
             rooms: DashMap::new(),
             token,
+            idle_timeout: std::time::Duration::from_secs(90),
         }
+    }
+
+    /// Override the idle-reaper window (tests use a short value).
+    pub fn with_idle_timeout(mut self, d: std::time::Duration) -> Self {
+        self.idle_timeout = d;
+        self
     }
 
     /// Get or create a room by name.
