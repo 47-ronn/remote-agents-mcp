@@ -22,6 +22,7 @@ use std::sync::Arc;
 pub fn router(state: Arc<RelayState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/rooms", get(rooms_list))
         .route("/api/room/:room", get(room_info))
         .route("/ws/room/:room", get(ws_handler))
         .with_state(state)
@@ -69,6 +70,30 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "service": "remote-agents-relay" }))
+}
+
+/// List every active room with its connection / distinct-host / observer counts.
+/// The Cloudflare worker stubs this out — Durable Objects have no global
+/// registry — but the self-hosted relay holds all rooms in shared state, so it
+/// can give operators a real fleet-wide view. `connections` counts raw sockets,
+/// `agents` counts distinct machines (one host may hold several terminals).
+async fn rooms_list(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+    let mut rooms: Vec<_> = state
+        .rooms
+        .iter()
+        .map(|e| {
+            let room = e.value();
+            serde_json::json!({
+                "room": e.key(),
+                "connections": room.agents.len(),
+                "agents": crate::routing::dedup_agents(room).len(),
+                "mcp_clients": room.mcp.len(),
+            })
+        })
+        .collect();
+    // Stable ordering for clients/tests.
+    rooms.sort_by(|a, b| a["room"].as_str().cmp(&b["room"].as_str()));
+    Json(serde_json::json!({ "rooms": rooms }))
 }
 
 async fn room_info(

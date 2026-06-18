@@ -143,6 +143,8 @@ remote-agents-relay --bind 0.0.0.0:8080
 # agents/MCP then use relay_url = ws://<host>:8080
 # optional: --token <secret> to gate room access at the relay;
 #           --idle-timeout-secs <n> to reap silently-dead sockets (default 90, 0 disables)
+# monitoring: GET /health, /api/rooms (all active rooms + counts),
+#             /api/room/:room (one room's agents)
 ```
 
 **Cloudflare Worker:**

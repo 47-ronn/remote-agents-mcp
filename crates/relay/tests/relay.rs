@@ -774,3 +774,36 @@ async fn active_connection_survives_idle_window() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+// `/api/rooms` enumerates every active room with its counts (the self-hosted
+// relay can do this even though the Cloudflare worker stubs it out).
+#[tokio::test]
+async fn rooms_list_enumerates_active_rooms() {
+    let port = start_relay().await;
+
+    // No rooms yet.
+    let (status, body) = http_get(port, "/api/rooms").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"rooms\":[]"), "body: {body}");
+
+    // Agents join two different rooms (room comes from the URL path).
+    let mut a = connect(port, "dev").await;
+    auth(&mut a, Some(agent_info("a1", &[]))).await;
+    let mut b = connect(port, "prod").await;
+    auth(&mut b, Some(agent_info("b1", &[]))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (status, body) = http_get(port, "/api/rooms").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"room\":\"dev\""), "body: {body}");
+    assert!(body.contains("\"room\":\"prod\""), "body: {body}");
+    assert!(body.contains("\"connections\":1"), "body: {body}");
+    assert!(body.contains("\"agents\":1"), "body: {body}");
+
+    // When the last connection of a room leaves, the room is GC'd and drops out.
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_s, body) = http_get(port, "/api/rooms").await;
+    assert!(!body.contains("\"room\":\"dev\""), "dev should be gone: {body}");
+    assert!(body.contains("\"room\":\"prod\""), "prod should remain: {body}");
+}
