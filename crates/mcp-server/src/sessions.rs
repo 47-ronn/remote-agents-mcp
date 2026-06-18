@@ -708,6 +708,10 @@ fn pid_for_session(id: &str, _ps: &str) -> Option<u32> {
 /// wouldn't load. A regular file gets the complete output every time, and also
 /// avoids the pipe-buffer deadlock (a child blocking mid-write while we wait).
 fn run_cli(program: &str, args: &[&str]) -> Option<String> {
+    run_cli_with_timeout(program, args, CLI_TIMEOUT)
+}
+
+fn run_cli_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let tmp = std::env::temp_dir().join(format!("ra-cli-{}.out", uuid::Uuid::new_v4()));
     let status = (|| {
         let file = std::fs::File::create(&tmp).ok()?;
@@ -717,7 +721,7 @@ fn run_cli(program: &str, args: &[&str]) -> Option<String> {
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
-        let deadline = Instant::now() + CLI_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
@@ -725,7 +729,10 @@ fn run_cli(program: &str, args: &[&str]) -> Option<String> {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 _ => {
+                    // Kill AND reap — `kill()` alone leaves the timed-out CLI a
+                    // zombie (std Child doesn't reap on drop).
                     let _ = child.kill();
+                    let _ = child.wait();
                     break None;
                 }
             }
@@ -926,6 +933,34 @@ mod tests {
         let out = run_cli("seq", &["1", "50000"]).expect("seq ran");
         assert!(out.len() > 64 * 1024, "truncated to {} bytes", out.len());
         assert_eq!(out.lines().next_back(), Some("50000")); // got the full tail
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cli_timeout_kills_and_reaps_child() {
+        // `exec sleep <unique>` so the spawned child IS the sleeper. Run it on a
+        // thread, grab its pid while alive, then check it's fully gone (reaped,
+        // not a zombie) after the timeout — `kill -0` succeeds on a zombie.
+        let marker = "sleep 88.123";
+        let h = std::thread::spawn(|| {
+            run_cli_with_timeout("sh", &["-c", "exec sleep 88.123"], Duration::from_millis(700))
+        });
+        std::thread::sleep(Duration::from_millis(250));
+        let pid = Command::new("pgrep")
+            .args(["-f", marker])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(String::from))
+            .expect("sleep should be running before the timeout");
+
+        assert!(h.join().unwrap().is_none(), "timed-out CLI returns None");
+        std::thread::sleep(Duration::from_millis(200));
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(!alive, "timed-out child pid {pid} was not killed+reaped");
     }
 
     #[test]
