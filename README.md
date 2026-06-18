@@ -141,6 +141,8 @@ remote-agents install --room dev --token <secret> --relay wss://<your-relay-host
 ```bash
 remote-agents-relay --bind 0.0.0.0:8080
 # agents/MCP then use relay_url = ws://<host>:8080
+# optional: --token <secret> to gate room access at the relay;
+#           --idle-timeout-secs <n> to reap silently-dead sockets (default 90, 0 disables)
 ```
 
 **Cloudflare Worker:**
