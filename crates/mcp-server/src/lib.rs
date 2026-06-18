@@ -24,5 +24,6 @@ pub mod safety;
 pub mod scheduler;
 pub mod sessions;
 pub mod transfer;
+pub mod tunnel;
 pub mod state;
 pub mod udp_transport;

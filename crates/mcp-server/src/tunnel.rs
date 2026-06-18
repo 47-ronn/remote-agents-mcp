@@ -1,0 +1,308 @@
+//! Cloudflare quick tunnels: expose one of this host's local addresses at a
+//! public `*.trycloudflare.com` URL via `cloudflared`, downloading the binary
+//! on demand. A dev convenience (`cloudflared tunnel --url http://localhost:N`),
+//! gated to edit/bypass mode by the executor.
+//!
+//! cloudflared keeps running for the life of the tunnel; we track each child in
+//! an in-memory registry (mirrors `transfer`/`autonomous`) and reap exited ones.
+
+use anyhow::{bail, Context, Result};
+use remote_agents_shared::TunnelInfo;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How long to wait for cloudflared to report its public URL before giving up.
+const URL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// In-memory registry of quick tunnels this node started.
+#[derive(Default)]
+pub struct TunnelStore {
+    inner: Mutex<HashMap<String, Handle>>,
+}
+
+struct Handle {
+    info: TunnelInfo,
+    child: Child,
+}
+
+impl TunnelStore {
+    /// Start a quick tunnel to `target` (a local address or bare port). Downloads
+    /// `cloudflared` into `data_dir` if it isn't already available, spawns it,
+    /// and returns once the public URL is known. `data_dir` is the node's data
+    /// dir (where the binary is cached).
+    pub fn start(&self, target: &str, data_dir: Option<PathBuf>) -> Result<TunnelInfo> {
+        let target = validate_target(target)?;
+        let bin = ensure_cloudflared(data_dir)?;
+        let id = short_id();
+
+        // cloudflared logs (incl. the URL) to stderr. Capture to a file, not a
+        // pipe, so a full pipe can never block the long-lived child.
+        let log = std::env::temp_dir().join(format!("ra-tunnel-{id}.log"));
+        let logfile = std::fs::File::create(&log).context("create tunnel log")?;
+        let child = Command::new(&bin)
+            .args(["tunnel", "--no-autoupdate", "--url", &target])
+            .stdout(Stdio::null())
+            .stderr(logfile)
+            .spawn()
+            .context("spawn cloudflared (is it executable?)")?;
+
+        let url = wait_for_url(&log, child.id());
+        match url {
+            Some(public_url) => {
+                let _ = std::fs::remove_file(&log); // captured; child keeps its fd
+                let info = TunnelInfo {
+                    id,
+                    target,
+                    public_url,
+                    status: "running".into(),
+                };
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .insert(info.id.clone(), Handle { info: info.clone(), child });
+                Ok(info)
+            }
+            None => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&log);
+                bail!("cloudflared did not report a tunnel URL within {URL_TIMEOUT:?}");
+            }
+        }
+    }
+
+    /// Running tunnels (reaping any whose process has exited).
+    pub fn list(&self) -> Vec<TunnelInfo> {
+        let mut g = self.inner.lock().unwrap();
+        g.retain(|_, h| !matches!(h.child.try_wait(), Ok(Some(_))));
+        g.values().map(|h| h.info.clone()).collect()
+    }
+
+    /// Stop a tunnel by id (kills its `cloudflared` process).
+    pub fn stop(&self, id: &str) -> Result<()> {
+        match self.inner.lock().unwrap().remove(id) {
+            Some(mut h) => {
+                let _ = h.child.kill();
+                Ok(())
+            }
+            None => bail!("no running tunnel with id '{id}'"),
+        }
+    }
+}
+
+/// Poll the cloudflared log for the public URL until it appears or we time out.
+fn wait_for_url(log: &Path, _pid: u32) -> Option<String> {
+    let deadline = Instant::now() + URL_TIMEOUT;
+    loop {
+        if let Some(url) = std::fs::read_to_string(log).ok().and_then(|s| parse_tunnel_url(&s)) {
+            return Some(url);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Extract the `https://<sub>.trycloudflare.com` URL cloudflared prints to its
+/// log. Returns the first match, or None if not present yet.
+fn parse_tunnel_url(log: &str) -> Option<String> {
+    for line in log.lines() {
+        let Some(start) = line.find("https://") else {
+            continue;
+        };
+        let tail = &line[start..];
+        // The URL ends at the first character that can't appear in it.
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '/' | ':')))
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        if url.contains(".trycloudflare.com") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// Normalize/validate a tunnel target. Accepts a bare port (→ localhost) or an
+/// `http(s)://` URL pointing at this host's loopback only — a dev tool to expose
+/// LOCAL services, not arbitrary internal hosts.
+fn validate_target(target: &str) -> Result<String> {
+    let t = target.trim();
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(format!("http://localhost:{t}"));
+    }
+    let lower = t.to_lowercase();
+    let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+    let is_local = ["localhost", "127.0.0.1", "[::1]", "://[::1]"]
+        .iter()
+        .any(|h| lower.contains(h));
+    if is_http && is_local {
+        Ok(t.to_string())
+    } else {
+        bail!("tunnel target must be a local address (http(s)://localhost[:port] or a bare port), got '{target}'")
+    }
+}
+
+/// Locate `cloudflared`: prefer one on `PATH`, then a cached download, else
+/// fetch the right release asset for this platform into the cache.
+fn ensure_cloudflared(data_dir: Option<PathBuf>) -> Result<PathBuf> {
+    if on_path("cloudflared") {
+        return Ok(PathBuf::from("cloudflared"));
+    }
+    let cache = cache_path(data_dir);
+    if cache.is_file() {
+        return Ok(cache);
+    }
+    download_cloudflared(&cache)?;
+    Ok(cache)
+}
+
+fn on_path(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn cache_path(data_dir: Option<PathBuf>) -> PathBuf {
+    let base = data_dir
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+    base.join("remote-agents").join("bin").join(name)
+}
+
+/// GitHub release asset name for the current platform, or None if unsupported.
+fn cloudflared_asset() -> Option<&'static str> {
+    asset_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("cloudflared-linux-amd64"),
+        ("linux", "aarch64") => Some("cloudflared-linux-arm64"),
+        ("linux", "arm") => Some("cloudflared-linux-arm"),
+        ("linux", "x86") => Some("cloudflared-linux-386"),
+        ("macos", "x86_64") => Some("cloudflared-darwin-amd64.tgz"),
+        ("macos", "aarch64") => Some("cloudflared-darwin-arm64.tgz"),
+        ("windows", "x86_64") => Some("cloudflared-windows-amd64.exe"),
+        ("windows", "x86") => Some("cloudflared-windows-386.exe"),
+        _ => None,
+    }
+}
+
+fn download_cloudflared(dest: &Path) -> Result<()> {
+    let asset = cloudflared_asset().context("no cloudflared build for this OS/arch")?;
+    let url = format!(
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+    );
+    let dir = dest.parent().context("cache path has no parent")?;
+    std::fs::create_dir_all(dir).context("create cloudflared cache dir")?;
+
+    if asset.ends_with(".tgz") {
+        // macOS ships a tarball containing the `cloudflared` binary.
+        let tgz = dir.join("cloudflared.tgz");
+        fetch(&url, &tgz)?;
+        let status = Command::new("tar")
+            .args(["xzf", &tgz.to_string_lossy(), "-C", &dir.to_string_lossy()])
+            .status()
+            .context("run tar")?;
+        let _ = std::fs::remove_file(&tgz);
+        if !status.success() {
+            bail!("failed to extract cloudflared tarball");
+        }
+    } else {
+        fetch(&url, dest)?;
+    }
+    make_executable(dest)?;
+    Ok(())
+}
+
+/// Download `url` to `dest` using whatever HTTP client is available (curl, then
+/// wget) — avoids pulling a heavyweight HTTP dependency into the static binary.
+fn fetch(url: &str, dest: &Path) -> Result<()> {
+    let d = dest.to_string_lossy();
+    let curl = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o", &d, url])
+        .status();
+    if matches!(curl, Ok(s) if s.success()) {
+        return Ok(());
+    }
+    let wget = Command::new("wget").args(["-q", "-O", &d, url]).status();
+    if matches!(wget, Ok(s) if s.success()) {
+        return Ok(());
+    }
+    bail!("could not download cloudflared (need `curl` or `wget`): {url}")
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .context("chmod cloudflared")
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Short random-ish id from the current time (no extra deps needed for a label).
+fn short_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_mapping_covers_common_platforms() {
+        assert_eq!(asset_for("linux", "x86_64"), Some("cloudflared-linux-amd64"));
+        assert_eq!(asset_for("linux", "aarch64"), Some("cloudflared-linux-arm64"));
+        assert_eq!(asset_for("macos", "aarch64"), Some("cloudflared-darwin-arm64.tgz"));
+        assert_eq!(asset_for("windows", "x86_64"), Some("cloudflared-windows-amd64.exe"));
+        assert_eq!(asset_for("plan9", "mips"), None);
+    }
+
+    #[test]
+    fn parses_url_from_cloudflared_box() {
+        let log = "\
+2026-06-18T10:00:00Z INF +-------------------------------------+
+2026-06-18T10:00:00Z INF |  Your quick Tunnel has been created! |
+2026-06-18T10:00:00Z INF |  https://happy-tree-cat.trycloudflare.com  |
+2026-06-18T10:00:00Z INF +-------------------------------------+";
+        assert_eq!(
+            parse_tunnel_url(log).as_deref(),
+            Some("https://happy-tree-cat.trycloudflare.com")
+        );
+        // No URL yet → None.
+        assert_eq!(parse_tunnel_url("INF starting cloudflared\n"), None);
+        // A non-trycloudflare https URL is ignored.
+        assert_eq!(parse_tunnel_url("see https://example.com for docs"), None);
+    }
+
+    #[test]
+    fn validate_target_normalizes_and_restricts() {
+        assert_eq!(validate_target("3000").unwrap(), "http://localhost:3000");
+        assert_eq!(
+            validate_target("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            validate_target("http://127.0.0.1:5000/app").unwrap(),
+            "http://127.0.0.1:5000/app"
+        );
+        // Non-local targets are rejected (no exposing arbitrary internal hosts).
+        assert!(validate_target("http://10.0.0.5:80").is_err());
+        assert!(validate_target("https://example.com").is_err());
+        assert!(validate_target("ftp://localhost:21").is_err());
+    }
+}

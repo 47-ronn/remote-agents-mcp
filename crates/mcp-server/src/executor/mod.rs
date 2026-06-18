@@ -338,6 +338,39 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             bail!("send_file must be issued to a connected peer node")
         }
 
+        // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
+        // Starting/stopping exposes a local service to the internet, so require
+        // a write-capable mode. Listing is read-only. The work (download +
+        // spawn + wait for URL) is blocking → run it off the async runtime.
+        Command::TunnelStart { target } => {
+            if !mode.allows_write() {
+                bail!("Starting a tunnel requires Edit/Bypass mode (got {:?})", mode);
+            }
+            let (tunnels, target, data_dir) =
+                (state.tunnels(), target.clone(), dirs::data_dir());
+            let info = tokio::task::spawn_blocking(move || tunnels.start(&target, data_dir))
+                .await
+                .map_err(|e| anyhow::anyhow!("tunnel task failed: {e}"))??;
+            Ok(CommandResult::TunnelStarted { tunnel: info })
+        }
+        Command::TunnelList => {
+            let tunnels = state.tunnels();
+            let list = tokio::task::spawn_blocking(move || tunnels.list())
+                .await
+                .map_err(|e| anyhow::anyhow!("tunnel task failed: {e}"))?;
+            Ok(CommandResult::TunnelList { tunnels: list })
+        }
+        Command::TunnelStop { id } => {
+            if !mode.allows_write() {
+                bail!("Stopping a tunnel requires Edit/Bypass mode (got {:?})", mode);
+            }
+            let (tunnels, id) = (state.tunnels(), id.clone());
+            tokio::task::spawn_blocking(move || tunnels.stop(&id))
+                .await
+                .map_err(|e| anyhow::anyhow!("tunnel task failed: {e}"))??;
+            Ok(CommandResult::Ok)
+        }
+
         // MapReduce (Phase 13): map_fn/reduce_fn are shell commands; the
         // partition data (or collected map outputs) is fed on stdin. This
         // reuses the existing shell executor and safety policy — no separate

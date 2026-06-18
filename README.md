@@ -236,6 +236,7 @@ the registered entry.
 | `list_agents` | List agents connected to the relay room |
 | `fleet_exec` / `fleet_read` / `fleet_write` / `fleet_git` / `fleet_search` | Run an operation across the fleet — `target = all \| tag1,tag2 \| os:<family>` |
 | `file_search` / `file_stat` / `send_file` / `transfer_get` | Find files on a host, and move a file host→host (UDP, SHA-256 verified) |
+| `tunnel_start` / `tunnel_list` / `tunnel_stop` | Expose a host's local port at a public `*.trycloudflare.com` URL via a Cloudflare quick tunnel (`cloudflared` auto-downloaded; Edit/Bypass) |
 | `mapreduce` | Distributed map/reduce over the fleet (shell map/reduce functions) |
 
 Each agent advertises platform metadata (OS family, distro, kernel, shell) and
