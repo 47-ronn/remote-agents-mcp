@@ -39,12 +39,18 @@ const STABLE_THRESHOLD: Duration = Duration::from_secs(30);
 /// clear error instead, pointing the caller at chunked reads.
 const MAX_RELAY_PAYLOAD: usize = 900_000;
 
+/// Whether an encrypted envelope (command or result) is too big to send over the
+/// relay's WS frame. Used to fail loudly instead of being silently dropped.
+pub(crate) fn relay_payload_too_large(len: usize) -> bool {
+    len > MAX_RELAY_PAYLOAD
+}
+
 /// Build a relayed reply from an encrypted result envelope, substituting a clear
 /// error when the envelope is too big for the relay's WS frame (a silent drop
 /// otherwise). Used by both the WS- and UDP-inbound command paths (and the
 /// mcp-mode peer in `relay_controller`).
 pub(crate) fn relay_safe_result(request_id: String, envelope: String) -> ClientMessage {
-    if envelope.len() > MAX_RELAY_PAYLOAD {
+    if relay_payload_too_large(envelope.len()) {
         ClientMessage::CommandError {
             request_id,
             error: format!(
@@ -766,6 +772,13 @@ mod tests {
             relay_safe_result("r3".into(), edge),
             ClientMessage::CommandResult { .. }
         ));
+    }
+
+    #[test]
+    fn relay_payload_too_large_threshold() {
+        assert!(!relay_payload_too_large(0));
+        assert!(!relay_payload_too_large(MAX_RELAY_PAYLOAD));
+        assert!(relay_payload_too_large(MAX_RELAY_PAYLOAD + 1));
     }
 
     #[test]
