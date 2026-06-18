@@ -64,8 +64,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/remote-agent" "$dist/"
           cp "target/${{ matrix.target }}/release/remote-agents-relay" "$dist/"
           tar -czf "$dist.tar.gz" "$dist"
-          # Raw single binary for the npm installer (downloaded at `npm install`).
+          # Raw single binary for the npm installer (downloaded at `npm install`),
+          # with a SHA-256 sidecar the installer verifies against.
           cp "target/${{ matrix.target }}/release/remote-agent" "remote-agent-${{ matrix.target }}"
+          sha256sum "remote-agent-${{ matrix.target }}" > "remote-agent-${{ matrix.target }}.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -76,7 +78,11 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" $dist
           Copy-Item "target/${{ matrix.target }}/release/remote-agents-relay.exe" $dist
           Compress-Archive -Path $dist -DestinationPath "$dist.zip"
-          Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" "remote-agent-${{ matrix.target }}.exe"
+          $bin = "remote-agent-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/remote-agent.exe" $bin
+          # SHA-256 sidecar (lowercase hex, two-space sha256sum format) for the installer.
+          $hash = (Get-FileHash $bin -Algorithm SHA256).Hash.ToLower()
+          "$hash  $bin" | Out-File -Encoding ascii -NoNewline "$bin.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
