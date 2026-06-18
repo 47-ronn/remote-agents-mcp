@@ -495,6 +495,18 @@ impl ConnectionPool {
 
         // WS path (fallback when no UDP channel, or the broadcast/tagged cases).
         if !sent_via_udp {
+            // The relay caps a WS frame at ~1 MiB; a too-large command (e.g.
+            // write_file of a multi-MB file, MapTask data) sent here would be
+            // silently dropped. Fail loudly — the only uncapped path is the
+            // direct UDP channel, which wasn't available for this send.
+            if crate::connection::relay_payload_too_large(envelope.len()) {
+                conn.pending.write().await.remove(&request_id);
+                bail!(
+                    "command too large for relay ({} bytes); no direct UDP channel \
+                     was available — use a smaller payload or write in chunks",
+                    envelope.len()
+                );
+            }
             if let Err(e) = conn
                 .tx
                 .send(ClientMessage::Command {
