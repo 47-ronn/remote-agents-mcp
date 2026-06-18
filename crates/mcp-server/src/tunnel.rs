@@ -54,13 +54,12 @@ impl TunnelStore {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .context("spawn cloudflared (is it executable?)")?;
 
-        let url = wait_for_url(&log, child.id());
-        match url {
-            Some(public_url) => {
+        match wait_for_url(&mut child, &log) {
+            Ok(public_url) => {
                 let _ = std::fs::remove_file(&log); // captured; child keeps its fd
                 let info = TunnelInfo {
                     id,
@@ -74,11 +73,10 @@ impl TunnelStore {
                     .insert(info.id.clone(), Handle { info: info.clone(), child });
                 Ok(info)
             }
-            None => {
-                let mut child = child;
+            Err(msg) => {
                 kill_reap(&mut child);
                 let _ = std::fs::remove_file(&log);
-                bail!("cloudflared did not report a tunnel URL within {URL_TIMEOUT:?}");
+                bail!("{msg}");
             }
         }
     }
@@ -142,18 +140,54 @@ impl Drop for TunnelStore {
     }
 }
 
-/// Poll the cloudflared log for the public URL until it appears or we time out.
-fn wait_for_url(log: &Path, _pid: u32) -> Option<String> {
+/// Wait for cloudflared to print its public URL. Returns the URL, or an error
+/// message — surfacing an early process exit (with the log tail) right away so a
+/// bad binary / edge-connection failure reports the real cause instead of a
+/// generic timeout after the full window.
+fn wait_for_url(child: &mut Child, log: &Path) -> std::result::Result<String, String> {
     let deadline = Instant::now() + URL_TIMEOUT;
     loop {
         if let Some(url) = std::fs::read_to_string(log).ok().and_then(|s| parse_tunnel_url(&s)) {
-            return Some(url);
+            return Ok(url);
+        }
+        // cloudflared exited before opening a tunnel → report its error now.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "cloudflared exited ({status}) before opening a tunnel: {}",
+                log_tail(log)
+            ));
         }
         if Instant::now() >= deadline {
-            return None;
+            return Err(format!(
+                "cloudflared did not report a tunnel URL within {URL_TIMEOUT:?}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// The last few log lines (char-safe, bounded) for error context.
+fn log_tail(log: &Path) -> String {
+    let s = std::fs::read_to_string(log).unwrap_or_default();
+    let joined = s
+        .lines()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let joined = joined.trim();
+    // Keep the tail bounded without slicing through a UTF-8 boundary.
+    joined
+        .chars()
+        .rev()
+        .take(400)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 /// Extract the `https://<sub>.trycloudflare.com` URL cloudflared prints to its
@@ -362,6 +396,39 @@ mod tests {
         assert_eq!(parse_tunnel_url("INF starting cloudflared\n"), None);
         // A non-trycloudflare https URL is ignored.
         assert_eq!(parse_tunnel_url("see https://example.com for docs"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_url_surfaces_early_exit() {
+        // cloudflared crashing before it prints a URL → fast, informative error
+        // (with the log tail), not a 30s generic timeout.
+        let log = std::env::temp_dir().join(format!("ra-tun-exit-{}.log", std::process::id()));
+        let logfile = std::fs::File::create(&log).unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "echo 'failed to connect to the edge' >&2; exit 1"])
+            .stdout(Stdio::null())
+            .stderr(logfile)
+            .spawn()
+            .expect("spawn sh");
+        let res = wait_for_url(&mut child, &log);
+        std::fs::remove_file(&log).ok();
+        let err = res.expect_err("should error on early exit");
+        assert!(err.contains("exited"), "got: {err}");
+        assert!(err.contains("failed to connect to the edge"), "tail missing: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_url_returns_parsed_url_while_running() {
+        let log = std::env::temp_dir().join(format!("ra-tun-url-{}.log", std::process::id()));
+        std::fs::write(&log, "INF |  https://abc-def.trycloudflare.com  |\n").unwrap();
+        let mut child = Command::new("sleep").arg("5").spawn().expect("spawn sleep");
+        let res = wait_for_url(&mut child, &log);
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::remove_file(&log).ok();
+        assert_eq!(res.unwrap(), "https://abc-def.trycloudflare.com");
     }
 
     #[cfg(unix)]
