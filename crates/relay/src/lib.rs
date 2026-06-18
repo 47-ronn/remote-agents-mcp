@@ -100,8 +100,11 @@ async fn room_info(
     Path(room): Path<String>,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
-    let (agents, mcp): (Vec<_>, usize) = match state.rooms.get(&room) {
-        Some(r) => (r.agents.iter().map(|e| e.info.clone()).collect(), r.mcp.len()),
+    // Dedup to one entry per machine (a host with several terminals is one
+    // logical peer), carrying the relay-computed `connections` count — matching
+    // the worker's `/info` so panels behave the same on either relay.
+    let (agents, mcp) = match state.rooms.get(&room) {
+        Some(r) => (crate::routing::dedup_agents(r.value()), r.mcp.len()),
         None => (Vec::new(), 0),
     };
     Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp }))

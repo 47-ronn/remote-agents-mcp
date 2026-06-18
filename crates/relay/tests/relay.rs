@@ -311,12 +311,22 @@ async fn room_info_reports_connected_agents() {
     assert!(body.contains("\"agents\":[]"), "body: {body}");
     assert!(body.contains("\"mcp_clients\":0"));
 
-    // After an agent joins it shows up in the room info.
+    // After an agent joins it shows up in the room info, with its connection count.
     let mut agent = connect(port, "dev").await;
     auth(&mut agent, Some(agent_info("a1", &["backend"]))).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (_status, body) = http_get(port, "/api/room/dev").await;
     assert!(body.contains("\"id\":\"a1\""), "body: {body}");
+    assert!(body.contains("\"connections\":1"), "body: {body}");
+
+    // A second socket of the SAME machine collapses to one entry (matching the
+    // worker's deduped /info) and the count rises to 2.
+    let mut agent_dup = connect(port, "dev").await;
+    auth(&mut agent_dup, Some(agent_info("a1", &["backend"]))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (_status, body) = http_get(port, "/api/room/dev").await;
+    assert_eq!(body.matches("\"id\":\"a1\"").count(), 1, "deduped to one entry: {body}");
+    assert!(body.contains("\"connections\":2"), "body: {body}");
 }
 
 /// The relay reflects the client's observed IP via `YourEndpoint` (so peers can
