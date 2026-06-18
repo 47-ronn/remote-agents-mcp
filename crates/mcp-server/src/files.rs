@@ -117,26 +117,25 @@ pub fn thumbnail(path: &str, max_px: u32, sec: &SecurityConfig) -> Result<(Strin
     Ok((data, w, h))
 }
 
-/// Default search roots: configured `search_roots`, else home + common dirs.
+/// Default search roots: configured `search_roots`, else the whole home dir.
+/// (Searching only Pictures/Documents/… missed everything else — e.g. a project
+/// folder like `~/web_biz` — so a plain "find this file" came up empty. Heavy
+/// dirs are pruned in `search` to keep `find` within the timeout.)
 fn default_roots(sec: &SecurityConfig) -> Vec<String> {
     if !sec.search_roots.is_empty() {
         return sec.search_roots.clone();
     }
-    let mut roots = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        for sub in ["Pictures", "Documents", "Downloads", "Desktop"] {
-            let p = home.join(sub);
-            if p.is_dir() {
-                roots.push(p.to_string_lossy().to_string());
-            }
-        }
-        // Fall back to the whole home dir if none of the common subdirs exist.
-        if roots.is_empty() {
-            roots.push(home.to_string_lossy().to_string());
-        }
-    }
-    roots
+    dirs::home_dir()
+        .map(|h| vec![h.to_string_lossy().to_string()])
+        .unwrap_or_default()
 }
+
+/// Directory names pruned from `find` traversal: huge and rarely the target, so
+/// skipping them keeps a home-wide search fast (esp. macOS `~/Library`).
+const PRUNE_DIRS: &[&str] = &[
+    "node_modules", ".git", "Library", ".cache", "Caches", ".cargo", ".rustup",
+    ".npm", ".pnpm-store", "venv", ".venv", "__pycache__", ".Trash", "target",
+];
 
 /// Run a search program, collecting up to `max` newline-separated paths from its
 /// stdout. Stops on any of: enough results, the program finishing, or `timeout`
@@ -232,12 +231,27 @@ pub fn search(
     let timeout = Duration::from_secs(sec.search_timeout_secs);
     let paths = match kind {
         SearchKind::Name | SearchKind::Image => {
-            // find <roots...> -type f -iname '*query*'
+            // find <roots...> ( -name node_modules -o … ) -prune -o -type f
+            //   -iname '*query*' -print
+            // The prune group skips heavy dirs; the trailing -print is required
+            // once -prune/-o are in play (else pruned dirs would be printed too).
             let mut args: Vec<String> = roots.clone();
+            args.push("(".into());
+            for (i, d) in PRUNE_DIRS.iter().enumerate() {
+                if i > 0 {
+                    args.push("-o".into());
+                }
+                args.push("-name".into());
+                args.push((*d).to_string());
+            }
+            args.push(")".into());
+            args.push("-prune".into());
+            args.push("-o".into());
             args.push("-type".into());
             args.push("f".into());
             args.push("-iname".into());
             args.push(format!("*{query}*"));
+            args.push("-print".into());
             run_collecting("find", &args, max * 2, timeout)?
         }
         SearchKind::Content => {
@@ -341,6 +355,24 @@ mod tests {
         let imgs = search(&roots, "vacation", SearchKind::Image, &sec()).unwrap();
         assert!(imgs.iter().all(|h| h.is_image));
         assert!(imgs.iter().any(|h| h.path.ends_with("vacation-photo.jpg")));
+    }
+
+    #[test]
+    fn search_finds_nested_files_but_prunes_heavy_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file in a normal project subdir must be found (the case that the
+        // old Pictures/Documents-only default roots missed).
+        std::fs::create_dir_all(dir.path().join("web_biz")).unwrap();
+        std::fs::write(dir.path().join("web_biz/founders-playbook-ru.md"), b"x").unwrap();
+        // A same-named file inside a pruned dir must NOT be returned.
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/founders-playbook-ru.md"), b"y").unwrap();
+        let roots = vec![dir.path().to_string_lossy().to_string()];
+
+        let hits = search(&roots, "founders-playbook", SearchKind::Name, &sec()).unwrap();
+        assert_eq!(hits.len(), 1, "exactly the non-pruned match: {hits:?}");
+        assert!(hits[0].path.ends_with("web_biz/founders-playbook-ru.md"));
+        assert!(!hits[0].path.contains("node_modules"));
     }
 
     #[test]
