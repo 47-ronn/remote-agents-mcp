@@ -17,7 +17,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn start_relay() -> u16 {
-    let state = Arc::new(RelayState::new(None));
+    start_relay_with(Arc::new(RelayState::new(None))).await
+}
+
+async fn start_relay_with(state: Arc<RelayState>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -719,4 +722,55 @@ async fn duplicate_connections_merge_capabilities_and_route_to_capable() {
         try_recv(&mut plain, 400).await.is_none(),
         "non-autonomous connection must not receive the Agent-targeted command"
     );
+}
+
+// A connection that sends nothing past the idle window is reaped (its socket is
+// closed by the server), so a silently-dead TCP can't linger as a phantom.
+#[tokio::test]
+async fn idle_connection_is_reaped() {
+    let state = Arc::new(RelayState::new(None).with_idle_timeout(Duration::from_millis(300)));
+    let port = start_relay_with(state).await;
+
+    let mut agent = connect(port, "dev").await;
+    auth(&mut agent, Some(agent_info("idle1", &[]))).await;
+
+    // Send nothing. Within ~idle_timeout the server closes the socket; the
+    // client stream then ends (None) or yields a Close frame.
+    let reaped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match agent.next().await {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break true,
+                Some(Ok(_)) => continue, // ignore agent_list / your_endpoint etc.
+            }
+        }
+    })
+    .await
+    .expect("connection was not reaped within 2s");
+    assert!(reaped);
+}
+
+// A connection that keeps sending stays alive well past the idle window.
+#[tokio::test]
+async fn active_connection_survives_idle_window() {
+    let state = Arc::new(RelayState::new(None).with_idle_timeout(Duration::from_millis(300)));
+    let port = start_relay_with(state).await;
+
+    let mut agent = connect(port, "dev").await;
+    auth(&mut agent, Some(agent_info("live1", &[]))).await;
+    // Consume the initial peer list the agent gets on joining the room.
+    match recv(&mut agent).await {
+        ServerMessage::AgentList { .. } => {}
+        other => panic!("expected initial agent_list, got {:?}", other),
+    }
+
+    // Ping every 100ms across ~5 idle windows; the server must answer each pong
+    // and never close us.
+    for _ in 0..5 {
+        send(&mut agent, &ClientMessage::Ping).await;
+        match recv(&mut agent).await {
+            ServerMessage::Pong => {}
+            other => panic!("expected pong, got {:?}", other),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

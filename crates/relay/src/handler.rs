@@ -153,21 +153,29 @@ pub async fn handle_socket(
     }
 
     // --- 4. Reader loop -----------------------------------------------------
+    // A frame must arrive within `idle_timeout` (agents ping every 30s, the
+    // panel polls every ~5s). If none does, the TCP died silently (no close
+    // frame) — reap the connection so it doesn't linger as a phantom session.
+    let idle_timeout = state.idle_timeout;
     loop {
         tokio::select! {
-            incoming = stream.next() => {
+            incoming = tokio::time::timeout(idle_timeout, stream.next()) => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
+                    Err(_elapsed) => {
+                        debug!("idle timeout, reaping session {}", session_id);
+                        break;
+                    }
+                    Ok(Some(Ok(Message::Text(text)))) => {
                         if handle_client_msg(&text, &room, &session_id, &agent_info, &tx)
                             .is_break()
                         {
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                    Ok(Some(Err(_))) => break,
                     // Control frames (ping/pong/binary) are unused by our protocol.
-                    _ => {}
+                    Ok(_) => {}
                 }
             }
             _ = &mut writer => break, // peer's read half gone
