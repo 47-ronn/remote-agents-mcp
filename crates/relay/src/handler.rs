@@ -433,3 +433,243 @@ mod tests {
         assert!(auth_ok(&s, None, "")); // absent query == empty auth
     }
 }
+
+/// Routing tests for `handle_client_msg`: drive the dispatch path directly with
+/// in-memory `Room`s and mpsc channels (no real WebSocket), asserting which
+/// connection each message lands on. This is the relay's core fan-out/route-back
+/// logic, security-relevant and previously only covered indirectly via routing.rs.
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use crate::state::{AgentSession, McpSession, Room};
+    use remote_agents_shared::{AgentEvent, AgentInfo, AgentMode, Target, TaskStatus};
+    use tokio::sync::mpsc::{self, Receiver};
+
+    fn info(id: &str, session: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.into(),
+            name: "n".into(),
+            mode: AgentMode::Edit,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            hostname: "h".into(),
+            tags: vec![],
+            platform: Default::default(),
+            autonomous: false,
+            accepts_commands: true,
+            connected_at: 0,
+            session_id: Some(session.into()),
+            version: String::new(),
+            update_available: None,
+            connections: None,
+        }
+    }
+
+    fn chan() -> (Tx, Receiver<String>) {
+        mpsc::channel(OUTBOUND_CAP)
+    }
+
+    fn add_agent(room: &Room, session_id: &str, id: &str) -> Receiver<String> {
+        let (tx, rx) = chan();
+        room.agents
+            .insert(session_id.into(), AgentSession { info: info(id, session_id), tx });
+        rx
+    }
+
+    fn add_mcp(room: &Room, session_id: &str) -> Receiver<String> {
+        let (tx, rx) = chan();
+        room.mcp
+            .insert(session_id.into(), McpSession { id: session_id.into(), tx });
+        rx
+    }
+
+    /// Pop the next frame off a connection's outbound queue, parsed.
+    fn next(rx: &mut Receiver<String>) -> Option<ServerMessage> {
+        rx.try_recv().ok().and_then(|j| ServerMessage::from_json(&j).ok())
+    }
+
+    fn dispatch(
+        room: &Room,
+        session_id: &str,
+        agent: &Option<Box<AgentInfo>>,
+        self_tx: &Tx,
+        msg: ClientMessage,
+    ) -> ControlFlow<()> {
+        handle_client_msg(&msg.to_json().unwrap(), room, session_id, agent, self_tx)
+    }
+
+    #[test]
+    fn command_to_all_fans_out_to_agents_and_records_pending() {
+        let room = Room::default();
+        let mut a1 = add_agent(&room, "s-a1", "agentA");
+        let mut a2 = add_agent(&room, "s-a2", "agentB");
+        let (self_tx, _self_rx) = chan(); // an MCP/panel origin (anonymous)
+
+        let flow = dispatch(
+            &room,
+            "origin-sess",
+            &None,
+            &self_tx,
+            ClientMessage::Command {
+                request_id: "req1".into(),
+                target: Target::All,
+                payload: "ENC".into(),
+            },
+        );
+        assert!(flow.is_continue());
+
+        for rx in [&mut a1, &mut a2] {
+            match next(rx) {
+                Some(ServerMessage::Command { request_id, payload, from_session }) => {
+                    assert_eq!(request_id, "req1");
+                    assert_eq!(payload, "ENC");
+                    assert_eq!(from_session, "origin-sess");
+                }
+                other => panic!("each agent should receive the Command, got {other:?}"),
+            }
+        }
+        // Origin recorded so replies route back to it specifically.
+        assert_eq!(
+            room.pending.get("req1").map(|e| e.value().clone()),
+            Some("origin-sess".to_string())
+        );
+    }
+
+    #[test]
+    fn command_with_no_matching_target_errors_back_to_sender_only() {
+        let room = Room::default(); // no agents at all
+        let (self_tx, mut self_rx) = chan();
+
+        let _ = dispatch(
+            &room,
+            "origin",
+            &None,
+            &self_tx,
+            ClientMessage::Command {
+                request_id: "req2".into(),
+                target: Target::Agent { id: "ghost".into() },
+                payload: "X".into(),
+            },
+        );
+
+        match next(&mut self_rx) {
+            Some(ServerMessage::CommandError { request_id, error, .. }) => {
+                assert_eq!(request_id, "req2");
+                assert!(error.contains("No matching"), "got: {error}");
+            }
+            other => panic!("sender should get CommandError, got {other:?}"),
+        }
+        // Nothing was dispatched, so nothing is pending.
+        assert!(room.pending.is_empty());
+    }
+
+    #[test]
+    fn command_result_routes_to_origin_only_not_other_observers() {
+        let room = Room::default();
+        let mut origin = add_mcp(&room, "origin-sess");
+        let mut observer = add_mcp(&room, "observer-sess");
+        room.pending.insert("req3".into(), "origin-sess".into());
+
+        let agent = Some(Box::new(info("agentA", "s-a1")));
+        let (atx, _arx) = chan();
+        let _ = dispatch(
+            &room,
+            "s-a1",
+            &agent,
+            &atx,
+            ClientMessage::CommandResult { request_id: "req3".into(), result: "RES".into() },
+        );
+
+        match next(&mut origin) {
+            Some(ServerMessage::CommandResult { request_id, agent_id, result }) => {
+                assert_eq!(request_id, "req3");
+                assert_eq!(agent_id, "agentA");
+                assert_eq!(result, "RES");
+            }
+            other => panic!("origin should receive its result, got {other:?}"),
+        }
+        assert!(
+            next(&mut observer).is_none(),
+            "a targeted result must NOT reach unrelated observers"
+        );
+        // pending is intentionally kept so further (broadcast) replies still route.
+        assert!(room.pending.contains_key("req3"));
+    }
+
+    #[test]
+    fn command_result_with_unknown_request_falls_back_to_mcp_broadcast() {
+        let room = Room::default();
+        let mut o1 = add_mcp(&room, "m1");
+        let mut o2 = add_mcp(&room, "m2");
+        // No pending entry for req4: origin unknown (late/duplicate) → broadcast.
+        let agent = Some(Box::new(info("agentA", "s-a1")));
+        let (atx, _arx) = chan();
+        let _ = dispatch(
+            &room,
+            "s-a1",
+            &agent,
+            &atx,
+            ClientMessage::CommandError { request_id: "req4".into(), error: "boom".into() },
+        );
+
+        for rx in [&mut o1, &mut o2] {
+            match next(rx) {
+                Some(ServerMessage::CommandError { request_id, agent_id, error }) => {
+                    assert_eq!(request_id, "req4");
+                    assert_eq!(agent_id, "agentA");
+                    assert_eq!(error, "boom");
+                }
+                other => panic!("unknown-origin reply should broadcast to MCP, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn notify_broadcasts_event_to_mcp_observers_with_agent_id() {
+        let room = Room::default();
+        let mut o1 = add_mcp(&room, "m1");
+        let agent = Some(Box::new(info("agentA", "s-a1")));
+        let (atx, _arx) = chan();
+        let _ = dispatch(
+            &room,
+            "s-a1",
+            &agent,
+            &atx,
+            ClientMessage::Notify {
+                event: AgentEvent::TaskCompleted {
+                    task_id: "t1".into(),
+                    status: TaskStatus::Done,
+                },
+            },
+        );
+        match next(&mut o1) {
+            Some(ServerMessage::Event { agent_id, .. }) => assert_eq!(agent_id, "agentA"),
+            other => panic!("expected Event broadcast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_replies_pong_to_sender() {
+        let room = Room::default();
+        let (self_tx, mut self_rx) = chan();
+        let flow = dispatch(&room, "s", &None, &self_tx, ClientMessage::Ping);
+        assert!(flow.is_continue());
+        assert!(matches!(next(&mut self_rx), Some(ServerMessage::Pong)));
+    }
+
+    #[test]
+    fn close_message_breaks_the_loop() {
+        let room = Room::default();
+        let (self_tx, _rx) = chan();
+        assert!(dispatch(&room, "s", &None, &self_tx, ClientMessage::Close).is_break());
+    }
+
+    #[test]
+    fn unparseable_message_is_ignored_without_reply() {
+        let room = Room::default();
+        let (self_tx, mut rx) = chan();
+        let flow = handle_client_msg("{ not valid json", &room, "s", &None, &self_tx);
+        assert!(flow.is_continue());
+        assert!(next(&mut rx).is_none());
+    }
+}
