@@ -149,6 +149,10 @@ impl AutonomousStore {
         cmd.args(&runner[1..]);
         cmd.arg(prompt); // prompt appended as the final argument
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Kill the AI process if the `output()` future is dropped (i.e. on the
+        // timeout below) — otherwise an expensive `claude -p`/`opencode` run is
+        // orphaned and keeps running after the task is marked timed-out.
+        cmd.kill_on_drop(true);
         if let Some(dir) = &self.config.workdir {
             cmd.current_dir(dir);
         } else if let Some(home) = dirs::home_dir() {
@@ -377,6 +381,35 @@ mod tests {
         store_runner(enabled, vec!["echo"]).0
     }
 
+    #[cfg(unix)]
+    fn store_runner_timeout(runner: Vec<&str>, timeout: u64) -> Arc<AutonomousStore> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(10_000);
+        let path = std::env::temp_dir().join(format!(
+            "auto-to-{}-{}.db",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let cfg = AutonomousConfig {
+            enabled: Some(true),
+            runner: runner.into_iter().map(String::from).collect(),
+            timeout,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Arc::new(AutonomousStore::load(path, cfg, tx))
+    }
+
+    #[cfg(unix)]
+    fn pgrep(pattern: &str) -> bool {
+        std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(pattern)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     /// Poll a task to a terminal state (Done/Failed) or panic after ~1s.
     async fn await_terminal(s: &Arc<AutonomousStore>, id: &str) -> AutonomousTask {
         for _ in 0..50 {
@@ -387,6 +420,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("task {id} did not finish in time");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_task_kills_its_runner_process() {
+        // `exec sleep <unique>` so the spawned child IS the sleeper (kill_on_drop
+        // reaps the direct child) and a distinctive duration lets pgrep find it.
+        // The prompt is appended as sh's $0 and ignored.
+        let marker = "sleep 91.37";
+        let s = store_runner_timeout(vec!["sh", "-c", "exec sleep 91.37"], 1);
+        let id = s.dispatch("ignored", None).unwrap();
+
+        // It should be running before the 1s timeout fires.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(pgrep(marker), "runner should be running");
+
+        // Poll past the 1s timeout for the terminal state.
+        let mut task = None;
+        for _ in 0..150 {
+            let t = s.get(&id).unwrap().unwrap();
+            if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
+                task = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let task = task.expect("task did not reach a terminal state");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.error.unwrap_or_default().contains("timed out"));
+
+        // The timed-out process must be killed, not orphaned.
+        for _ in 0..25 {
+            if !pgrep(marker) {
+                return; // killed — pass
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        panic!("timed-out runner was left running (not killed)");
     }
 
     #[tokio::test]
