@@ -120,6 +120,7 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 session_id: None,
                 update_available: crate::config::update_available(),
+                connections: None,
             };
 
             Ok(CommandResult::Info { info })

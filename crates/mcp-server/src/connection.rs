@@ -406,6 +406,7 @@ async fn handle_server_message(
             state.set_peers(agents).await;
         }
         ServerMessage::AgentJoined { agent } => {
+            let agent = *agent; // unbox (the wire variant is boxed)
             debug!("Peer joined: {} ({})", agent.name, agent.id);
             state.upsert_peer(agent).await;
         }
@@ -656,6 +657,8 @@ pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::Agen
         session_id: None,
         // Surfaced from the launcher's cached npm-registry check.
         update_available: crate::config::update_available(),
+        // Relay-computed; an agent never advertises its own connection count.
+        connections: None,
     }
 }
 
@@ -816,7 +819,7 @@ mod tests {
             accepts_commands: true,
             connected_at: 0,
             session_id: None,
-            version: String::new(), update_available: None,
+            version: String::new(), update_available: None, connections: None,
         };
         peer_a.platform.distro = Some("Ubuntu 22.04".into());
 
@@ -834,7 +837,7 @@ mod tests {
 
         // A second peer joins.
         let peer_b = remote_agents_shared::AgentInfo { id: "b".into(), name: "beta".into(), ..peer_a.clone() };
-        deliver(&state, &ServerMessage::AgentJoined { agent: peer_b }).await;
+        deliver(&state, &ServerMessage::AgentJoined { agent: Box::new(peer_b) }).await;
         assert_eq!(state.peers().await.len(), 2);
 
         // First peer leaves.

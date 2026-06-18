@@ -20,8 +20,10 @@ fn score(info: &AgentInfo) -> u8 {
 /// connection's metadata (session_id/platform) with the merged flags applied.
 pub fn dedup_agents(room: &Room) -> Vec<AgentInfo> {
     let mut by_id: HashMap<String, AgentInfo> = HashMap::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for e in room.agents.iter() {
         let info = &e.value().info;
+        *counts.entry(info.id.clone()).or_insert(0) += 1;
         match by_id.get_mut(&info.id) {
             None => {
                 by_id.insert(info.id.clone(), info.clone());
@@ -36,6 +38,11 @@ pub fn dedup_agents(room: &Room) -> Vec<AgentInfo> {
                 rep.accepts_commands = accepts;
             }
         }
+    }
+    // Surface how many sockets share each machine's agent-id (>1 = duplicates,
+    // possibly a wrong-keyed socket that can hijack routing → the panel warns).
+    for (id, rep) in by_id.iter_mut() {
+        rep.connections = counts.get(id).copied();
     }
     by_id.into_values().collect()
 }
@@ -148,7 +155,7 @@ mod tests {
                 accepts_commands: true,
                 connected_at: 0,
                 session_id: None,
-                version: String::new(), update_available: None,
+                version: String::new(), update_available: None, connections: None,
             },
             tx,
         }
@@ -307,6 +314,26 @@ mod tests {
 
         // Broadcast (All) also collapses the machine to one delivery.
         assert_eq!(resolve_targets(&r, &Target::All).len(), 1, "one delivery per machine");
+    }
+
+    #[test]
+    fn dedup_reports_connection_count_per_machine() {
+        // Three sockets share id "dup"; "solo" has one. dedup surfaces the count
+        // so the panel can warn about duplicate sockets (>1 = possible key/
+        // version conflict where a wrong-keyed socket hijacks routing).
+        let r = Room::default();
+        for (i, sid) in ["s1", "s2", "s3"].iter().enumerate() {
+            let (s, _rx) = sess("dup", sid, i == 0, true);
+            r.agents.insert(sid.to_string(), s);
+        }
+        let (solo, _rx) = sess("solo", "s9", false, true);
+        r.agents.insert("s9".into(), solo);
+
+        let merged = dedup_agents(&r);
+        let dup = merged.iter().find(|a| a.id == "dup").unwrap();
+        let solo = merged.iter().find(|a| a.id == "solo").unwrap();
+        assert_eq!(dup.connections, Some(3));
+        assert_eq!(solo.connections, Some(1));
     }
 
     #[test]

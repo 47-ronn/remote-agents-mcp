@@ -162,6 +162,12 @@ pub struct AgentInfo {
     /// running binary, so orchestrators can flag stale hosts in `list_agents`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_available: Option<String>,
+    /// Relay-computed: number of live connections sharing this machine's
+    /// agent-id. `>1` flags duplicate sockets (a wrong-keyed one can hijack
+    /// routing), so the panel can warn. Set by the relay's `dedup_agents`, never
+    /// sent by an agent (always `None` on the wire from a host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
 }
 
 /// Metadata for one AI-provider conversation stored on a host (claude /
