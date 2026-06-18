@@ -24,11 +24,10 @@ const HARD_DENIED: &[&str] = &[
     "> /dev/sdb",
 ];
 
-/// Read-only `git` subcommands permitted in Plan mode.
-const GIT_RO: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "remote", "ls-files", "ls-tree",
-    "rev-parse", "describe", "blame", "tag", "shortlog", "reflog", "cat-file",
-    "config", "whatchanged", "grep",
+/// `git` subcommands that only ever read — safe in Plan mode regardless of args.
+const GIT_PURE_RO: &[&str] = &[
+    "status", "log", "diff", "show", "ls-files", "ls-tree", "rev-parse",
+    "describe", "blame", "shortlog", "cat-file", "whatchanged", "grep",
 ];
 
 /// Read-only `cargo` subcommands permitted in Plan mode.
@@ -148,11 +147,16 @@ fn is_readonly_segment(segment: &str, sec: &SecurityConfig) -> bool {
         return false;
     }
 
+    // Everything after the program name (for arg-aware subcommand checks).
+    let rest: Vec<&str> = tokens.collect();
     // Tools that can both read and write require a read-only subcommand.
     // The subcommand is the first non-flag token after the program.
-    let sub = tokens.find(|t| !t.starts_with('-')).map(basename);
+    let sub = rest.iter().find(|t| !t.starts_with('-')).map(|t| basename(t));
     match prog {
-        "git" => matches!(sub, Some(s) if GIT_RO.contains(&s)),
+        // `git`'s dual-use subcommands (branch/tag/config/remote/reflog) WRITE
+        // when given arguments, so they need arg-aware inspection, not a flat
+        // subcommand whitelist.
+        "git" => git_is_readonly(&rest),
         "cargo" => sub.is_none_or(|s| CARGO_RO.contains(&s)),
         "npm" => matches!(sub, Some(s) if NPM_RO.contains(&s)),
         // Whitelisted, but each can write or run other commands via specific
@@ -162,6 +166,87 @@ fn is_readonly_segment(segment: &str, sec: &SecurityConfig) -> bool {
         "awk" | "gawk" | "mawk" => !segment.contains("system("),
         _ => true,
     }
+}
+
+/// Is this `git` invocation read-only? `rest` is every token after `git`.
+///
+/// Pure-read subcommands (`GIT_PURE_RO`) always pass. The dual-use ones —
+/// `branch`, `tag`, `config`, `remote`, `reflog` — only read in their
+/// listing/query form; with a write flag or a positional that names a new
+/// ref/value they mutate repo state, which Plan mode must reject. When a form is
+/// ambiguous we err toward rejection (Plan mode favors safety over convenience).
+fn git_is_readonly(rest: &[&str]) -> bool {
+    let Some(sub_pos) = rest.iter().position(|t| !t.starts_with('-')) else {
+        return false; // bare `git` / only flags — nothing to read, deny
+    };
+    let sub = basename(rest[sub_pos]);
+    let after = &rest[sub_pos + 1..]; // tokens following the subcommand
+
+    if GIT_PURE_RO.contains(&sub) {
+        return true;
+    }
+    match sub {
+        "branch" => git_branch_or_tag_ro(after, GIT_BRANCH_WRITE_FLAGS),
+        "tag" => git_branch_or_tag_ro(after, GIT_TAG_WRITE_FLAGS),
+        "config" => git_config_ro(after),
+        "remote" => git_remote_ro(after),
+        "reflog" => git_reflog_ro(after),
+        _ => false,
+    }
+}
+
+const GIT_BRANCH_WRITE_FLAGS: &[&str] = &[
+    "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+];
+const GIT_TAG_WRITE_FLAGS: &[&str] = &[
+    "-d", "--delete", "-a", "--annotate", "-s", "--sign", "-m", "--message",
+    "-F", "--file", "-e", "--edit", "-f", "--force",
+];
+
+/// `git branch` / `git tag`: read-only only when *listing* — no write flag and
+/// no positional (a positional names a ref to create).
+fn git_branch_or_tag_ro(after: &[&str], write_flags: &[&str]) -> bool {
+    let has_write_flag = after.iter().any(|t| write_flags.contains(t));
+    let has_positional = after.iter().any(|t| !t.starts_with('-'));
+    !has_write_flag && !has_positional
+}
+
+/// `git config`: reading a value (`--get`/`--list`/a single key) is fine;
+/// setting (`key value`, `--unset`, `--add`, …) is a write.
+fn git_config_ro(after: &[&str]) -> bool {
+    const WRITE: &[&str] = &[
+        "--unset", "--unset-all", "--add", "--replace-all", "--rename-section",
+        "--remove-section", "-e", "--edit",
+    ];
+    if after.iter().any(|t| WRITE.contains(t)) {
+        return false;
+    }
+    const READ: &[&str] = &[
+        "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l",
+        "--get-color", "--get-colorbool",
+    ];
+    if after.iter().any(|t| READ.contains(t)) {
+        return true;
+    }
+    // No explicit read/write flag: `git config key` reads, `git config key value`
+    // (two positionals) writes.
+    after.iter().filter(|t| !t.starts_with('-')).count() <= 1
+}
+
+/// `git remote`: bare/`-v`/`show`/`get-url` list; add/remove/rename/set-* mutate.
+fn git_remote_ro(after: &[&str]) -> bool {
+    matches!(
+        after.iter().find(|t| !t.starts_with('-')).map(|t| basename(t)),
+        None | Some("show") | Some("get-url")
+    )
+}
+
+/// `git reflog`: bare/`show`/`exists` read; `expire`/`delete` mutate.
+fn git_reflog_ro(after: &[&str]) -> bool {
+    matches!(
+        after.iter().find(|t| !t.starts_with('-')).map(|t| basename(t)),
+        None | Some("show") | Some("exists")
+    )
 }
 
 /// `find` action predicates that write files or run commands — disallowed in
@@ -304,6 +389,67 @@ mod tests {
 
         // Edit mode is unaffected.
         assert!(check_command_allowed("find /tmp -delete", AgentMode::Edit, &s).is_ok());
+    }
+
+    #[test]
+    fn plan_allows_git_readonly_forms() {
+        let s = sec();
+        for cmd in [
+            "git status",
+            "git log --oneline",
+            "git diff HEAD~1",
+            "git show",
+            "git grep needle",
+            "git branch",            // list
+            "git branch -a",         // list (read flag)
+            "git branch -v",
+            "git tag",               // list
+            "git tag -l",
+            "git config user.name",  // read a single key
+            "git config --get user.email",
+            "git config -l",
+            "git remote",            // list
+            "git remote -v",
+            "git remote show origin",
+            "git reflog",
+            "git reflog show",
+        ] {
+            assert!(
+                check_command_allowed(cmd, AgentMode::Plan, &s).is_ok(),
+                "Plan mode should ALLOW read-only git: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_blocks_git_dual_use_writes() {
+        // These all mutate repo state despite living under a once-"read-only"
+        // subcommand — Plan mode must reject them.
+        let s = sec();
+        for cmd in [
+            "git branch newfeature",         // create branch
+            "git branch -d old",             // delete branch
+            "git branch -m a b",             // rename branch
+            "git tag v1.0",                  // create tag
+            "git tag -d v1.0",               // delete tag
+            "git tag -a v1 -m msg",          // create annotated tag
+            "git config user.email evil@x",  // set config
+            "git config --global user.name Bad",
+            "git config --unset user.name",
+            "git remote add origin http://x",
+            "git remote remove origin",
+            "git remote set-url origin http://y",
+            "git reflog delete HEAD@{0}",
+            "git reflog expire --all",
+        ] {
+            assert!(
+                check_command_allowed(cmd, AgentMode::Plan, &s).is_err(),
+                "Plan mode should BLOCK git write: {cmd}"
+            );
+        }
+        // Edit mode is unaffected by the read-only tightening.
+        assert!(check_command_allowed("git branch newfeature", AgentMode::Edit, &s).is_ok());
+        assert!(check_command_allowed("git tag v1.0", AgentMode::Edit, &s).is_ok());
     }
 
     #[test]
