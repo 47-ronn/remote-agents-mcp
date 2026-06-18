@@ -24,6 +24,12 @@ struct Cli {
     /// must equal it. Omit for Cloudflare-parity (token from query string).
     #[arg(long)]
     token: Option<String>,
+
+    /// Close a connection idle (no frame received) for this many seconds.
+    /// Agents ping every 30s, so the default reaps a silently-dead TCP after
+    /// three missed pings. Set 0 to disable (rely on TCP keepalive instead).
+    #[arg(long, default_value_t = 90)]
+    idle_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -43,10 +49,13 @@ async fn main() -> anyhow::Result<()> {
              E2E encryption still protects payloads. Use --token in production."
         );
     }
-    let state = Arc::new(RelayState::new(cli.token));
+    let state = Arc::new(RelayState::new(cli.token).with_idle_timeout_secs(cli.idle_timeout_secs));
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
-    info!("relay listening on ws://{}/ws/room/:room", cli.bind);
+    info!(
+        "relay listening on ws://{}/ws/room/:room (idle reap {}s)",
+        cli.bind, cli.idle_timeout_secs
+    );
     axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),

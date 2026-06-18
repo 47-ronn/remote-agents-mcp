@@ -74,6 +74,15 @@ impl RelayState {
         self
     }
 
+    /// Set the idle window from a seconds value. `0` disables reaping (the
+    /// window becomes effectively infinite), for operators who'd rather rely on
+    /// TCP keepalive / a load balancer.
+    pub fn with_idle_timeout_secs(self, secs: u64) -> Self {
+        // tokio timers accept large durations; ~136 years is "never" in practice.
+        let d = std::time::Duration::from_secs(if secs == 0 { u32::MAX as u64 } else { secs });
+        self.with_idle_timeout(d)
+    }
+
     /// Get or create a room by name.
     pub fn room(&self, name: &str) -> Arc<Room> {
         self.rooms
@@ -124,6 +133,22 @@ mod tests {
                 tx: dummy_tx(),
             },
         );
+    }
+
+    #[test]
+    fn idle_timeout_secs_maps_value_and_disables_on_zero() {
+        use std::time::Duration;
+        assert_eq!(
+            RelayState::new(None).with_idle_timeout_secs(45).idle_timeout,
+            Duration::from_secs(45)
+        );
+        // 0 → effectively never (far larger than any real ping gap).
+        assert!(
+            RelayState::new(None).with_idle_timeout_secs(0).idle_timeout
+                >= Duration::from_secs(u32::MAX as u64)
+        );
+        // Default constructor keeps the 90s window.
+        assert_eq!(RelayState::new(None).idle_timeout, Duration::from_secs(90));
     }
 
     #[test]
