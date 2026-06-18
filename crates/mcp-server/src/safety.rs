@@ -48,6 +48,13 @@ pub fn default_readonly_commands() -> Vec<String> {
         "ip", "ifconfig", "netstat", "ss", "dig", "nslookup", "ping", "top",
         "htop", "lsblk", "lscpu", "lsof", "jq", "yq", "md5sum", "sha256sum",
         "git", "cargo", "npm",
+        // More read-only text/inspection/system tools (iter125):
+        "tac", "rev", "comm", "paste", "join", "fold", "fmt", "expand",
+        "unexpand", "numfmt", "seq", "factor", "look", "xxd", "hexdump", "od",
+        "strings", "base64", "base32", "cksum", "sha1sum", "sha512sum", "b2sum",
+        "pgrep", "pidof", "nproc", "arch", "getconf", "locale", "tty", "groups",
+        "who", "w", "host", "whois", "lsmod", "lspci", "lsusb", "findmnt",
+        "getent", "ldd", "readelf", "nm", "objdump", "cal", "whatis", "apropos",
     ]
     .iter()
     .map(|s| s.to_string())

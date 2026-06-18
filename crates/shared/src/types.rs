@@ -269,6 +269,20 @@ pub struct TransferStatus {
     pub error: Option<String>,
 }
 
+/// A Cloudflare quick tunnel exposing one of this host's local addresses at a
+/// public `*.trycloudflare.com` URL (dev convenience; started via `cloudflared`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelInfo {
+    /// Stable id used to stop the tunnel.
+    pub id: String,
+    /// Local address being exposed (e.g. `http://localhost:3000`).
+    pub target: String,
+    /// Public URL (e.g. `https://foo-bar.trycloudflare.com`).
+    pub public_url: String,
+    /// `running` | `stopped` | `failed`.
+    pub status: String,
+}
+
 /// Lifecycle status of an autonomous task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

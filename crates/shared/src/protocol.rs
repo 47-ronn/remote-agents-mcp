@@ -273,6 +273,20 @@ pub enum Command {
         id: String,
     },
 
+    // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
+    /// Start a Cloudflare quick tunnel to a local address (e.g.
+    /// `http://localhost:3000`, or a bare port). Downloads `cloudflared` on
+    /// demand. Returns the public `*.trycloudflare.com` URL. Requires edit/bypass.
+    TunnelStart {
+        target: String,
+    },
+    /// List this host's running quick tunnels.
+    TunnelList,
+    /// Stop a running quick tunnel by id.
+    TunnelStop {
+        id: String,
+    },
+
     /// Change agent mode
     SetMode {
         mode: AgentMode,
@@ -511,6 +525,16 @@ pub enum CommandResult {
     /// Progress/status of a host↔host transfer (response to `TransferGet`).
     Transfer {
         status: TransferStatus,
+    },
+
+    /// A Cloudflare quick tunnel was started (carries its public URL).
+    TunnelStarted {
+        tunnel: TunnelInfo,
+    },
+
+    /// All running quick tunnels on this host.
+    TunnelList {
+        tunnels: Vec<TunnelInfo>,
     },
 
     // === AI-provider sessions ===

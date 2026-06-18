@@ -238,6 +238,34 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             vec!["id"],
         ),
 
+        // === Cloudflare quick tunnels (expose a local dev port publicly) ===
+        make_tool(
+            "tunnel_start",
+            "Expose one of the host's LOCAL ports at a public https://*.trycloudflare.com URL via a Cloudflare quick tunnel (downloads `cloudflared` on demand). Useful to share a local dev server. The host must be in edit/bypass mode. Returns the public URL; the tunnel stays up until tunnel_stop. target is a local address like 'http://localhost:3000' or just a port '3000'.",
+            json!({
+                "target": {"type": "string", "description": "Local address to expose, e.g. 'http://localhost:3000' or a bare port '3000'"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["target"],
+        ),
+        make_tool(
+            "tunnel_list",
+            "List the Cloudflare quick tunnels currently running on a host (set agent_id for a remote host).",
+            json!({
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec![],
+        ),
+        make_tool(
+            "tunnel_stop",
+            "Stop a Cloudflare quick tunnel by id (from tunnel_start/tunnel_list). Requires edit/bypass mode.",
+            json!({
+                "id": {"type": "string", "description": "Tunnel id returned by tunnel_start"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["id"],
+        ),
+
         // === Agent info & mode ===
         make_tool(
             "get_info",
@@ -639,6 +667,13 @@ impl McpHandler {
                 dest_path: get_str_required("dest_path")?,
             },
             "transfer_get" => Command::TransferGet {
+                id: get_str_required("id")?,
+            },
+            "tunnel_start" => Command::TunnelStart {
+                target: get_str_required("target")?,
+            },
+            "tunnel_list" => Command::TunnelList,
+            "tunnel_stop" => Command::TunnelStop {
                 id: get_str_required("id")?,
             },
             "get_info" => Command::GetInfo,
@@ -1143,6 +1178,21 @@ fn format_result(result: &CommandResult) -> String {
         CommandResult::TransferQueued { id } => format!("Transfer queued: {}", id),
         CommandResult::Transfer { status } => {
             serde_json::to_string_pretty(status).unwrap_or_else(|_| format!("{:?}", status))
+        }
+        CommandResult::TunnelStarted { tunnel } => format!(
+            "Tunnel {} → {}\n{}",
+            tunnel.id, tunnel.target, tunnel.public_url
+        ),
+        CommandResult::TunnelList { tunnels } => {
+            if tunnels.is_empty() {
+                "No running tunnels".to_string()
+            } else {
+                let mut s = format!("{} tunnel(s):", tunnels.len());
+                for t in tunnels {
+                    s.push_str(&format!("\n  [{}] {} → {}", t.id, t.target, t.public_url));
+                }
+                s
+            }
         }
     }
 }

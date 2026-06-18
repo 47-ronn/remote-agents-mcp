@@ -29,6 +29,8 @@ pub struct AgentState {
     peers: Arc<RwLock<Vec<AgentInfo>>>,
     /// Progress registry for host↔host transfers this node initiated.
     transfers: Arc<TransferStore>,
+    /// Registry of Cloudflare quick tunnels this node started.
+    tunnels: Arc<crate::tunnel::TunnelStore>,
 }
 
 impl AgentState {
@@ -49,12 +51,18 @@ impl AgentState {
             events_rx: Arc::new(Mutex::new(events_rx)),
             peers: Arc::new(RwLock::new(Vec::new())),
             transfers: Arc::new(TransferStore::default()),
+            tunnels: Arc::new(crate::tunnel::TunnelStore::default()),
         }
     }
 
     /// The shared host↔host transfer registry.
     pub fn transfers(&self) -> Arc<TransferStore> {
         self.transfers.clone()
+    }
+
+    /// The shared Cloudflare quick-tunnel registry.
+    pub fn tunnels(&self) -> Arc<crate::tunnel::TunnelStore> {
+        self.tunnels.clone()
     }
 
     /// Snapshot of the peer agents currently known to share this room.
