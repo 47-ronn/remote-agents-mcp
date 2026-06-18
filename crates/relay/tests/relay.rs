@@ -100,7 +100,7 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
         accepts_commands: true,
         connected_at: 0,
         session_id: None,
-        version: String::new(), update_available: None,
+        version: String::new(), update_available: None, connections: None,
     }
 }
 
@@ -806,4 +806,32 @@ async fn rooms_list_enumerates_active_rooms() {
     let (_s, body) = http_get(port, "/api/rooms").await;
     assert!(!body.contains("\"room\":\"dev\""), "dev should be gone: {body}");
     assert!(body.contains("\"room\":\"prod\""), "prod should remain: {body}");
+}
+
+// Two sockets sharing one agent-id collapse to one host whose `connections`
+// count is surfaced (so the panel can warn about duplicate/possibly-mis-keyed
+// sockets). Mirrors the worker's dedupAgents behaviour.
+#[tokio::test]
+async fn list_agents_reports_connection_count_for_duplicate_sockets() {
+    let port = start_relay().await;
+
+    // Two live connections advertise the SAME agent id "dup".
+    let mut dup1 = connect(port, "dev").await;
+    auth(&mut dup1, Some(agent_info("dup", &[]))).await;
+    let mut dup2 = connect(port, "dev").await;
+    auth(&mut dup2, Some(agent_info("dup", &[]))).await;
+
+    // An observer lists the room.
+    let mut mcp = connect(port, "dev").await;
+    auth(&mut mcp, None).await;
+    send(&mut mcp, &ClientMessage::ListAgents).await;
+
+    match recv(&mut mcp).await {
+        ServerMessage::AgentList { agents } => {
+            assert_eq!(agents.len(), 1, "two sockets of one id collapse to one host");
+            assert_eq!(agents[0].id, "dup");
+            assert_eq!(agents[0].connections, Some(2), "both sockets counted");
+        }
+        other => panic!("expected agent_list, got {:?}", other),
+    }
 }

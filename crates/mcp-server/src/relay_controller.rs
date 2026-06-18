@@ -859,6 +859,7 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
         }
 
         ServerMessage::AgentJoined { agent } => {
+            let agent = *agent; // unbox (the wire variant is boxed)
             let mut list = shared.agents.write().await;
             // Upsert by id: a re-announce (or a second connection reusing the
             // same persistent node id) must not create a duplicate entry.
@@ -1129,7 +1130,7 @@ mod tests {
             accepts_commands: true,
             connected_at: 0,
             session_id: session.map(String::from),
-            version: String::new(), update_available: None,
+            version: String::new(), update_available: None, connections: None,
         }
     }
 
@@ -1330,13 +1331,13 @@ mod tests {
         let (shared, _rx, _w, _e) = handler_shared();
 
         let a = agent("x", Some("s1")); // id = "id-x"
-        let text = serde_json::to_string(&ServerMessage::AgentJoined { agent: a }).unwrap();
+        let text = serde_json::to_string(&ServerMessage::AgentJoined { agent: Box::new(a) }).unwrap();
         handle_message(&text, &shared).await.unwrap();
 
         // A re-announce / second connection with the SAME id must not duplicate.
         let mut a2 = agent("x", Some("s2"));
         a2.name = "x-renamed".into();
-        let text2 = serde_json::to_string(&ServerMessage::AgentJoined { agent: a2 }).unwrap();
+        let text2 = serde_json::to_string(&ServerMessage::AgentJoined { agent: Box::new(a2) }).unwrap();
         handle_message(&text2, &shared).await.unwrap();
 
         let list = shared.agents.read().await;

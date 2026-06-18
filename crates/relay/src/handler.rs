@@ -135,7 +135,7 @@ pub async fn handle_socket(
                 .into_iter()
                 .find(|a| a.id == info.id)
                 .unwrap_or_else(|| info_with_session.clone());
-            let joined = ServerMessage::AgentJoined { agent: merged };
+            let joined = ServerMessage::AgentJoined { agent: Box::new(merged) };
             broadcast_mcp(&room, &joined);
             broadcast_agents(&room, &joined, Some(&info.id));
             info!("peer joined: {} ({})", info.name, info.id);

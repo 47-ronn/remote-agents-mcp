@@ -330,9 +330,11 @@ pub enum ServerMessage {
         agents: Vec<AgentInfo>,
     },
 
-    /// Agent joined the room
+    /// Agent joined the room. Boxed to keep this from being a giant `ServerMessage`
+    /// variant (mirrors `ClientMessage::Auth`); serde treats `Box<AgentInfo>` as
+    /// the inline object, so the wire format is unchanged.
     AgentJoined {
-        agent: AgentInfo,
+        agent: Box<AgentInfo>,
     },
 
     /// Agent left the room
@@ -627,7 +629,7 @@ mod tests {
                 accepts_commands: true,
                 connected_at: 1234567890,
                 session_id: None,
-                version: String::new(), update_available: None,
+                version: String::new(), update_available: None, connections: None,
             })),
         };
 

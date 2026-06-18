@@ -635,6 +635,7 @@ mod tests {
             version: "0.1.8".into(),
             session_id: None,
             update_available: update.map(String::from),
+            connections: None,
         }
     }
 
