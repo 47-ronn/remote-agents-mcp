@@ -370,12 +370,43 @@ pub fn split_into_fragments(body: &[u8], msg_id: u32) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Default cap on the number of messages reassembled concurrently. A message
+/// whose final fragment never arrives (the sender exhausts retransmissions, or a
+/// peer floods distinct `msg_id`s with a single fragment each) would otherwise
+/// linger forever — an unbounded leak / DoS vector. Past the cap we evict the
+/// least-recently-touched partial message, which is the most likely abandoned.
+/// 256 concurrent in-flight fragmented messages per channel is already far
+/// beyond any real workload (the transfer layer chunks sequentially).
+pub const MAX_PARTIAL_MESSAGES: usize = 256;
+
+/// One message being reassembled.
+#[derive(Debug)]
+struct Partial {
+    /// Expected fragment count (from the fragment sub-header).
+    count: u16,
+    /// index -> chunk bytes for the fragments seen so far.
+    parts: std::collections::HashMap<u16, Vec<u8>>,
+    /// Monotonic tick of the most recent fragment for this message; used to
+    /// evict the least-recently-touched message when over capacity.
+    last_touched: u64,
+}
+
 /// Reassembles `DataFragment` payloads into complete messages. Tolerates
-/// out-of-order arrival and duplicate fragments (retransmissions).
-#[derive(Debug, Default)]
+/// out-of-order arrival and duplicate fragments (retransmissions), and bounds
+/// memory by evicting stale, never-completed messages past a capacity.
+#[derive(Debug)]
 pub struct FragmentReassembler {
-    /// msg_id -> (expected count, index -> chunk)
-    partial: std::collections::HashMap<u32, (u16, std::collections::HashMap<u16, Vec<u8>>)>,
+    partial: std::collections::HashMap<u32, Partial>,
+    /// Monotonic counter stamped onto each touched message (eviction ordering).
+    tick: u64,
+    /// Maximum number of in-flight partial messages before eviction kicks in.
+    max_messages: usize,
+}
+
+impl Default for FragmentReassembler {
+    fn default() -> Self {
+        Self::with_capacity(MAX_PARTIAL_MESSAGES)
+    }
 }
 
 impl FragmentReassembler {
@@ -383,9 +414,30 @@ impl FragmentReassembler {
         Self::default()
     }
 
+    /// Construct with an explicit cap on concurrent partial messages.
+    pub fn with_capacity(max_messages: usize) -> Self {
+        Self {
+            partial: std::collections::HashMap::new(),
+            tick: 0,
+            max_messages: max_messages.max(1),
+        }
+    }
+
     /// Number of messages currently being reassembled (for bookkeeping/tests).
     pub fn pending_len(&self) -> usize {
         self.partial.len()
+    }
+
+    /// Drop the least-recently-touched partial message. Called when inserting a
+    /// brand-new message id would exceed `max_messages`.
+    fn evict_oldest(&mut self) {
+        if let Some((&oldest_id, _)) = self
+            .partial
+            .iter()
+            .min_by_key(|(_, p)| p.last_touched)
+        {
+            self.partial.remove(&oldest_id);
+        }
     }
 
     /// Feed one fragment payload (sub-header + chunk). Returns the fully
@@ -397,25 +449,38 @@ impl FragmentReassembler {
             return None; // nonsensical framing
         }
 
-        let entry = self
-            .partial
-            .entry(header.msg_id)
-            .or_insert_with(|| (header.count, std::collections::HashMap::new()));
-        // A mismatched count for the same id means corruption — reset it.
-        if entry.0 != header.count {
-            *entry = (header.count, std::collections::HashMap::new());
-        }
-        entry.1.insert(header.index, chunk.to_vec());
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
 
-        if entry.1.len() as u16 != header.count {
+        // Bound memory: if this fragment opens a *new* message and we are already
+        // at capacity, evict the stalest one first so the map can't grow without
+        // limit on never-completed messages.
+        if !self.partial.contains_key(&header.msg_id) && self.partial.len() >= self.max_messages {
+            self.evict_oldest();
+        }
+
+        let entry = self.partial.entry(header.msg_id).or_insert_with(|| Partial {
+            count: header.count,
+            parts: std::collections::HashMap::new(),
+            last_touched: tick,
+        });
+        // A mismatched count for the same id means corruption — reset it.
+        if entry.count != header.count {
+            entry.count = header.count;
+            entry.parts.clear();
+        }
+        entry.parts.insert(header.index, chunk.to_vec());
+        entry.last_touched = tick;
+
+        if entry.parts.len() as u16 != header.count {
             return None;
         }
 
         // All present — concatenate in index order and drop the buffer.
-        let (count, parts) = self.partial.remove(&header.msg_id)?;
+        let partial = self.partial.remove(&header.msg_id)?;
         let mut body = Vec::new();
-        for i in 0..count {
-            body.extend_from_slice(parts.get(&i)?);
+        for i in 0..partial.count {
+            body.extend_from_slice(partial.parts.get(&i)?);
         }
         Some(body)
     }
@@ -553,6 +618,53 @@ mod tests {
     fn udp_frame_from_bytes_rejects_garbage() {
         assert!(UdpFrame::from_bytes(b"not json").is_none());
         assert!(UdpFrame::from_bytes(b"{\"kind\":\"bogus\"}").is_none());
+    }
+
+    /// Build a single fragment (index 0 of `count`) for `msg_id` carrying one
+    /// byte — enough to open a partial message without completing it.
+    fn lone_fragment(msg_id: u32, count: u16) -> Vec<u8> {
+        let mut b = vec![0u8; FRAGMENT_HEADER_SIZE + 1];
+        FragmentHeader { msg_id, index: 0, count }.write(&mut b);
+        b[FRAGMENT_HEADER_SIZE] = 0xAB;
+        b
+    }
+
+    #[test]
+    fn reassembler_bounds_partial_messages_by_evicting_oldest() {
+        // A small cap makes the eviction observable. Each id contributes one
+        // fragment of a 2-fragment message, so none ever completes.
+        let mut r = FragmentReassembler::with_capacity(4);
+        for id in 0..100u32 {
+            assert!(r.insert(&lone_fragment(id, 2)).is_none());
+            // Never exceeds the cap — the leak is bounded.
+            assert!(r.pending_len() <= 4, "exceeded cap at id {id}");
+        }
+        assert_eq!(r.pending_len(), 4);
+    }
+
+    #[test]
+    fn reassembler_eviction_keeps_recently_touched_message_alive() {
+        // Capacity 2. Open msg 1, then keep feeding it while a churn of other
+        // ids streams past; msg 1 stays "warm" and must survive to completion.
+        let mut r = FragmentReassembler::with_capacity(2);
+        let body: Vec<u8> = (0..FRAGMENT_CHUNK_SIZE + 10).map(|i| i as u8).collect();
+        let frags = split_into_fragments(&body, 1);
+        assert_eq!(frags.len(), 2);
+
+        // Feed the first fragment of msg 1.
+        assert!(r.insert(&frags[0]).is_none());
+
+        // Churn other single-fragment messages through, re-touching msg 1 each
+        // round so it is never the least-recently-touched candidate.
+        for id in 10..40u32 {
+            assert!(r.insert(&lone_fragment(id, 2)).is_none());
+            // Re-touch msg 1 (duplicate of its first fragment — harmless).
+            assert!(r.insert(&frags[0]).is_none());
+        }
+
+        // The final fragment of msg 1 must still complete it.
+        let done = r.insert(&frags[1]).expect("warm message survived eviction");
+        assert_eq!(done, body);
     }
 
     #[test]
