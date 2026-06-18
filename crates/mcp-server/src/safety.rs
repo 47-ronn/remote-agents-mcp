@@ -76,6 +76,13 @@ pub fn check_command_allowed(command: &str, mode: AgentMode, sec: &SecurityConfi
             if command.contains('>') {
                 bail!("Plan mode: output redirection (`>`) is not allowed");
             }
+            // Command / process substitution runs nested commands that the
+            // per-segment whitelist never sees (the shell evaluates them before
+            // the outer program). `>(...)` is already caught by the `>` rule
+            // above; block `$(...)`, backticks, and `<(...)` too.
+            if command.contains("$(") || command.contains('`') || command.contains("<(") {
+                bail!("Plan mode: command substitution is not allowed");
+            }
             for segment in split_segments(command) {
                 let seg = segment.trim();
                 if seg.is_empty() {
@@ -229,6 +236,20 @@ mod tests {
         assert!(check_command_allowed("git commit -m x", AgentMode::Plan, &s).is_err());
         assert!(check_command_allowed("echo hi > f", AgentMode::Plan, &s).is_err());
         assert!(check_command_allowed("ls | rm -rf foo", AgentMode::Plan, &s).is_err());
+    }
+
+    #[test]
+    fn plan_blocks_command_substitution() {
+        // The outer program is whitelisted, but the shell evaluates the nested
+        // command first — so these must be rejected in read-only mode.
+        let s = sec();
+        assert!(check_command_allowed("echo $(touch f)", AgentMode::Plan, &s).is_err());
+        assert!(check_command_allowed("echo `touch f`", AgentMode::Plan, &s).is_err());
+        assert!(check_command_allowed("cat <(touch f)", AgentMode::Plan, &s).is_err());
+        // A normal variable expansion is still fine (not a command substitution).
+        assert!(check_command_allowed("echo ${HOME}", AgentMode::Plan, &s).is_ok());
+        // Edit/Bypass are unaffected by this read-only-only restriction.
+        assert!(check_command_allowed("echo $(date)", AgentMode::Edit, &s).is_ok());
     }
 
     #[test]
