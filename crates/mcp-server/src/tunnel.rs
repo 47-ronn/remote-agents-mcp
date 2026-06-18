@@ -177,23 +177,49 @@ fn parse_tunnel_url(log: &str) -> Option<String> {
 }
 
 /// Normalize/validate a tunnel target. Accepts a bare port (→ localhost) or an
-/// `http(s)://` URL pointing at this host's loopback only — a dev tool to expose
-/// LOCAL services, not arbitrary internal hosts.
+/// `http(s)://` URL whose host is EXACTLY this machine's loopback — a dev tool to
+/// expose LOCAL services, not arbitrary internal/remote hosts.
 fn validate_target(target: &str) -> Result<String> {
     let t = target.trim();
+
+    // Bare port → http://localhost:PORT (validate the range).
     if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(format!("http://localhost:{t}"));
+        return match t.parse::<u32>() {
+            Ok(p) if (1..=65535).contains(&p) => Ok(format!("http://localhost:{p}")),
+            _ => bail!("tunnel port must be 1–65535, got '{target}'"),
+        };
     }
+
     let lower = t.to_lowercase();
     let is_http = lower.starts_with("http://") || lower.starts_with("https://");
-    let is_local = ["localhost", "127.0.0.1", "[::1]", "://[::1]"]
-        .iter()
-        .any(|h| lower.contains(h));
-    if is_http && is_local {
+    // Parse the URL host PROPERLY (exact match) so a lookalike like
+    // `http://localhost.evil.com` or `http://localhost@evil.com` can't sneak past
+    // a substring check and tunnel to a remote host.
+    let host_is_loopback = url_host(&lower)
+        .map(|h| matches!(h.as_str(), "localhost" | "127.0.0.1" | "::1"))
+        .unwrap_or(false);
+    if is_http && host_is_loopback {
         Ok(t.to_string())
     } else {
         bail!("tunnel target must be a local address (http(s)://localhost[:port] or a bare port), got '{target}'")
     }
+}
+
+/// Extract the host from an `scheme://[userinfo@]host[:port][/path]` URL,
+/// lowercased. Handles userinfo and bracketed IPv6 (`[::1]`).
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any userinfo before the last '@'.
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // Bracketed IPv6 `[::1]:port` vs plain `host:port`.
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    Some(host.to_string())
 }
 
 /// Locate `cloudflared`: prefer one on `PATH`, then a cached download, else
@@ -382,9 +408,37 @@ mod tests {
             validate_target("http://127.0.0.1:5000/app").unwrap(),
             "http://127.0.0.1:5000/app"
         );
+        assert!(validate_target("http://[::1]:8080").is_ok());
         // Non-local targets are rejected (no exposing arbitrary internal hosts).
         assert!(validate_target("http://10.0.0.5:80").is_err());
         assert!(validate_target("https://example.com").is_err());
         assert!(validate_target("ftp://localhost:21").is_err());
+    }
+
+    #[test]
+    fn validate_target_rejects_loopback_lookalikes() {
+        // A substring check would have let these tunnel to a REMOTE host.
+        assert!(validate_target("http://localhost.evil.com").is_err());
+        assert!(validate_target("http://127.0.0.1.evil.com/").is_err());
+        assert!(validate_target("http://localhost@evil.com").is_err());
+        assert!(validate_target("http://evil.com/?x=localhost").is_err());
+        assert!(validate_target("http://evil-localhost.com").is_err());
+    }
+
+    #[test]
+    fn validate_target_checks_port_range() {
+        assert!(validate_target("0").is_err());
+        assert!(validate_target("65536").is_err());
+        assert!(validate_target("99999").is_err());
+        assert_eq!(validate_target("65535").unwrap(), "http://localhost:65535");
+        assert_eq!(validate_target("1").unwrap(), "http://localhost:1");
+    }
+
+    #[test]
+    fn url_host_parses_authority() {
+        assert_eq!(url_host("http://localhost:3000/x").as_deref(), Some("localhost"));
+        assert_eq!(url_host("http://localhost@evil.com").as_deref(), Some("evil.com"));
+        assert_eq!(url_host("http://[::1]:8080/p").as_deref(), Some("::1"));
+        assert_eq!(url_host("http://127.0.0.1.evil.com").as_deref(), Some("127.0.0.1.evil.com"));
     }
 }
