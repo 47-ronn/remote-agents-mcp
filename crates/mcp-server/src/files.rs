@@ -255,8 +255,16 @@ pub fn search(
             run_collecting("find", &args, max * 2, timeout)?
         }
         SearchKind::Content => {
-            // grep -rIl -e query <roots...>   (-I skips binary, -l lists files)
-            let mut args: Vec<String> = vec!["-rIl".into(), "-e".into(), query.into()];
+            // grep -rIl --exclude-dir=<heavy> -e query <roots...>
+            // (-I skips binary, -l lists files). Excluding the heavy dirs keeps a
+            // home-wide content scan from drowning in Library/node_modules/.git;
+            // both GNU and BSD grep support --exclude-dir.
+            let mut args: Vec<String> = vec!["-rIl".into()];
+            for d in PRUNE_DIRS {
+                args.push(format!("--exclude-dir={d}"));
+            }
+            args.push("-e".into());
+            args.push(query.into());
             args.extend(roots.clone());
             run_collecting("grep", &args, max, timeout)?
         }
@@ -385,6 +393,21 @@ mod tests {
         let hits = search(&roots, "needle", SearchKind::Content, &sec()).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("a.txt"));
+    }
+
+    #[test]
+    fn search_by_content_excludes_heavy_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), b"the needle is here\n").unwrap();
+        // Same content inside a pruned dir must be skipped (else a home-wide
+        // content search drowns in node_modules/etc).
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/x.txt"), b"the needle is here\n").unwrap();
+        let roots = vec![dir.path().to_string_lossy().to_string()];
+
+        let hits = search(&roots, "needle", SearchKind::Content, &sec()).unwrap();
+        assert_eq!(hits.len(), 1, "only the non-pruned match: {hits:?}");
+        assert!(hits[0].path.ends_with("src.txt"));
     }
 
     #[test]
