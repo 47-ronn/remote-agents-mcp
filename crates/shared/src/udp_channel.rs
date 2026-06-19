@@ -28,6 +28,8 @@ mod channel_impl {
         Crypto,
         #[error("Invalid packet")]
         InvalidPacket,
+        #[error("Message too large to fragment")]
+        MessageTooLarge,
     }
 
     /// A pending reliable packet awaiting acknowledgment.
@@ -242,7 +244,9 @@ mod channel_impl {
                 *id = id.wrapping_add(1);
                 v
             };
-            for fragment in split_into_fragments(encrypted_bytes, msg_id) {
+            let fragments = split_into_fragments(encrypted_bytes, msg_id)
+                .ok_or(UdpChannelError::MessageTooLarge)?;
+            for fragment in fragments {
                 self.send_reliable_packet(UdpPacketType::DataFragment, &fragment, peer)
                     .await?;
             }
