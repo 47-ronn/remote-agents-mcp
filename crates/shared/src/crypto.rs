@@ -15,6 +15,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 const NONCE_LEN: usize = 12;
+/// AES-GCM authentication tag length. Every ciphertext carries one, so a payload
+/// with no room for both the nonce and the tag cannot be a valid message.
+const TAG_LEN: usize = 16;
 
 /// A symmetric cipher derived from a shared passphrase.
 #[derive(Clone)]
@@ -83,7 +86,11 @@ impl Cipher {
     /// Decrypt a base64 string produced by [`Cipher::encrypt`].
     pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, CryptoError> {
         let raw = B64.decode(encoded).map_err(|_| CryptoError::Encoding)?;
-        if raw.len() <= NONCE_LEN {
+        // Reject anything too short to even hold a nonce + GCM tag *before*
+        // slicing. `split_at` would panic on `raw.len() < NONCE_LEN`; and a
+        // payload in `(NONCE_LEN, NONCE_LEN+TAG_LEN)` can't carry a valid tag, so
+        // it earns a clear `TooShort` instead of a misleading `Decrypt` error.
+        if raw.len() < NONCE_LEN + TAG_LEN {
             return Err(CryptoError::TooShort);
         }
         let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
@@ -132,6 +139,32 @@ mod tests {
         let b = Cipher::from_passphrase("key-b");
         let ct = a.encrypt_str("secret").unwrap();
         assert!(b.decrypt_str(&ct).is_err());
+    }
+
+    #[test]
+    fn malformed_input_errors_never_panic() {
+        // `decrypt` runs on the untrusted wire: a peer/relay can feed it anything.
+        // It must return a typed error, never panic (e.g. `split_at` on a buffer
+        // shorter than the nonce would).
+        let c = Cipher::from_passphrase("k");
+
+        // Non-base64 garbage → Encoding.
+        assert!(matches!(c.decrypt("not base64 @@@"), Err(CryptoError::Encoding)));
+
+        // Valid base64 but too short to hold nonce + tag → TooShort (no panic).
+        for raw_len in [0usize, 1, NONCE_LEN, NONCE_LEN + 1, NONCE_LEN + TAG_LEN - 1] {
+            let encoded = B64.encode(vec![0u8; raw_len]);
+            assert!(
+                matches!(c.decrypt(&encoded), Err(CryptoError::TooShort)),
+                "{raw_len}-byte payload should be TooShort"
+            );
+        }
+
+        // Exactly nonce+tag length but bogus contents → not TooShort; the AEAD
+        // rejects it as Decrypt (the boundary is accepted for slicing, then fails
+        // authentication rather than panicking).
+        let boundary = B64.encode(vec![0u8; NONCE_LEN + TAG_LEN]);
+        assert!(matches!(c.decrypt(&boundary), Err(CryptoError::Decrypt)));
     }
 
     #[test]
