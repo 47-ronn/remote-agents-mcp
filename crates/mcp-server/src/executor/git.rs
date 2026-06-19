@@ -19,6 +19,23 @@ use tokio::process::Command;
 /// below; this is the safety net for everything else.
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Non-interactive `ssh` for git, so an SSH `pull`/`push` fails fast instead of
+/// stalling until [`GIT_TIMEOUT`]. `BatchMode=yes` refuses every prompt (password,
+/// key passphrase, unknown-host confirmation) and errors instead — a headless
+/// agent could never answer them anyway. `ConnectTimeout` bounds the TCP connect
+/// so an unreachable host doesn't eat the full backstop.
+///
+/// Pure so the policy is unit-testable: returns `None` when the user already
+/// configured `GIT_SSH_COMMAND`, so we never clobber a custom ssh/key setup;
+/// otherwise the default to apply. `GIT_TERMINAL_PROMPT=0` already covers the
+/// HTTPS credential prompt; this is the SSH counterpart.
+fn git_ssh_command(existing: Option<&str>) -> Option<&'static str> {
+    match existing {
+        Some(s) if !s.trim().is_empty() => None,
+        _ => Some("ssh -o BatchMode=yes -o ConnectTimeout=10"),
+    }
+}
+
 /// Run a git subcommand in `repo` and capture its output.
 async fn git(repo: &str, args: &[&str]) -> Result<(String, String, i32)> {
     let mut cmd = Command::new("git");
@@ -31,6 +48,10 @@ async fn git(repo: &str, args: &[&str]) -> Result<(String, String, i32)> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // SSH counterpart of the prompt guard — only when the user hasn't set their own.
+    if let Some(ssh) = git_ssh_command(std::env::var("GIT_SSH_COMMAND").ok().as_deref()) {
+        cmd.env("GIT_SSH_COMMAND", ssh);
+    }
     let output = run_with_timeout(cmd, GIT_TIMEOUT).await?;
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -241,6 +262,20 @@ mod tests {
             survivors.is_empty(),
             "leaked a backgrounded grandchild: {survivors:?}"
         );
+    }
+
+    #[test]
+    fn git_ssh_command_defaults_only_when_user_has_none() {
+        // No user setting → our non-interactive default (BatchMode so SSH never
+        // hangs on a prompt; ConnectTimeout bounds the connect).
+        let def = git_ssh_command(None).expect("a default when unset");
+        assert!(def.contains("BatchMode=yes"));
+        assert!(def.contains("ConnectTimeout="));
+        // Blank/whitespace counts as unset.
+        assert!(git_ssh_command(Some("")).is_some());
+        assert!(git_ssh_command(Some("   ")).is_some());
+        // A real user setting is respected — never clobbered.
+        assert_eq!(git_ssh_command(Some("ssh -i ~/.ssh/deploy_key")), None);
     }
 
     #[test]
