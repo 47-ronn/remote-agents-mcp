@@ -348,16 +348,42 @@ impl UdpFrame {
     }
 }
 
+/// Largest message body that can be fragmented: the header's `count`/`index` are
+/// `u16`, so a message is capped at `u16::MAX` fragments of `FRAGMENT_CHUNK_SIZE`
+/// body bytes each. Bodies this large don't occur on current paths (the relay's
+/// ~1 MiB frame limit is ≈ 880 fragments) — the cap exists so a future caller
+/// can't silently overflow the count via an `as u16` wrap, which would corrupt
+/// every fragment's `count` and break reassembly.
+pub const MAX_FRAGMENTED_BODY: usize = (u16::MAX as usize) * FRAGMENT_CHUNK_SIZE;
+
+/// Number of fragments [`split_into_fragments`] yields for a `len`-byte body —
+/// always ≥ 1, since an empty body still travels as one (empty) fragment.
+fn fragment_count(len: usize) -> usize {
+    if len == 0 {
+        1
+    } else {
+        len.div_ceil(FRAGMENT_CHUNK_SIZE)
+    }
+}
+
 /// Split `body` into fragment payloads (each = [`FragmentHeader`] + chunk),
-/// chunking at `FRAGMENT_CHUNK_SIZE`. Always returns at least one fragment.
-pub fn split_into_fragments(body: &[u8], msg_id: u32) -> Vec<Vec<u8>> {
+/// chunking at `FRAGMENT_CHUNK_SIZE`. Always yields at least one fragment.
+///
+/// Returns `None` when `body` would need more than `u16::MAX` fragments (i.e.
+/// `body.len() > MAX_FRAGMENTED_BODY`): the count wouldn't fit the header's
+/// `u16`, so rather than wrap silently we refuse to fragment it.
+pub fn split_into_fragments(body: &[u8], msg_id: u32) -> Option<Vec<Vec<u8>>> {
+    if fragment_count(body.len()) > u16::MAX as usize {
+        return None;
+    }
     let chunks: Vec<&[u8]> = if body.is_empty() {
         vec![&body[0..0]]
     } else {
         body.chunks(FRAGMENT_CHUNK_SIZE).collect()
     };
+    // Provably fits `u16` now (guarded above), so no truncating cast.
     let count = chunks.len() as u16;
-    chunks
+    let fragments = chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
@@ -367,7 +393,8 @@ pub fn split_into_fragments(body: &[u8], msg_id: u32) -> Vec<Vec<u8>> {
             out[FRAGMENT_HEADER_SIZE..].copy_from_slice(chunk);
             out
         })
-        .collect()
+        .collect();
+    Some(fragments)
 }
 
 /// Default cap on the number of messages reassembled concurrently. A message
@@ -542,8 +569,23 @@ mod tests {
     }
 
     #[test]
+    fn fragment_count_and_u16_boundary() {
+        // Empty body still travels as one fragment; chunking is div_ceil.
+        assert_eq!(fragment_count(0), 1);
+        assert_eq!(fragment_count(1), 1);
+        assert_eq!(fragment_count(FRAGMENT_CHUNK_SIZE), 1);
+        assert_eq!(fragment_count(FRAGMENT_CHUNK_SIZE + 1), 2);
+        // The largest fragmentable body is exactly u16::MAX fragments; one byte
+        // more needs 65536, which can't fit the header's u16 count — so it's the
+        // split/no-split boundary. (Asserted on the pure length math; allocating
+        // an ~78 MiB body just to drive the branch isn't worth it.)
+        assert_eq!(fragment_count(MAX_FRAGMENTED_BODY), u16::MAX as usize);
+        assert!(fragment_count(MAX_FRAGMENTED_BODY + 1) > u16::MAX as usize);
+    }
+
+    #[test]
     fn single_fragment_for_small_body() {
-        let frags = split_into_fragments(b"small", 1);
+        let frags = split_into_fragments(b"small", 1).expect("fits u16");
         assert_eq!(frags.len(), 1);
         let (h, chunk) = FragmentHeader::parse(&frags[0]).unwrap();
         assert_eq!(h.count, 1);
@@ -557,7 +599,7 @@ mod tests {
         let body: Vec<u8> = (0..FRAGMENT_CHUNK_SIZE * 3 + 100)
             .map(|i| (i % 251) as u8)
             .collect();
-        let frags = split_into_fragments(&body, 42);
+        let frags = split_into_fragments(&body, 42).expect("fits u16");
         assert_eq!(frags.len(), 4);
 
         let mut r = FragmentReassembler::new();
@@ -573,7 +615,7 @@ mod tests {
     #[test]
     fn reassemble_out_of_order_and_duplicates() {
         let body: Vec<u8> = (0..FRAGMENT_CHUNK_SIZE * 2 + 5).map(|i| i as u8).collect();
-        let frags = split_into_fragments(&body, 7);
+        let frags = split_into_fragments(&body, 7).expect("fits u16");
         assert_eq!(frags.len(), 3);
 
         let mut r = FragmentReassembler::new();
@@ -648,7 +690,7 @@ mod tests {
         // ids streams past; msg 1 stays "warm" and must survive to completion.
         let mut r = FragmentReassembler::with_capacity(2);
         let body: Vec<u8> = (0..FRAGMENT_CHUNK_SIZE + 10).map(|i| i as u8).collect();
-        let frags = split_into_fragments(&body, 1);
+        let frags = split_into_fragments(&body, 1).expect("fits u16");
         assert_eq!(frags.len(), 2);
 
         // Feed the first fragment of msg 1.
