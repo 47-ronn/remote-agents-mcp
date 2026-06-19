@@ -158,6 +158,38 @@ fn jitter(backoff: Duration) -> Duration {
     Duration::from_millis(n % (half + 1))
 }
 
+/// Read WebSocket frames until the relay returns its auth verdict, skipping any
+/// pre-auth broadcast frame.
+///
+/// We must LOOP rather than read a single frame: while a socket is connected but
+/// not yet authed it carries no agent_info, so the relay treats it as an
+/// anonymous observer and may push broadcast frames (e.g. `agent_joined` for a
+/// peer that joins in this window) BEFORE our own `auth_ok`. Skipping them loses
+/// nothing — `auth_ok` is followed by a fresh `agent_list` for this connection.
+/// Shared by the `run`-agent loop and the MCP relay-controller. The caller wraps
+/// this in a timeout. See docs/ITERATION_LOG.md iter143.
+pub(crate) async fn await_auth_verdict<S, E>(read: &mut S) -> Result<String>
+where
+    S: futures::Stream<Item = std::result::Result<Message, E>> + Unpin + ?Sized,
+    E: std::fmt::Display,
+{
+    loop {
+        let frame = read
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("connection closed during auth"))?
+            .map_err(|e| anyhow::anyhow!("websocket error during auth: {e}"))?;
+        let Message::Text(text) = frame else {
+            continue; // ignore Ping/Pong/Binary control frames pre-auth
+        };
+        match ServerMessage::from_json(&text)? {
+            ServerMessage::AuthOk { session_id } => return Ok(session_id),
+            ServerMessage::AuthFailed { reason } => bail!("Auth failed: {reason}"),
+            other => debug!("Ignoring pre-auth frame: {:?}", other),
+        }
+    }
+}
+
 async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     // Build WebSocket URL
     let ws_url = format!(
@@ -196,30 +228,12 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
         .await
         .context("Failed to send auth")?;
 
-    // Wait for auth response
-    let auth_response = timeout(Duration::from_secs(10), read.next())
+    // Wait for the auth verdict, tolerating pre-auth broadcast frames (see
+    // `await_auth_verdict`).
+    let session_id = timeout(Duration::from_secs(10), await_auth_verdict(&mut read))
         .await
-        .context("Auth timeout")?
-        .ok_or_else(|| anyhow::anyhow!("Connection closed during auth"))?
-        .context("WebSocket error during auth")?;
-
-    let session_id = if let Message::Text(text) = auth_response {
-        let msg: ServerMessage = ServerMessage::from_json(&text)?;
-        match msg {
-            ServerMessage::AuthOk { session_id } => {
-                info!("Authenticated with session ID: {}", session_id);
-                session_id
-            }
-            ServerMessage::AuthFailed { reason } => {
-                return Err(anyhow::anyhow!("Auth failed: {}", reason));
-            }
-            _ => {
-                return Err(anyhow::anyhow!("Unexpected auth response"));
-            }
-        }
-    } else {
-        return Err(anyhow::anyhow!("Invalid auth response"));
-    };
+        .context("Auth timeout")??;
+    info!("Authenticated with session ID: {}", session_id);
 
     info!("End-to-end payload encryption active (AES-GCM-256)");
 
@@ -744,6 +758,42 @@ mod tests {
         Arc::new(RwLock::new(HashMap::new()))
     }
     use remote_agents_shared::{AgentMode, Cipher, CommandResult};
+
+    // --- await_auth_verdict (pre-auth frame tolerance, iter143) -------------
+
+    fn text(msg: ServerMessage) -> std::result::Result<Message, std::io::Error> {
+        Ok(Message::Text(msg.to_json().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn await_auth_verdict_skips_preauth_frames() {
+        // A not-yet-authed socket is an anonymous observer to the relay, so a
+        // broadcast frame (Pong stands in) can land before our own auth_ok. The
+        // verdict must still resolve, not be mistaken for "unexpected response".
+        let mut stream = futures::stream::iter(vec![
+            text(ServerMessage::Pong),
+            text(ServerMessage::AgentLeft { agent_id: "someone".into() }),
+            text(ServerMessage::AuthOk { session_id: "sid-1".into() }),
+        ]);
+        assert_eq!(await_auth_verdict(&mut stream).await.unwrap(), "sid-1");
+    }
+
+    #[tokio::test]
+    async fn await_auth_verdict_propagates_auth_failed() {
+        let mut stream = futures::stream::iter(vec![text(ServerMessage::AuthFailed {
+            reason: "bad token".into(),
+        })]);
+        let err = await_auth_verdict(&mut stream).await.unwrap_err();
+        assert!(err.to_string().contains("bad token"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn await_auth_verdict_errs_when_closed_before_verdict() {
+        // Stream ends (relay closed) before any verdict → a clear error, not a hang.
+        let mut stream = futures::stream::iter(vec![text(ServerMessage::Pong)]);
+        let err = await_auth_verdict(&mut stream).await.unwrap_err();
+        assert!(err.to_string().contains("closed during auth"), "got: {err}");
+    }
 
     // --- jitter -------------------------------------------------------------
 

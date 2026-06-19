@@ -23,9 +23,10 @@ pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<E
         .arg(command)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // On timeout the `cmd.output()` future is dropped; tokio defaults to
-        // *not* killing the child on drop, which would orphan the `sh -c`
-        // process (and any tree under it). Reap it instead of leaking.
+        // On timeout the wait future is dropped; tokio defaults to *not* killing
+        // the child on drop, which would orphan the `sh -c` leader. Reap it.
+        // (`kill_on_drop` only signals the leader — the whole-tree kill below
+        // handles backgrounded grandchildren.)
         .kill_on_drop(true);
 
     if let Some(cwd) = cwd {
@@ -36,9 +37,24 @@ pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<E
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("LC_ALL", "en_US.UTF-8");
 
+    // Run the child as its own process-group leader so a timeout can SIGKILL the
+    // entire tree, not just `sh -c`. Without this a command that backgrounds work
+    // (`some_daemon &`) leaks the grandchild: `kill_on_drop` reaps only the
+    // leader and the orphan is reparented to init.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
     let duration = Duration::from_millis(timeout_ms);
 
-    let output = timeout(duration, cmd.output()).await??;
+    let output = match timeout(duration, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(elapsed) => {
+            kill_process_group(pid);
+            return Err(elapsed.into());
+        }
+    };
 
     Ok(ExecResult {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -46,6 +62,24 @@ pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<E
         exit_code: output.status.code().unwrap_or(-1),
     })
 }
+
+/// SIGKILL the whole process group led by `pid` (no-op if the child already
+/// exited and so reports no pid). `process_group(0)` made the child its own
+/// group leader, so `-pid` targets it and every descendant that didn't start a
+/// new group. `kill_on_drop` still reaps the leader; this reaches the rest.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // Safe: a bare `kill(2)`, no memory is dereferenced. A negative pid
+        // signals the entire process group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pid: Option<u32>) {}
 
 /// Execute a shell command, feeding `stdin_data` to its standard input, with a
 /// timeout. The stdin write runs concurrently with output collection so a child
@@ -59,17 +93,21 @@ pub async fn exec_with_stdin(
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let shell_arg = if cfg!(windows) { "/C" } else { "-c" };
 
-    let mut child = Command::new(shell)
-        .arg(shell_arg)
+    let mut cmd = Command::new(shell);
+    cmd.arg(shell_arg)
         .arg(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("LANG", "en_US.UTF-8")
         .env("LC_ALL", "en_US.UTF-8")
-        // Reap the child if the timeout drops `wait_with_output` (see `exec`).
-        .kill_on_drop(true)
-        .spawn()?;
+        // Reap the leader if the timeout drops `wait_with_output` (see `exec`).
+        .kill_on_drop(true);
+    // Own process group so a timeout kills the whole tree (see `exec`).
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
 
     // Write (and close) stdin from a separate task to avoid pipe deadlock.
     let stdin = child.stdin.take();
@@ -82,7 +120,16 @@ pub async fn exec_with_stdin(
     });
 
     let duration = Duration::from_millis(timeout_ms);
-    let output = timeout(duration, child.wait_with_output()).await??;
+    let output = match timeout(duration, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(elapsed) => {
+            kill_process_group(pid);
+            // The writer may be parked on a full stdin pipe; the kill closes it,
+            // but abort so we never block on a child that's gone.
+            writer.abort();
+            return Err(elapsed.into());
+        }
+    };
     let _ = writer.await;
 
     Ok(ExecResult {
@@ -212,6 +259,59 @@ mod tests {
         assert!(
             poll_liveness(marker, false, Duration::from_secs(12)).await,
             "timed-out exec_with_stdin left an orphan '{marker}' running"
+        );
+    }
+
+    /// The tree case: a command that BACKGROUNDS a child keeps `sh` as the
+    /// tracked leader, so `kill_on_drop` (which signals only the leader) would
+    /// reap `sh` and leave the backgrounded `sleep` reparented to init. The
+    /// process-group kill must take the whole tree down. With the group kill
+    /// removed this test stays red — the grandchild never goes away.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_exec_kills_backgrounded_grandchild() {
+        let marker = "sleep 87655";
+
+        // `<marker> & wait`: sh forks the sleep into the background and blocks in
+        // `wait`, so the leader is sh and the victim is a *grandchild*.
+        let handle =
+            tokio::spawn(async move { exec(&format!("{marker} & wait"), None, 1000).await });
+
+        assert!(
+            poll_liveness(marker, true, Duration::from_secs(8)).await,
+            "the backgrounded child never started"
+        );
+
+        let res = handle.await.unwrap();
+        assert!(res.is_err(), "exec should have timed out");
+
+        assert!(
+            poll_liveness(marker, false, Duration::from_secs(12)).await,
+            "timed-out exec leaked a backgrounded grandchild '{marker}'"
+        );
+    }
+
+    /// Same whole-tree guarantee for the stdin-feeding path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_exec_with_stdin_kills_backgrounded_grandchild() {
+        let marker = "sleep 76544";
+
+        let handle = tokio::spawn(async move {
+            exec_with_stdin(&format!("{marker} & wait"), "", 1000).await
+        });
+
+        assert!(
+            poll_liveness(marker, true, Duration::from_secs(8)).await,
+            "the backgrounded child never started"
+        );
+
+        let res = handle.await.unwrap();
+        assert!(res.is_err(), "exec_with_stdin should have timed out");
+
+        assert!(
+            poll_liveness(marker, false, Duration::from_secs(12)).await,
+            "timed-out exec_with_stdin leaked a backgrounded grandchild '{marker}'"
         );
     }
 }

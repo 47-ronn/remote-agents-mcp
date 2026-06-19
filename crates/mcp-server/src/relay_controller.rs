@@ -188,25 +188,12 @@ impl ConnectionPool {
             .await
             .context("Failed to send auth")?;
 
-        // Wait for auth response
-        let auth_response = timeout(Duration::from_secs(10), read.next())
-            .await
-            .context("Auth timeout")?
-            .ok_or_else(|| anyhow::anyhow!("Connection closed"))?
-            .context("WebSocket error")?;
-
-        let session_id = if let Message::Text(text) = auth_response {
-            let msg: ServerMessage = ServerMessage::from_json(&text)?;
-            match msg {
-                ServerMessage::AuthOk { session_id } => session_id,
-                ServerMessage::AuthFailed { reason } => {
-                    bail!("Auth failed: {}", reason);
-                }
-                _ => bail!("Unexpected auth response"),
-            }
-        } else {
-            bail!("Unexpected message type");
-        };
+        // Wait for the auth verdict, tolerating pre-auth broadcast frames (see
+        // `connection::await_auth_verdict`).
+        let session_id =
+            timeout(Duration::from_secs(10), crate::connection::await_auth_verdict(&mut read))
+                .await
+                .context("Auth timeout")??;
 
         info!("Connected to room '{}' with session '{}'", room, session_id);
 

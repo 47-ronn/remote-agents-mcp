@@ -5,9 +5,10 @@
 //! end-to-end, asserting the destination file matches the source byte-for-byte.
 
 use remote_agent::config::Config;
+use remote_agent::state::AgentState;
 use remote_agent::{connection, relay_api::McpServer};
 use remote_agents_relay::{router, state::RelayState};
-use remote_agents_shared::{AgentMode, Command, CommandResult, Target, TransferState};
+use remote_agents_shared::{AgentInfo, AgentMode, Command, CommandResult, Target, TransferState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,26 @@ fn agent_config(id: &str, port: u16) -> Config {
         token: "secret".to_string(),
         relay_url: format!("ws://127.0.0.1:{port}"),
         ..Default::default()
+    }
+}
+
+fn agent_info(id: &str) -> AgentInfo {
+    AgentInfo {
+        id: id.to_string(),
+        name: id.to_string(),
+        mode: AgentMode::Bypass,
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        hostname: id.to_string(),
+        tags: vec![],
+        platform: Default::default(),
+        autonomous: false,
+        accepts_commands: true,
+        connected_at: 0,
+        session_id: None,
+        version: String::new(),
+        update_available: None,
+        connections: None,
     }
 }
 
@@ -132,6 +153,121 @@ async fn host_to_host_transfer_round_trips_over_relay() {
         }
     }
     assert!(done, "transfer should reach Done state");
+
+    // The received file must be byte-identical to the source.
+    assert_eq!(
+        std::fs::read(&dst_path).unwrap(),
+        data,
+        "destination file must match the source"
+    );
+}
+
+/// iter141: `send_file` with no `agent_id` routes to the node's OWN id, so the
+/// local host streams its own filesystem to a remote agent. This exercises the
+/// loopback path the fix produces: a full peer node (executor attached, exactly
+/// like `run_mcp_server` builds it) issues `SendFileTo` to its own id; the relay
+/// delivers `Target::Agent{self}` back to the same socket without excluding the
+/// sender, and the peer's `begin_send_file` handler streams to the destination.
+#[tokio::test]
+async fn local_host_to_agent_loopback_round_trips_over_relay() {
+    let port = start_relay().await;
+    let relay_url = format!("ws://127.0.0.1:{port}");
+
+    // Destination is an ordinary agent loop.
+    let dst_cfg = agent_config("dst-agent", port);
+    tokio::spawn(async move {
+        let _ = connection::run(&dst_cfg).await;
+    });
+
+    // The "local host": a full peer with an attached executor, mirroring
+    // run_mcp_server (config.accepts_commands → Some(state.clone())). It holds
+    // the source file and will send to its OWN id. A small chunk forces the
+    // streaming loop to run several slices. The relay and the local TransferGet
+    // share one Arc<TransferStore>, so progress is visible either way.
+    let mut host_cfg = agent_config("host-agent", port);
+    host_cfg.security.transfer_chunk_size = 1000;
+    let host_state = Arc::new(AgentState::new(host_cfg));
+    let host = McpServer::new();
+    host.join_room(
+        &relay_url,
+        "dev",
+        "secret",
+        None,
+        Some(Box::new(agent_info("host-agent"))),
+        Some(host_state),
+    )
+    .await
+    .expect("host joins room as a full peer");
+
+    // Wait until both the host peer and the destination have registered.
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(agents) = host.list_agents("dev").await {
+            let has = |id: &str| agents.iter().any(|a| a.id == id);
+            if has("host-agent") && has("dst-agent") {
+                ready = true;
+                break;
+            }
+        }
+    }
+    assert!(ready, "host peer and destination should register");
+
+    // The destination must allow writes to receive the file.
+    host.set_mode("dev", "dst-agent", AgentMode::Bypass)
+        .await
+        .expect("set dst to bypass");
+
+    // Source file on the host's own filesystem.
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("payload.bin");
+    let dst_path = dir.path().join("received.bin");
+    let data: Vec<u8> = (0u8..=255).cycle().take(4000).collect();
+    std::fs::write(&src_path, &data).unwrap();
+
+    // Send to our OWN id — the loopback the iter141 fix produces.
+    let res = host
+        .send_command(
+            "dev",
+            Target::Agent { id: "host-agent".into() },
+            Command::SendFileTo {
+                src_path: src_path.to_string_lossy().to_string(),
+                dest_id: "dst-agent".to_string(),
+                dest_path: dst_path.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .expect("dispatch SendFileTo to own id");
+    let id = match res.into_iter().next() {
+        Some((_, CommandResult::TransferQueued { id })) => id,
+        other => panic!("expected TransferQueued, got {other:?}"),
+    };
+
+    // Poll the host's own transfer registry until it reports completion.
+    let mut done = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = host
+            .send_command(
+                "dev",
+                Target::Agent { id: "host-agent".into() },
+                Command::TransferGet { id: id.clone() },
+            )
+            .await;
+        if let Ok(v) = r {
+            if let Some((_, CommandResult::Transfer { status })) = v.into_iter().next() {
+                match status.state {
+                    TransferState::Done => {
+                        done = true;
+                        break;
+                    }
+                    TransferState::Failed => panic!("transfer failed: {:?}", status.error),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(done, "loopback transfer should reach Done state");
 
     // The received file must be byte-identical to the source.
     assert_eq!(

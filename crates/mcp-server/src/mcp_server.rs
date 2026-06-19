@@ -589,6 +589,16 @@ impl ServerHandler for McpHandler {
         let result = if let Some(ref aid) = agent_id {
             debug!("Routing {} to remote agent {}", tool_name, aid);
             self.remote_command(aid, command).await?
+        } else if tool_name == "send_file" && self.has_relay() {
+            // local host → agent: the local executor has no peer-send primitives
+            // (it would bail), so route SendFileTo to our OWN node id. The relay
+            // delivers Target::Agent{self} back to this peer's socket, where the
+            // relay-controller handler runs begin_send_file. Both relays resolve
+            // Agent-targets without excluding the sender, so no relay change is
+            // needed. See docs/ITERATION_LOG.md iter141.
+            let own_id = self.state.read().await.config.id.clone();
+            debug!("Routing send_file to own node {} (local host → agent)", own_id);
+            self.remote_command(&own_id, command).await?
         } else {
             debug!("Executing {} locally", tool_name);
             let state = self.state.read().await;

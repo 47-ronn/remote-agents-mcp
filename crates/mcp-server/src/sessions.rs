@@ -8,6 +8,8 @@
 
 use anyhow::{bail, Context, Result};
 use remote_agents_shared::{SessionMessage, SessionMeta};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt; // process_group
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -208,6 +210,48 @@ fn claude_title_from(content: &str) -> Option<String> {
 /// for paths containing dashes — this is a display hint only.
 fn decode_claude_dir(name: &str) -> String {
     name.replace('-', "/")
+}
+
+/// The working directory a claude session was recorded in.
+///
+/// `claude --resume <id>` resolves a session id only within the project that
+/// maps to the *current* cwd, so a non-interactive resume must chdir there
+/// first — otherwise claude looks in the wrong project store and reports
+/// "No conversation found with session ID". The exact path lives in the JSONL
+/// `cwd` field; the project *dir name* is lossy (it can't tell `-` from `_`/`/`,
+/// see [`decode_claude_dir`]) so we only fall back to decoding it if no record
+/// carries a cwd.
+pub fn claude_session_cwd(id: &str) -> Option<PathBuf> {
+    let root = claude_root()?;
+    let file = std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path().join(format!("{id}.jsonl")))
+        .find(|p| p.is_file())?;
+    // The first records hold a `cwd`; the head is enough (no full read).
+    if let Some(cwd) = read_head(&file, 256 * 1024).and_then(|c| cwd_from_jsonl(&c)) {
+        return Some(PathBuf::from(cwd));
+    }
+    // Fallback: lossy decode of the project dir name (best effort).
+    file.parent()
+        .and_then(|d| d.file_name())
+        .map(|n| PathBuf::from(decode_claude_dir(&n.to_string_lossy())))
+}
+
+/// First non-empty `cwd` field across a claude JSONL head, if any.
+fn cwd_from_jsonl(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn claude_transcript(id: &str) -> Result<Vec<SessionMessage>> {
@@ -715,12 +759,19 @@ fn run_cli_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Opti
     let tmp = std::env::temp_dir().join(format!("ra-cli-{}.out", uuid::Uuid::new_v4()));
     let status = (|| {
         let file = std::fs::File::create(&tmp).ok()?;
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdout(file)
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(std::process::Stdio::null());
+        // Own process group so a timeout SIGKILLs the whole subtree, not just
+        // the leader: provider CLIs fork heavy children (`opencode` on Bun,
+        // `claude` on node + MCP servers) that would otherwise reparent to init
+        // and leak on every timed-out call. Mirrors the executor's group-kill
+        // (iter145/146); `kill()` below still reaps the leader, killpg the rest.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().ok()?;
+        let pid = child.id();
         let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
@@ -729,8 +780,11 @@ fn run_cli_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Opti
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 _ => {
-                    // Kill AND reap — `kill()` alone leaves the timed-out CLI a
-                    // zombie (std Child doesn't reap on drop).
+                    // Timeout/error: SIGKILL the whole group (descendants that
+                    // didn't start their own group), then kill+reap the leader —
+                    // `kill()` alone reaches only the leader and, without `wait()`,
+                    // leaves it a zombie (std Child doesn't reap on drop).
+                    crate::executor::shell::kill_process_group(Some(pid));
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -835,6 +889,27 @@ mod tests {
     #[test]
     fn decodes_claude_project_dir() {
         assert_eq!(decode_claude_dir("-home-ojo-dev-x"), "/home/ojo/dev/x");
+    }
+
+    #[test]
+    fn cwd_from_jsonl_picks_first_nonempty() {
+        // The leading `mode` record has no cwd; the first user record does. The
+        // exact path (underscores intact) must come from the field, never from a
+        // lossy decode of the dash-encoded project dir name.
+        let jsonl = concat!(
+            r#"{"type":"mode","sessionId":"a"}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/home/ojo/dev/tunshell_mcp_agents","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            cwd_from_jsonl(jsonl).as_deref(),
+            Some("/home/ojo/dev/tunshell_mcp_agents")
+        );
+        // No cwd anywhere → None (caller falls back to the lossy dir decode).
+        assert_eq!(cwd_from_jsonl(r#"{"type":"mode"}"#), None);
+        // Empty cwd is ignored.
+        assert_eq!(cwd_from_jsonl(r#"{"type":"user","cwd":""}"#), None);
     }
 
     #[test]
@@ -1096,5 +1171,47 @@ mod tests {
         std::fs::write(&p, serde_json::to_vec(&msgs).unwrap()).unwrap();
         assert_eq!(vscode_title(&p).as_deref(), Some("Fix the build on CI"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A timed-out provider CLI must take its whole subtree down, not just the
+    /// leader. We run `sh -c "<sleep> & wait"`: the leader is `sh`, the long
+    /// `sleep` is a backgrounded grandchild. Without the group-kill, SIGKILLing
+    /// only `sh` reparents the `sleep` to init and leaks it; `process_group(0)` +
+    /// killpg reaches it. The sleep duration is a unique marker so a stray from a
+    /// broken run is found by pgrep and reaped by PID (not `pkill -f`, which would
+    /// also match this test's own shell).
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_cli_kills_backgrounded_grandchild() {
+        let marker = "92731"; // distinctive sleep length, in seconds
+        let script = format!("sleep {marker} & wait");
+        let start = Instant::now();
+        let out = run_cli_with_timeout("sh", &["-c", &script], Duration::from_millis(300));
+        assert!(out.is_none(), "a timed-out CLI must yield None");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not block waiting on the grandchild"
+        );
+        // Let the SIGKILL propagate, then assert no `sleep <marker>` survives.
+        std::thread::sleep(Duration::from_millis(200));
+        let pgrep = Command::new("pgrep")
+            .args(["-f", &format!("sleep {marker}")])
+            .output()
+            .expect("pgrep");
+        let stdout = String::from_utf8_lossy(&pgrep.stdout);
+        let survivors: Vec<&str> = stdout.split_whitespace().collect();
+        // Reap any leak by PID before asserting, so a failure doesn't poison the
+        // next run with a stray process.
+        for pid in &survivors {
+            if let Ok(p) = pid.parse::<i32>() {
+                unsafe {
+                    libc::kill(p, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "leaked a backgrounded grandchild: {survivors:?}"
+        );
     }
 }

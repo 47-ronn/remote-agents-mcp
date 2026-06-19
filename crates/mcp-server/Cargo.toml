@@ -51,6 +51,11 @@ rust-mcp-macros = "0.9"
 schemars = "0.8"
 async-trait = "0.1"
 
+# Process-group kill on timeout (Unix): SIGKILL the whole `sh -c` tree, not just
+# the leader, so backgrounded grandchildren can't be orphaned to init.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.10"
 # End-to-end transfer test: run the real relay in-process + two agent loops.
