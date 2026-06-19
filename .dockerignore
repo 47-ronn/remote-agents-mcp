@@ -1,0 +1,12 @@
+target/
+node_modules/
+.git/
+.github/
+worker/
+docs/
+guides/
+*.log
+.wrangler/
+npm/bin/
+.env
+.env.local
