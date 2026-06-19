@@ -1,0 +1,46 @@
+# Smithery configuration: https://smithery.ai/docs/build/project-config/smithery.yaml
+# remote-agents ships as a prebuilt binary behind an npm wrapper, so Smithery
+# launches it over stdio with `npx` — no container build needed.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - relay
+      - room
+    properties:
+      relay:
+        type: string
+        description: WebSocket URL of the relay to join, e.g. wss://your-relay-host
+      room:
+        type: string
+        description: Relay room name the agents/MCP share.
+      token:
+        type: string
+        description: Optional shared secret gating room access at the relay.
+      name:
+        type: string
+        description: Optional stable peer id for this MCP node in the room.
+      tags:
+        type: string
+        description: Optional comma-separated tags for fleet targeting (e.g. backend,gpu).
+      noAgent:
+        type: boolean
+        default: false
+        description: >-
+          Run as a send-only controller that does NOT execute commands from
+          other peers. Recommended for production controllers / dashboards.
+  commandFunction: |-
+    (config) => {
+      const args = ['-y', 'remote-agents', 'mcp', '--relay', config.relay, '--room', config.room];
+      if (config.token) args.push('--token', config.token);
+      if (config.name) args.push('--name', config.name);
+      if (config.tags) args.push('--tags', config.tags);
+      if (config.noAgent) args.push('--no-agent');
+      return { command: 'npx', args };
+    }
+  exampleConfig:
+    relay: wss://your-relay-host
+    room: myroom
+    token: your-shared-secret
+    noAgent: true

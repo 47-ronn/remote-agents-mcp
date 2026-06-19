@@ -1,0 +1,43 @@
+# Draft entry for the Docker MCP Catalog.
+# Submit by PR to https://github.com/docker/mcp-registry
+# Path in that repo: servers/remote-agents/server.yaml
+#
+# Recommended: fork docker/mcp-registry, then run `task create` (or `task wizard`)
+# in the fork to generate/validate this file canonically, paste these values,
+# build-test with the printed `docker` command, then open the PR.
+name: remote-agents
+image: mcp/remote-agents
+type: server
+meta:
+  category: devops
+  tags:
+    - remote
+    - ssh
+    - devops
+    - automation
+    - fleet
+about:
+  title: Remote Agents
+  description: >-
+    Control fleets of remote machines via AI agents — run commands, transfer
+    files, drive git, fan out fleet ops, and map/reduce across hosts. Agents
+    connect outbound to a relay; end-to-end encrypted by default.
+  # 400x400-ish PNG hosted over https (reuse the Cline logo once created).
+  icon: https://raw.githubusercontent.com/47-ronn/tunshell_mcp_agents/main/assets/logo.png
+source:
+  project: https://github.com/47-ronn/tunshell_mcp_agents
+  # dockerfile lives at repo root; Docker builds & signs the image.
+  dockerfile: Dockerfile
+config:
+  description: Relay connection settings (shared by every peer in the room).
+  env:
+    - name: REMOTE_AGENTS_RELAY
+      example: wss://your-relay-host
+    - name: REMOTE_AGENTS_ROOM
+      example: myroom
+    - name: REMOTE_AGENTS_NAME
+      example: mcp-controller
+  secrets:
+    - name: remote-agents.token
+      env: REMOTE_AGENTS_TOKEN
+      example: your-shared-secret
