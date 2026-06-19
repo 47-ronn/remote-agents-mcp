@@ -337,18 +337,49 @@ fn download_cloudflared(dest: &Path) -> Result<()> {
 /// Download `url` to `dest` using whatever HTTP client is available (curl, then
 /// wget) — avoids pulling a heavyweight HTTP dependency into the static binary.
 fn fetch(url: &str, dest: &Path) -> Result<()> {
-    let d = dest.to_string_lossy();
-    let curl = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o", &d, url])
-        .status();
+    let d = dest.to_string_lossy().to_string();
+    let curl = Command::new("curl").args(curl_args(url, &d)).status();
     if matches!(curl, Ok(s) if s.success()) {
         return Ok(());
     }
-    let wget = Command::new("wget").args(["-q", "-O", &d, url]).status();
+    let wget = Command::new("wget").args(wget_args(url, &d)).status();
     if matches!(wget, Ok(s) if s.success()) {
         return Ok(());
     }
     bail!("could not download cloudflared (need `curl` or `wget`): {url}")
+}
+
+/// `curl` args for fetching `url` → `dest`, time-bounded so a stalled CDN
+/// connection can't hang `tunnel start` forever: `--connect-timeout` caps the TCP
+/// handshake and `--max-time` the whole transfer. `--max-time` is generous —
+/// cloudflared is tens of MB and the link may be thin — so it kills a true hang,
+/// not a slow-but-progressing download. `--retry` still rides transient failures.
+fn curl_args(url: &str, dest: &str) -> Vec<String> {
+    [
+        "-fsSL",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "300",
+        "-o",
+        dest,
+        url,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// `wget` fallback args. Only `-T` (network timeout) is used for the bound: it's
+/// understood by both GNU wget (alias of `--timeout`) and BusyBox wget (`-T SEC`),
+/// so the fallback stays portable on minimal images where curl is absent.
+fn wget_args(url: &str, dest: &str) -> Vec<String> {
+    ["-q", "-T", "60", "-O", dest, url]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -371,6 +402,31 @@ fn short_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_args_are_time_bounded() {
+        // curl: connect + overall timeout present, file written to dest, url last.
+        let c = curl_args("https://dl/cf", "/tmp/cf");
+        assert!(
+            c.windows(2).any(|w| w[0] == "--connect-timeout" && w[1] == "20"),
+            "curl needs a connect timeout: {c:?}"
+        );
+        assert!(
+            c.windows(2).any(|w| w[0] == "--max-time" && w[1] == "300"),
+            "curl needs an overall timeout: {c:?}"
+        );
+        assert!(c.windows(2).any(|w| w[0] == "-o" && w[1] == "/tmp/cf"));
+        assert_eq!(c.last().map(String::as_str), Some("https://dl/cf"));
+
+        // wget: portable `-T` network timeout, dest via -O, url last.
+        let w = wget_args("https://dl/cf", "/tmp/cf");
+        assert!(
+            w.windows(2).any(|x| x[0] == "-T" && x[1] == "60"),
+            "wget needs a network timeout: {w:?}"
+        );
+        assert!(w.windows(2).any(|x| x[0] == "-O" && x[1] == "/tmp/cf"));
+        assert_eq!(w.last().map(String::as_str), Some("https://dl/cf"));
+    }
 
     #[test]
     fn asset_mapping_covers_common_platforms() {
