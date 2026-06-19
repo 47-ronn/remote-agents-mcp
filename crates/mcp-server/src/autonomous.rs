@@ -63,18 +63,22 @@ impl AutonomousStore {
 
     /// Accept a task with the configured runner.
     pub fn dispatch(self: &Arc<Self>, prompt: &str, initiator: Option<String>) -> Result<String> {
-        self.dispatch_with_runner(prompt, initiator, None)
+        self.dispatch_with_runner(prompt, initiator, None, None)
     }
 
     /// Accept a task: persist it as Queued and spawn the runner in the
     /// background. `runner_override` replaces the configured runner (used to
     /// resume a specific provider session, e.g. `claude -p --resume <id>`).
+    /// `cwd_override` runs the child in a specific directory (resume must run in
+    /// the session's own project dir so `claude --resume` can find it), taking
+    /// precedence over the configured `workdir`/home default.
     /// Returns the new task id immediately.
     pub fn dispatch_with_runner(
         self: &Arc<Self>,
         prompt: &str,
         initiator: Option<String>,
         runner_override: Option<Vec<String>>,
+        cwd_override: Option<PathBuf>,
     ) -> Result<String> {
         if !self.available {
             bail!("autonomous mode is not enabled on this host");
@@ -100,7 +104,7 @@ impl AutonomousStore {
         let prompt = prompt.to_string();
         let id_bg = id.clone();
         tokio::spawn(async move {
-            store.run_task(&id_bg, &prompt, runner_override).await;
+            store.run_task(&id_bg, &prompt, runner_override, cwd_override).await;
         });
 
         info!("Autonomous task '{}' queued", id);
@@ -135,7 +139,13 @@ impl AutonomousStore {
 
     // --- internals ---------------------------------------------------------
 
-    async fn run_task(&self, id: &str, prompt: &str, runner_override: Option<Vec<String>>) {
+    async fn run_task(
+        &self,
+        id: &str,
+        prompt: &str,
+        runner_override: Option<Vec<String>>,
+        cwd_override: Option<PathBuf>,
+    ) {
         let runner = runner_override.as_ref().unwrap_or(&self.config.runner);
         if runner.is_empty() {
             self.finish(id, TaskStatus::Failed, None, Some("empty runner command".into()), None);
@@ -149,11 +159,24 @@ impl AutonomousStore {
         cmd.args(&runner[1..]);
         cmd.arg(prompt); // prompt appended as the final argument
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        // Kill the AI process if the `output()` future is dropped (i.e. on the
-        // timeout below) — otherwise an expensive `claude -p`/`opencode` run is
-        // orphaned and keeps running after the task is marked timed-out.
+        // Kill the AI process if the wait future is dropped (i.e. on the timeout
+        // below) — otherwise an expensive `claude -p`/`opencode` run is orphaned
+        // and keeps running after the task is marked timed-out. `kill_on_drop`
+        // only signals the leader; the whole-tree group kill below handles the
+        // grandchildren these CLIs spawn (node, MCP servers, sub-agents).
         cmd.kill_on_drop(true);
-        if let Some(dir) = &self.config.workdir {
+        // Run the runner as its own process-group leader so a timeout can SIGKILL
+        // the entire tree, not just the leader. `claude -p`/`opencode` fork heavy
+        // child processes; without this they reparent to init and leak on every
+        // timed-out task (same fix as the shell executor, ITERATION_LOG iter145).
+        #[cfg(unix)]
+        cmd.process_group(0);
+        // A resume must run in the session's own project dir (so `claude
+        // --resume <id>` can locate it); otherwise fall back to the configured
+        // workdir, then home.
+        if let Some(dir) = cwd_override {
+            cmd.current_dir(dir);
+        } else if let Some(dir) = &self.config.workdir {
             cmd.current_dir(dir);
         } else if let Some(home) = dirs::home_dir() {
             cmd.current_dir(home);
@@ -161,8 +184,24 @@ impl AutonomousStore {
         // NOTE: env is inherited as-is → the host's existing AI CLI login is used.
 
         info!("Running autonomous task '{}' via {:?}", id, program);
-        let fut = cmd.output();
-        match timeout(Duration::from_secs(self.config.timeout), fut).await {
+        // Spawn manually (rather than `cmd.output()`) so the pid is in hand for a
+        // process-group kill if the timeout fires.
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Autonomous task '{}' failed to spawn: {}", id, e);
+                self.finish(
+                    id,
+                    TaskStatus::Failed,
+                    None,
+                    Some(format!("failed to run '{}': {}", program, e)),
+                    None,
+                );
+                return;
+            }
+        };
+        let pid = child.id();
+        match timeout(Duration::from_secs(self.config.timeout), child.wait_with_output()).await {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -179,17 +218,21 @@ impl AutonomousStore {
                 }
             }
             Ok(Err(e)) => {
-                error!("Autonomous task '{}' failed to spawn: {}", id, e);
+                error!("Autonomous task '{}' runner I/O error: {}", id, e);
                 self.finish(
                     id,
                     TaskStatus::Failed,
                     None,
-                    Some(format!("failed to run '{}': {}", program, e)),
+                    Some(format!("runner '{}' I/O error: {}", program, e)),
                     None,
                 );
             }
             Err(_) => {
                 warn!("Autonomous task '{}' timed out", id);
+                // `wait_with_output` is dropped here; kill_on_drop reaps the
+                // leader, but SIGKILL the whole group to reach grandchildren the
+                // AI CLI backgrounded (see iter145).
+                crate::executor::shell::kill_process_group(pid);
                 self.finish(
                     id,
                     TaskStatus::Failed,
@@ -458,6 +501,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         panic!("timed-out runner was left running (not killed)");
+    }
+
+    /// The tree case: a runner that BACKGROUNDS a child (as `claude -p` /
+    /// `opencode` do — node, MCP servers, sub-agents) keeps the leader as `sh`,
+    /// so `kill_on_drop` alone would reap `sh` and leave the grandchild
+    /// reparented to init. The process-group kill must take the whole tree down.
+    /// With the group kill removed this test stays red — the grandchild lives on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_task_kills_backgrounded_grandchild() {
+        // `<marker> & wait`: sh forks the sleep into the background and blocks in
+        // `wait`, so the leader is sh and the victim is a *grandchild*.
+        let marker = "sleep 91.39";
+        let s = store_runner_timeout(vec!["sh", "-c", "sleep 91.39 & wait"], 1);
+        let id = s.dispatch("ignored", None).unwrap();
+
+        // The backgrounded grandchild should be running before the 1s timeout.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(pgrep(marker), "backgrounded grandchild should be running");
+
+        // Poll past the 1s timeout for the terminal (Failed/timed out) state.
+        let mut task = None;
+        for _ in 0..150 {
+            let t = s.get(&id).unwrap().unwrap();
+            if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
+                task = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let task = task.expect("task did not reach a terminal state");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.error.unwrap_or_default().contains("timed out"));
+
+        // The whole tree must be gone, grandchild included.
+        for _ in 0..25 {
+            if !pgrep(marker) {
+                return; // killed — pass
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        panic!("timed-out runner leaked a backgrounded grandchild");
     }
 
     #[tokio::test]

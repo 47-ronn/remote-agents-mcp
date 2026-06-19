@@ -87,7 +87,14 @@ pub fn receive_chunk(
         .decode(bytes_b64)
         .context("decode transfer chunk")?;
 
-    if sec.max_transfer_size > 0 && offset + bytes.len() as u64 > sec.max_transfer_size {
+    // `offset` is peer-supplied; compute the end with checked arithmetic so a
+    // near-`u64::MAX` offset can't wrap PAST the size guard and then `seek` to a
+    // colossal position (which would balloon a sparse file and make the eof
+    // sha256 read run effectively forever). Overflow ⇒ treat as over-limit.
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("transfer chunk offset overflow ({offset} + {})", bytes.len()))?;
+    if sec.max_transfer_size > 0 && end > sec.max_transfer_size {
         bail!("transfer exceeds limit of {} bytes", sec.max_transfer_size);
     }
 
@@ -258,6 +265,36 @@ mod tests {
         let dp = dest.to_string_lossy().to_string();
         let r = receive_chunk(&dp, 0, &b64(b"hello"), true, Some("deadbeef"), &sec());
         assert!(r.is_err());
+    }
+
+    // A peer-supplied `offset` near u64::MAX must not wrap past the size guard.
+    // Without checked arithmetic this would seek to a colossal position and
+    // balloon a sparse file; here it must be rejected before any file is touched.
+    #[test]
+    fn receive_rejects_overflowing_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        let dp = dest.to_string_lossy().to_string();
+
+        let r = receive_chunk(&dp, u64::MAX, &b64(b"x"), false, None, &sec());
+        assert!(r.is_err(), "overflowing offset must be rejected");
+        // The guard runs before any open/seek, so no file is created.
+        assert!(!dest.exists(), "no file should be created on a rejected chunk");
+    }
+
+    // An in-range offset whose end exceeds the configured limit is rejected by
+    // the size guard (the non-overflowing sibling of the case above).
+    #[test]
+    fn receive_rejects_over_limit_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        let dp = dest.to_string_lossy().to_string();
+
+        let mut cfg = sec();
+        cfg.max_transfer_size = 1024;
+        let r = receive_chunk(&dp, 1024, &b64(b"x"), false, None, &cfg);
+        assert!(r.is_err(), "offset past the limit must be rejected");
+        assert!(!dest.exists());
     }
 
     // Pipe stream_file's FileRecv chunks straight into the receiver (the closure

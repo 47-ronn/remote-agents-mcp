@@ -2,7 +2,7 @@
 
 mod filesystem;
 mod git;
-mod shell;
+pub(crate) mod shell;
 
 use crate::safety;
 use crate::state::AgentState;
@@ -249,7 +249,14 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 bail!("autonomous mode is not enabled on this host");
             }
             let runner = crate::sessions::resume_runner(provider, id)?;
-            let new_id = store.dispatch_with_runner(prompt, None, Some(runner))?;
+            // `claude --resume <id>` only finds the session within the project
+            // that maps to its cwd, so resume from the session's recorded dir.
+            let cwd = if provider == "claude" {
+                crate::sessions::claude_session_cwd(id)
+            } else {
+                None
+            };
+            let new_id = store.dispatch_with_runner(prompt, None, Some(runner), cwd)?;
             Ok(CommandResult::TaskQueued { id: new_id })
         }
 

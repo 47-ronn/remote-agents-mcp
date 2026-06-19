@@ -4,28 +4,63 @@
 //! tree light and matches whatever git configuration / credentials the host
 //! already has set up for the user running the agent.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use remote_agents_shared::GitStatus;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
+
+/// Upper bound on any single `git` invocation. Local ops (status/commit) finish
+/// in milliseconds; this only backstops *network* subcommands (`pull`/`push`)
+/// that would otherwise stall indefinitely — a wedged TLS/SSH connection, or an
+/// SSH host-key prompt with no terminal to answer it. Generous on purpose: a
+/// legitimately slow transfer over a thin link must not be cut off, only a true
+/// hang. The credential-prompt hang is killed instantly by `GIT_TERMINAL_PROMPT`
+/// below; this is the safety net for everything else.
+const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Run a git subcommand in `repo` and capture its output.
 async fn git(repo: &str, args: &[&str]) -> Result<(String, String, i32)> {
-    let output = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo)
         .args(args)
+        // Headless agent: there is no terminal, so a private-repo `pull`/`push`
+        // would otherwise block *forever* waiting on a username/password prompt.
+        // `0` makes git fail fast with a clear error instead of hanging.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("failed to spawn git")?;
-
+        .stderr(Stdio::piped());
+    let output = run_with_timeout(cmd, GIT_TIMEOUT).await?;
     Ok((
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
         output.status.code().unwrap_or(-1),
     ))
+}
+
+/// Spawn `cmd`, capture its output, and abort it if it outruns `timeout`.
+///
+/// The child leads its own process group (`process_group(0)`, unix) so a hung
+/// network subcommand takes its whole subtree down on timeout — `git pull`/`push`
+/// fork `git-remote-https`/`ssh` children that would otherwise reparent to init
+/// and leak (same class as the executor's group-kill, iter145–147). On timeout we
+/// SIGKILL the group; `kill_on_drop` reaps the leader as the future is dropped.
+async fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().context("failed to spawn git")?;
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(res) => res.context("git i/o failed"),
+        Err(_elapsed) => {
+            // The future (owning `child`) is dropped at end of scope → kill_on_drop
+            // SIGKILLs the leader; this reaches the rest of the group.
+            crate::executor::shell::kill_process_group(pid);
+            bail!("git timed out after {}s", timeout.as_secs());
+        }
+    }
 }
 
 /// Collect a structured status of the repository at `repo`.
@@ -165,6 +200,47 @@ mod tests {
             .await
             .unwrap();
         (dir, repo)
+    }
+
+    /// A timed-out git invocation must take its whole subtree down, not just the
+    /// leader. We run `sh -c "<sleep> & wait"` through the same helper git uses:
+    /// the leader is `sh`, the long `sleep` is a backgrounded grandchild standing
+    /// in for the `git-remote-https`/`ssh` children a real `pull`/`push` forks.
+    /// Without the group-kill, SIGKILLing only `sh` reparents the `sleep` to init
+    /// and leaks it. Unique sleep length so a stray from a broken run is found by
+    /// pgrep and reaped by PID (not `pkill -f`, which would match this test too).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_git_kills_backgrounded_grandchild() {
+        let marker = "84517"; // distinctive sleep length, in seconds
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("sleep {marker} & wait")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let res = run_with_timeout(cmd, Duration::from_millis(300)).await;
+        assert!(res.is_err(), "a timed-out command must error");
+
+        // Let the SIGKILL propagate, then assert no `sleep <marker>` survives.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pgrep = std::process::Command::new("pgrep")
+            .args(["-f", &format!("sleep {marker}")])
+            .output()
+            .expect("pgrep");
+        let stdout = String::from_utf8_lossy(&pgrep.stdout);
+        let survivors: Vec<&str> = stdout.split_whitespace().collect();
+        // Reap any leak by PID before asserting, so a failure can't poison the
+        // next run with a stray process.
+        for pid in &survivors {
+            if let Ok(p) = pid.parse::<i32>() {
+                unsafe {
+                    libc::kill(p, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "leaked a backgrounded grandchild: {survivors:?}"
+        );
     }
 
     #[test]
