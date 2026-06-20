@@ -940,13 +940,28 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
                         },
                     }
                 }
-                Ok(cmd) => match crate::executor::execute(&cmd, state).await {
-                    Ok(result) => encrypt_result(&shared.cipher, request_id, result),
-                    Err(e) => ClientMessage::CommandError {
-                        request_id,
-                        error: e.to_string(),
-                    },
-                },
+                Ok(cmd) => {
+                    let is_set_mode = matches!(cmd, Command::SetMode { .. });
+                    match crate::executor::execute(&cmd, state).await {
+                        Ok(result) => {
+                            // After a successful SetMode, notify the relay of our new info
+                            if is_set_mode {
+                                let updated_info = crate::connection::build_agent_info(
+                                    &state.config,
+                                    state.mode().await,
+                                );
+                                let _ = shared.tx.send(ClientMessage::UpdateAgent {
+                                    agent_info: Box::new(updated_info),
+                                }).await;
+                            }
+                            encrypt_result(&shared.cipher, request_id, result)
+                        }
+                        Err(e) => ClientMessage::CommandError {
+                            request_id,
+                            error: e.to_string(),
+                        },
+                    }
+                }
                 Err(e) => {
                     warn!("Failed to decrypt incoming command {}: {}", request_id, e);
                     ClientMessage::CommandError {

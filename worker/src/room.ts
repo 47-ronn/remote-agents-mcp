@@ -355,6 +355,28 @@ export class Room implements DurableObject {
         });
         return;
       }
+
+      // Agent is updating its info (e.g. after mode change)
+      case 'update_agent': {
+        const newInfo = msg.agent_info;
+        if (!att.agentInfo || att.agentInfo.id !== newInfo.id) {
+          // Reject updates from sessions without matching agent_info
+          return;
+        }
+        // Preserve session_id and connected_at from the current attachment
+        const updatedInfo: AgentInfo = { 
+          ...newInfo, 
+          session_id: att.sessionId,
+          connected_at: att.agentInfo.connected_at,
+        };
+        this.patchAtt(ws, { agentInfo: updatedInfo });
+        
+        // Broadcast the update using the updatedInfo directly (not reading
+        // from sockets which may not reflect the patch yet in all code paths)
+        this.broadcastToMcp({ type: 'agent_joined', agent: updatedInfo });
+        this.broadcastToAgents({ type: 'agent_joined', agent: updatedInfo }, newInfo.id);
+        return;
+      }
     }
   }
 
