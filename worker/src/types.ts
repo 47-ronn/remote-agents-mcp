@@ -169,7 +169,8 @@ export type ClientMessage =
   | { type: 'udp_answer'; answer: UdpAnswer }
   | { type: 'udp_result'; result: UdpChannelResult }
   | { type: 'ping' }
-  | { type: 'close' };
+  | { type: 'close' }
+  | { type: 'update_agent'; agent_info: AgentInfo };
 
 // Relay → Client Messages
 export type ServerMessage =
