@@ -117,11 +117,36 @@ fn program_on_path(prog: &str) -> bool {
     if prog.is_empty() {
         return false;
     }
-    if prog.contains('/') {
+    if prog.contains('/') || prog.contains('\\') {
         return std::path::Path::new(prog).is_file();
     }
+    
+    #[cfg(windows)]
+    let extensions = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .map(|s| s.to_lowercase())
+        .collect::<Vec<_>>();
+    
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(prog).is_file()))
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                #[cfg(unix)]
+                {
+                    dir.join(prog).is_file()
+                }
+                #[cfg(windows)]
+                {
+                    // On Windows, check both bare name and with PATHEXT extensions
+                    if dir.join(prog).is_file() {
+                        return true;
+                    }
+                    extensions.iter().any(|ext| {
+                        dir.join(format!("{}{}", prog, ext)).is_file()
+                    })
+                }
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -614,8 +639,12 @@ mod tests {
         assert!(!autonomous_available(&forced_off));
 
         // Auto-detect (enabled = None): a program that's always on PATH vs a bogus one.
-        let present = AutonomousConfig { enabled: None, runner: vec!["sh".into()], ..Default::default() };
-        assert!(autonomous_available(&present), "sh should be on PATH");
+        #[cfg(unix)]
+        let common_cmd = "sh";
+        #[cfg(windows)]
+        let common_cmd = "cmd";
+        let present = AutonomousConfig { enabled: None, runner: vec![common_cmd.into()], ..Default::default() };
+        assert!(autonomous_available(&present), "{} should be on PATH", common_cmd);
         let absent = AutonomousConfig { enabled: None, runner: vec!["definitely-not-a-real-binary-xyz".into()], ..Default::default() };
         assert!(!autonomous_available(&absent));
 
@@ -624,10 +653,20 @@ mod tests {
         assert!(!autonomous_available(&empty));
 
         // Absolute path: existing executable vs missing.
-        let abs_ok = AutonomousConfig { enabled: None, runner: vec!["/bin/sh".into()], ..Default::default() };
-        assert!(autonomous_available(&abs_ok));
-        let abs_no = AutonomousConfig { enabled: None, runner: vec!["/no/such/bin".into()], ..Default::default() };
-        assert!(!autonomous_available(&abs_no));
+        #[cfg(unix)]
+        {
+            let abs_ok = AutonomousConfig { enabled: None, runner: vec!["/bin/sh".into()], ..Default::default() };
+            assert!(autonomous_available(&abs_ok));
+            let abs_no = AutonomousConfig { enabled: None, runner: vec!["/no/such/bin".into()], ..Default::default() };
+            assert!(!autonomous_available(&abs_no));
+        }
+        #[cfg(windows)]
+        {
+            let abs_ok = AutonomousConfig { enabled: None, runner: vec!["C:\\Windows\\System32\\cmd.exe".into()], ..Default::default() };
+            assert!(autonomous_available(&abs_ok));
+            let abs_no = AutonomousConfig { enabled: None, runner: vec!["C:\\no\\such\\bin.exe".into()], ..Default::default() };
+            assert!(!autonomous_available(&abs_no));
+        }
     }
 
     #[test]

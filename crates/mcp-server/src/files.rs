@@ -348,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn search_by_name_finds_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("vacation-photo.jpg"), b"x").unwrap();
@@ -366,6 +367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn search_finds_nested_files_but_prunes_heavy_dirs() {
         let dir = tempfile::tempdir().unwrap();
         // A file in a normal project subdir must be found (the case that the
@@ -384,6 +386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn search_by_content_finds_matching_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"the needle is here\n").unwrap();
@@ -396,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn search_by_content_excludes_heavy_dirs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("src.txt"), b"the needle is here\n").unwrap();
@@ -411,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_collecting_honors_result_cap() {
         let out = run_collecting(
             "sh",
@@ -424,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_collecting_returns_all_lines_before_timeout() {
         let out = run_collecting(
             "sh",
@@ -436,6 +442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_collecting_aborts_on_timeout() {
         let start = Instant::now();
         // The match is printed only after a 5s sleep; a 300ms deadline must win.

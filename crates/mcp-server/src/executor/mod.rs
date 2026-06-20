@@ -588,6 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn map_task_runs_shell_over_stdin() {
         let state = bypass_state().await;
         let cmd = Command::MapTask {
@@ -615,6 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn reduce_task_folds_inputs_via_stdin() {
         let state = bypass_state().await;
         // Map outputs arrive newline-joined; sum them with awk.
