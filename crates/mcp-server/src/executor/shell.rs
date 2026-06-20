@@ -22,9 +22,21 @@ pub struct ExecResult {
 /// Maximum partial output to capture on timeout (128 KB per stream).
 const MAX_PARTIAL_OUTPUT: usize = 128 * 1024;
 
+/// Windows command line length limit (safe threshold to avoid "filename too long").
+/// Actual limit is ~8191 for cmd.exe, but we use a conservative 4KB threshold.
+#[cfg(windows)]
+const MAX_CMD_LINE_LENGTH: usize = 4096;
+
 /// Execute a shell command with timeout. On timeout, returns any partial
 /// stdout/stderr captured so far instead of empty strings.
 pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<ExecResult> {
+    // On Windows, if the command is too long, use a temporary script file to avoid
+    // "The filename or extension is too long" error (cmd.exe has ~8KB limit).
+    #[cfg(windows)]
+    if command.len() > MAX_CMD_LINE_LENGTH {
+        return exec_via_tempfile(command, cwd, timeout_ms).await;
+    }
+
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let shell_arg = if cfg!(windows) { "/C" } else { "-c" };
 
@@ -152,6 +164,133 @@ pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<E
     }
 }
 
+/// Execute a long command via a temporary batch/script file on Windows.
+/// This avoids the "filename or extension is too long" error when the command
+/// exceeds cmd.exe's ~8KB argument length limit.
+#[cfg(windows)]
+async fn exec_via_tempfile(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<ExecResult> {
+    use std::io::Write;
+    
+    // Create a temporary batch file
+    let temp_dir = std::env::temp_dir();
+    let script_name = format!("remote-agent-{}.bat", std::process::id());
+    let script_path = temp_dir.join(script_name);
+    
+    // Write the command to the batch file
+    let mut file = std::fs::File::create(&script_path)?;
+    writeln!(file, "@echo off")?;
+    writeln!(file, "{}", command)?;
+    drop(file);
+    
+    // Execute the batch file
+    let script_path_str = script_path.to_string_lossy().to_string();
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C")
+        .arg(&script_path_str)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    
+    cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("LC_ALL", "en_US.UTF-8");
+    
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let deadline = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+    
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    
+    let stdout_buf_clone = stdout_buf.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout_handle {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stdout_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stdout_abort = stdout_task.abort_handle();
+    
+    let stderr_buf_clone = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr_handle {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stderr_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stderr_abort = stderr_task.abort_handle();
+    
+    let wait_result = timeout(deadline, async {
+        let status = child.wait().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        status
+    })
+    .await;
+    
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    
+    // Clean up the temporary file
+    let _ = std::fs::remove_file(&script_path);
+    
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_buf.lock().await.clone();
+            let stderr = stderr_buf.lock().await.clone();
+            Ok(ExecResult {
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(-1),
+                duration_ms: elapsed_ms,
+                timed_out: false,
+            })
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_elapsed) => {
+            kill_process_group(pid);
+            stdout_abort.abort();
+            stderr_abort.abort();
+            let partial_stdout = stdout_buf.lock().await.clone();
+            let partial_stderr = stderr_buf.lock().await.clone();
+            let mut stderr_out = partial_stderr;
+            if !stderr_out.is_empty() {
+                stderr_out.push('\n');
+            }
+            stderr_out.push_str(&format!("[command timed out after {}ms]", elapsed_ms));
+            Ok(ExecResult {
+                stdout: partial_stdout,
+                stderr: stderr_out,
+                exit_code: -1,
+                duration_ms: elapsed_ms,
+                timed_out: true,
+            })
+        }
+    }
+}
+
 /// SIGKILL the whole process group led by `pid` (no-op if the child already
 /// exited and so reports no pid). `process_group(0)` made the child its own
 /// group leader, so `-pid` targets it and every descendant that didn't start a
@@ -192,6 +331,12 @@ pub async fn exec_with_stdin(
     stdin_data: &str,
     timeout_ms: u64,
 ) -> Result<ExecResult> {
+    // On Windows, use tempfile for long commands to avoid argument length limits
+    #[cfg(windows)]
+    if command.len() > MAX_CMD_LINE_LENGTH {
+        return exec_with_stdin_via_tempfile(command, stdin_data, timeout_ms).await;
+    }
+
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let shell_arg = if cfg!(windows) { "/C" } else { "-c" };
 
@@ -300,6 +445,137 @@ pub async fn exec_with_stdin(
             stderr_abort.abort();
             writer_abort.abort();
             // Collect whatever partial output we captured.
+            let partial_stdout = stdout_buf.lock().await.clone();
+            let partial_stderr = stderr_buf.lock().await.clone();
+            let mut stderr_out = partial_stderr;
+            if !stderr_out.is_empty() {
+                stderr_out.push('\n');
+            }
+            stderr_out.push_str(&format!("[command timed out after {}ms]", elapsed_ms));
+            Ok(ExecResult {
+                stdout: partial_stdout,
+                stderr: stderr_out,
+                exit_code: -1,
+                duration_ms: elapsed_ms,
+                timed_out: true,
+            })
+        }
+    }
+}
+
+/// Execute a command with stdin via tempfile (Windows long command workaround).
+#[cfg(windows)]
+async fn exec_with_stdin_via_tempfile(
+    command: &str,
+    stdin_data: &str,
+    timeout_ms: u64,
+) -> Result<ExecResult> {
+    use std::io::Write;
+    
+    let temp_dir = std::env::temp_dir();
+    let script_name = format!("remote-agent-stdin-{}.bat", std::process::id());
+    let script_path = temp_dir.join(script_name);
+    
+    let mut file = std::fs::File::create(&script_path)?;
+    writeln!(file, "@echo off")?;
+    writeln!(file, "{}", command)?;
+    drop(file);
+    
+    let script_path_str = script_path.to_string_lossy().to_string();
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C")
+        .arg(&script_path_str)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8")
+        .kill_on_drop(true);
+    
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    
+    let stdin = child.stdin.take();
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let data = stdin_data.to_string();
+    let writer = tokio::spawn(async move {
+        if let Some(mut si) = stdin {
+            let _ = si.write_all(data.as_bytes()).await;
+        }
+    });
+    let writer_abort = writer.abort_handle();
+    
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    
+    let stdout_buf_clone = stdout_buf.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout_handle {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stdout_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stdout_abort = stdout_task.abort_handle();
+    
+    let stderr_buf_clone = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr_handle {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stderr_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stderr_abort = stderr_task.abort_handle();
+    
+    let deadline = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+    
+    let wait_result = timeout(deadline, async {
+        let status = child.wait().await;
+        let _ = writer.await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        status
+    })
+    .await;
+    
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let _ = std::fs::remove_file(&script_path);
+    
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_buf.lock().await.clone();
+            let stderr = stderr_buf.lock().await.clone();
+            Ok(ExecResult {
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(-1),
+                duration_ms: elapsed_ms,
+                timed_out: false,
+            })
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_elapsed) => {
+            kill_process_group(pid);
+            stdout_abort.abort();
+            stderr_abort.abort();
+            writer_abort.abort();
             let partial_stdout = stdout_buf.lock().await.clone();
             let partial_stderr = stderr_buf.lock().await.clone();
             let mut stderr_out = partial_stderr;
@@ -558,5 +834,32 @@ mod tests {
         // Duration should be non-zero (command took at least some time).
         // Just check it's reasonable — less than 5 seconds.
         assert!(result.duration_ms < 5000, "duration_ms too large: {}", result.duration_ms);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn long_command_uses_tempfile_automatically() {
+        // Create a command longer than MAX_CMD_LINE_LENGTH (4096 bytes)
+        // by echoing a long string. This should trigger the tempfile path.
+        let long_str = "X".repeat(5000);
+        let command = format!("echo {}", long_str);
+        
+        let result = exec(&command, None, 5000).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        // The output should contain our repeated X's
+        assert!(result.stdout.contains("XXXX"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn long_command_with_stdin_uses_tempfile() {
+        // Create a long command that echoes stdin
+        let long_comment = format!("REM {}", "Y".repeat(5000));
+        let command = format!("{}\nfindstr .*", long_comment);
+        
+        let result = exec_with_stdin(&command, "HELLO", 5000).await.unwrap();
+        // Command should execute without "filename too long" error
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("HELLO"));
     }
 }
