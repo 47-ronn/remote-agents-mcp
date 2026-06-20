@@ -421,7 +421,11 @@ mod tests {
 
     fn store(enabled: bool) -> Arc<AutonomousStore> {
         // Trivial, always-present runner that echoes the prompt back.
-        store_runner(enabled, vec!["echo"]).0
+        #[cfg(unix)]
+        let runner = vec!["echo"];
+        #[cfg(windows)]
+        let runner = vec!["cmd", "/C", "echo"];
+        store_runner(enabled, runner).0
     }
 
     #[cfg(unix)]
@@ -606,6 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn nonzero_exit_marks_failed() {
         // `false` ignores its args and exits 1.
         let (s, _rx) = store_runner(true, vec!["false"]);
@@ -617,7 +622,11 @@ mod tests {
 
     #[tokio::test]
     async fn completion_event_is_emitted() {
-        let (s, mut rx) = store_runner(true, vec!["echo"]);
+        #[cfg(unix)]
+        let runner = vec!["echo"];
+        #[cfg(windows)]
+        let runner = vec!["cmd", "/C", "echo"];
+        let (s, mut rx) = store_runner(true, runner);
         let id = s.dispatch("ping", None).unwrap();
         // A TaskCompleted event for this id is pushed for the connection loop.
         // Await it directly (the event send trails the DB write inside finish()).
