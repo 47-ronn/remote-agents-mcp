@@ -337,12 +337,17 @@ fn download_cloudflared(dest: &Path) -> Result<()> {
 /// Download `url` to `dest` using whatever HTTP client is available (curl, then
 /// wget) — avoids pulling a heavyweight HTTP dependency into the static binary.
 fn fetch(url: &str, dest: &Path) -> Result<()> {
+    fetch_with_commands(url, dest, "curl", "wget")
+}
+
+/// Testable core: tries `curl_cmd` first, then `wget_cmd` if that fails.
+fn fetch_with_commands(url: &str, dest: &Path, curl_cmd: &str, wget_cmd: &str) -> Result<()> {
     let d = dest.to_string_lossy().to_string();
-    let curl = Command::new("curl").args(curl_args(url, &d)).status();
+    let curl = Command::new(curl_cmd).args(curl_args(url, &d)).status();
     if matches!(curl, Ok(s) if s.success()) {
         return Ok(());
     }
-    let wget = Command::new("wget").args(wget_args(url, &d)).status();
+    let wget = Command::new(wget_cmd).args(wget_args(url, &d)).status();
     if matches!(wget, Ok(s) if s.success()) {
         return Ok(());
     }
@@ -563,5 +568,86 @@ mod tests {
         assert_eq!(url_host("http://localhost@evil.com").as_deref(), Some("evil.com"));
         assert_eq!(url_host("http://[::1]:8080/p").as_deref(), Some("::1"));
         assert_eq!(url_host("http://127.0.0.1.evil.com").as_deref(), Some("127.0.0.1.evil.com"));
+    }
+
+    /// fetch() fallback logic: when curl fails, wget is tried; when wget
+    /// succeeds, fetch returns Ok. Uses fake scripts via absolute paths to test
+    /// the branching without network I/O.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_falls_back_to_wget_when_curl_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!("ra-fetch-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Fake curl: always fails (exit 1).
+        let fake_curl = tmp.join("fake_curl");
+        std::fs::write(&fake_curl, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Fake wget: writes a marker to the destination file (given by -O flag).
+        // Args: -q -T 60 -O <dest> <url>
+        let fake_wget = tmp.join("fake_wget");
+        std::fs::write(
+            &fake_wget,
+            "#!/bin/sh\nfor arg; do shift; case \"$arg\" in -O) break;; esac; done; echo FETCHED > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_wget, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dest = tmp.join("download_output");
+        let result = fetch_with_commands(
+            "https://example.com/file",
+            &dest,
+            fake_curl.to_str().unwrap(),
+            fake_wget.to_str().unwrap(),
+        );
+        assert!(result.is_ok(), "fetch should succeed via wget fallback: {result:?}");
+        let content = std::fs::read_to_string(&dest).unwrap();
+        assert!(
+            content.contains("FETCHED"),
+            "wget should have written the marker: got '{content}'"
+        );
+
+        // Clean up.
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// fetch() fails cleanly when BOTH curl and wget fail — error message mentions
+    /// both tools.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_errors_when_both_curl_and_wget_fail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!("ra-fetch-both-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Both scripts exit with failure.
+        let fake_curl = tmp.join("fake_curl");
+        std::fs::write(&fake_curl, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_wget = tmp.join("fake_wget");
+        std::fs::write(&fake_wget, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake_wget, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dest = tmp.join("download_output");
+        let result = fetch_with_commands(
+            "https://example.com/file",
+            &dest,
+            fake_curl.to_str().unwrap(),
+            fake_wget.to_str().unwrap(),
+        );
+        assert!(result.is_err(), "fetch should error when both fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("curl") && msg.contains("wget"),
+            "error should mention both tools: '{msg}'"
+        );
+
+        // Clean up.
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

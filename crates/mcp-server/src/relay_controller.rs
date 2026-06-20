@@ -1,5 +1,6 @@
 //! Connection pool management for relay servers
 
+use crate::connection::{authenticated_answer, authenticated_offer};
 use crate::relay_udp::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -969,6 +970,7 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
 
         ServerMessage::UdpOffer { from_session, offer } => {
             debug!("Received UDP offer from {}", from_session);
+            let offer = authenticated_offer(&from_session, offer);
             if let Err(e) = shared.udp_transport.handle_offer(offer).await {
                 warn!("Failed to handle UDP offer: {}", e);
             }
@@ -976,6 +978,7 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
 
         ServerMessage::UdpAnswer { from_session, answer } => {
             debug!("Received UDP answer from {}", from_session);
+            let answer = authenticated_answer(&from_session, answer);
             if let Err(e) = shared.udp_transport.handle_answer(answer).await {
                 warn!("Failed to handle UDP answer: {}", e);
             }
