@@ -53,9 +53,6 @@ static SAFE_DIRS_ADDED: OnceLock<Mutex<std::collections::HashSet<String>>> = Onc
 /// This is idempotent: each path is only added once per process lifetime.
 #[cfg(windows)]
 async fn ensure_safe_directory(repo: &str) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::ffi::OsStr;
-
     // Normalize the path so git config matching works.
     let path = match std::fs::canonicalize(repo) {
         Ok(p) => p,
