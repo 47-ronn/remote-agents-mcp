@@ -18,6 +18,17 @@ use state::RelayState;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+/// Hard ceiling on a single inbound WebSocket message.
+///
+/// The relay accepts connections from untrusted clients; axum's default
+/// (64 MiB) lets any one of them force the relay to buffer a 64 MiB frame before
+/// `from_json` runs — a per-connection memory-amplification DoS. The relay only
+/// ever routes small control messages plus opaque encrypted envelopes, which the
+/// host caps at 900 KB to stay under the Cloudflare Workers' ~1 MiB WS limit.
+/// Since this relay is a drop-in alternative to that worker, mirror the 1 MiB
+/// cap: comfortably above any legitimate frame, far below the 64 MiB default.
+const MAX_WS_MESSAGE: usize = 1024 * 1024;
+
 /// Build the relay's HTTP/WS router over the given shared state.
 pub fn router(state: Arc<RelayState>) -> Router {
     Router::new()
@@ -45,7 +56,9 @@ async fn ws_handler(
     // hole-punching. Prefer proxy headers (TLS is terminated by a proxy in the
     // recommended deployment), falling back to the direct TCP peer address.
     let client_ip = client_ip(&headers, peer);
-    ws.on_upgrade(move |socket| handler::handle_socket(socket, room, q.token, client_ip, state))
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| handler::handle_socket(socket, room, q.token, client_ip, state))
 }
 
 /// Resolve the client IP: first `X-Forwarded-For` (leftmost), then `X-Real-IP`,

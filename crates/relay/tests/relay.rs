@@ -818,6 +818,51 @@ async fn rooms_list_enumerates_active_rooms() {
     assert!(body.contains("\"room\":\"prod\""), "prod should remain: {body}");
 }
 
+// An untrusted client cannot force the relay to buffer an oversized frame: a
+// message past the relay's max WS message size (1 MiB) is refused and the
+// connection is dropped, rather than being read into memory and parsed. Guards
+// the per-connection memory-amplification surface (axum's 64 MiB default).
+#[tokio::test]
+async fn oversized_message_is_rejected_and_connection_dropped() {
+    let port = start_relay().await;
+    let mut ws = connect(port, "dev").await;
+
+    // Authenticate normally first, so what follows is exercised on an
+    // established session — isolating the SIZE check from the "first frame must
+    // be auth" rule. (A small Ping here would be answered with a Pong.)
+    auth(&mut ws, Some(agent_info("big", &[]))).await;
+
+    // A ~2 MiB Ping frame — syntactically valid (unknown `pad` field is ignored
+    // by serde), so absent the size cap the server would parse it and reply
+    // Pong. With the cap, the frame is over the 1 MiB limit and the connection
+    // is dropped instead. The client happily sends it (its own limit is larger).
+    let huge = "x".repeat(2 * 1024 * 1024);
+    let oversized = format!("{{\"type\":\"ping\",\"pad\":\"{huge}\"}}");
+    ws.send(Message::Text(oversized)).await.unwrap();
+
+    // The server drops the connection: the client stream ends (None), yields a
+    // Close, or errors. Crucially it must NOT answer the oversized Ping (which
+    // is what an uncapped server would do) — a Pong here means the cap is gone.
+    let dropped = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break true,
+                Some(Ok(Message::Text(t))) => {
+                    assert!(
+                        !matches!(ServerMessage::from_json(&t), Ok(ServerMessage::Pong)),
+                        "server answered the oversized Ping — the size cap is not enforced"
+                    );
+                    continue; // ignore setup noise (agent_list / your_endpoint)
+                }
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("connection was not dropped within 2s after an oversized frame");
+    assert!(dropped, "oversized frame must drop the connection");
+}
+
 // Two sockets sharing one agent-id collapse to one host whose `connections`
 // count is surfaced (so the panel can warn about duplicate/possibly-mis-keyed
 // sockets). Mirrors the worker's dedupAgents behaviour.

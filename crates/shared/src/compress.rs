@@ -19,6 +19,17 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Payloads below this size aren't worth compressing (frame overhead + CPU).
 const COMPRESS_THRESHOLD: usize = 512;
 
+/// Hard ceiling on the *decompressed* size of an inbound zstd frame.
+///
+/// `maybe_decompress` runs on untrusted wire data (peers/relay can deliver any
+/// frame that decrypts under the shared key). zstd is an amplification vector: a
+/// frame within the relay's ~900 KB payload cap can expand to many gigabytes,
+/// and a streaming `read_to_end` would allocate all of it — a memory-exhaustion
+/// DoS. We bound the read instead. 128 MiB sits comfortably above the largest
+/// legitimate single message (UDP's `MAX_FRAGMENTED_BODY` ≈ 78 MiB; the relay
+/// TCP frame is far smaller) while turning the bomb into a clean error.
+const MAX_DECOMPRESSED: usize = 128 * 1024 * 1024;
+
 /// Whether `data` looks like a zstd frame (i.e. was produced by
 /// [`maybe_compress`]).
 fn is_zstd(data: &[u8]) -> bool {
@@ -42,13 +53,28 @@ pub fn maybe_compress(data: &[u8]) -> Vec<u8> {
 /// Inverse of [`maybe_compress`]: decompress a zstd frame, or pass raw bytes
 /// through unchanged.
 pub fn maybe_decompress(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    decompress_capped(data, MAX_DECOMPRESSED)
+}
+
+/// [`maybe_decompress`] with an explicit decompressed-size ceiling. Bounding the
+/// read lets us prove the cap rejects bombs without allocating 128 MiB per test.
+fn decompress_capped(data: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
     if !is_zstd(data) {
         return Ok(data.to_vec());
     }
-    let mut decoder = StreamingDecoder::new(data)
+    let decoder = StreamingDecoder::new(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // Bound the read so a malicious frame can't expand without limit. `take`
+    // reads at most `limit + 1` bytes, capping the allocation; if the extra byte
+    // materialises the frame was over budget → reject it.
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
+    decoder.take(limit as u64 + 1).read_to_end(&mut out)?;
+    if out.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed payload exceeds maximum size",
+        ));
+    }
     Ok(out)
 }
 
@@ -102,5 +128,29 @@ mod tests {
         // A reader must accept an uncompressed payload (legacy / small peer).
         let json = b"[1,2,3]";
         assert_eq!(maybe_decompress(json).unwrap(), json);
+    }
+
+    #[test]
+    fn decompression_bomb_is_rejected_at_the_cap() {
+        // A zstd "bomb": a tiny frame that expands far beyond its own size. zeros
+        // compress to a handful of bytes, so this models an attacker frame well
+        // within the relay's payload cap that would otherwise allocate ~1 MiB
+        // (and, at the real 128 MiB ceiling, gigabytes) on decode.
+        let bomb = maybe_compress(&vec![0u8; 1024 * 1024]);
+        assert!(is_zstd(&bomb), "test premise: the frame is compressed");
+        assert!(
+            bomb.len() < 4096,
+            "test premise: the frame is far smaller than its expansion"
+        );
+
+        // With a small limit the bomb is rejected (not OOM'd) ...
+        let err = decompress_capped(&bomb, 64 * 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // ... and a frame whose output fits the limit still round-trips intact,
+        // including exactly at the boundary (limit == output len).
+        let exact = decompress_capped(&bomb, 1024 * 1024).unwrap();
+        assert_eq!(exact.len(), 1024 * 1024);
+        assert!(exact.iter().all(|&b| b == 0));
     }
 }

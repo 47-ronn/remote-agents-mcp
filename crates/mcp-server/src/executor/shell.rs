@@ -78,7 +78,20 @@ pub(crate) fn kill_process_group(pid: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+/// On Windows, use `taskkill /F /T /PID` to forcibly terminate the process tree.
+/// `/F` = force, `/T` = tree (kill child processes too).
+#[cfg(windows)]
+pub(crate) fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn kill_process_group(_pid: Option<u32>) {}
 
 /// Execute a shell command, feeding `stdin_data` to its standard input, with a

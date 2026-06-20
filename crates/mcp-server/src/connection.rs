@@ -7,7 +7,8 @@ use crate::udp_transport::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
-    AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, UdpFrame,
+    AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, UdpAnswer,
+    UdpFrame, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,6 +157,28 @@ fn jitter(backoff: Duration) -> Duration {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     Duration::from_millis(n % (half + 1))
+}
+
+/// Reconcile a signaled UDP offer with the relay-authenticated sender session.
+///
+/// The relay stamps the *true* sender into the message's outer `from_session`
+/// (it derives it from the connection, not from the wire). The inner
+/// `offer.from_session` is peer-controlled: a malicious room peer could set it
+/// to *another* peer's session id so that `handle_offer` keys the resulting UDP
+/// channel under the victim's id — hijacking where this host later routes the
+/// victim's UDP traffic (misdelivery / denial). We trust the authenticated
+/// outer value instead. For honest peers the two already agree, so this is a
+/// no-op; for a spoofer it neutralises the claim. Mirror for [`authenticated_answer`].
+pub(crate) fn authenticated_offer(from_session: &str, mut offer: UdpOffer) -> UdpOffer {
+    offer.from_session = from_session.to_string();
+    offer
+}
+
+/// See [`authenticated_offer`]: trust the relay-authenticated sender over the
+/// peer-supplied `answer.from_session` (used to look up the pending channel).
+pub(crate) fn authenticated_answer(from_session: &str, mut answer: UdpAnswer) -> UdpAnswer {
+    answer.from_session = from_session.to_string();
+    answer
 }
 
 /// Read WebSocket frames until the relay returns its auth verdict, skipping any
@@ -455,6 +478,7 @@ async fn handle_server_message(
 
         ServerMessage::UdpOffer { from_session, offer } => {
             debug!("Received UDP offer from {}", from_session);
+            let offer = authenticated_offer(&from_session, offer);
             if let Err(e) = udp_transport.handle_offer(offer).await {
                 warn!("Failed to handle UDP offer: {}", e);
             }
@@ -462,6 +486,7 @@ async fn handle_server_message(
 
         ServerMessage::UdpAnswer { from_session, answer } => {
             debug!("Received UDP answer from {}", from_session);
+            let answer = authenticated_answer(&from_session, answer);
             if let Err(e) = udp_transport.handle_answer(answer).await {
                 warn!("Failed to handle UDP answer: {}", e);
             }
@@ -757,7 +782,56 @@ mod tests {
     fn empty_pending() -> ConnPending {
         Arc::new(RwLock::new(HashMap::new()))
     }
-    use remote_agents_shared::{AgentMode, Cipher, CommandResult};
+    use remote_agents_shared::{AgentMode, Cipher, CommandResult, Endpoint};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // --- authenticated_offer/answer (anti-spoof of peer-supplied session) ----
+
+    fn spoofed_offer(claimed_from: &str) -> UdpOffer {
+        UdpOffer {
+            channel_id: "ch".into(),
+            from_session: claimed_from.into(),
+            to_session: "me".into(),
+            local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+        }
+    }
+
+    #[test]
+    fn authenticated_offer_overrides_peer_supplied_session() {
+        // A malicious peer claims to be "victim" inside the offer body, but the
+        // relay authenticated it as "attacker-sess". The channel must be keyed to
+        // the authenticated id, not the spoofed claim.
+        let offer = spoofed_offer("victim");
+        let fixed = authenticated_offer("attacker-sess", offer);
+        assert_eq!(fixed.from_session, "attacker-sess");
+    }
+
+    #[test]
+    fn authenticated_offer_is_noop_for_honest_peer() {
+        // Honest peer: inner == authenticated. Nothing else is disturbed.
+        let offer = spoofed_offer("peer-1");
+        let fixed = authenticated_offer("peer-1", offer);
+        assert_eq!(fixed.from_session, "peer-1");
+        assert_eq!(fixed.to_session, "me");
+        assert_eq!(fixed.channel_id, "ch");
+    }
+
+    #[test]
+    fn authenticated_answer_overrides_peer_supplied_session() {
+        let answer = UdpAnswer {
+            channel_id: "ch".into(),
+            from_session: "victim".into(),
+            local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            public_endpoint: None,
+            nonce: [0u8; 16],
+            accepted: true,
+        };
+        let fixed = authenticated_answer("attacker-sess", answer);
+        assert_eq!(fixed.from_session, "attacker-sess");
+        assert!(fixed.accepted, "unrelated fields are untouched");
+    }
 
     // --- await_auth_verdict (pre-auth frame tolerance, iter143) -------------
 
