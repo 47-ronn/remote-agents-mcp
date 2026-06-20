@@ -175,13 +175,59 @@ fn uninstall_launchd() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows / NSSM
+// Windows / start /b (detached process) or NSSM (full service)
 // ---------------------------------------------------------------------------
+
+/// Launch the agent as a detached background process using `start /b`.
+/// This is simpler than NSSM and requires no extra software, but the process
+/// won't auto-restart on crash or be managed as a Windows service.
+///
+/// Returns Ok(()) if the process was launched successfully.
+#[cfg(windows)]
+pub fn launch_detached(extra_args: &[String]) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const DETACHED_PROCESS: u32 = 0x00000008;
+
+    let exe = std::env::current_exe().context("cannot determine current executable path")?;
+
+    // Build args: run [extra_args...]
+    let mut args = vec!["run".to_string()];
+    args.extend(extra_args.iter().cloned());
+
+    // Spawn detached with no console window.
+    let child = Command::new(&exe)
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .with_context(|| format!("failed to launch detached: {:?}", exe))?;
+
+    println!(
+        "Launched detached agent (PID {}).\nCommand: {} {}",
+        child.id(),
+        exe.display(),
+        args.join(" ")
+    );
+    println!("\nTo stop: taskkill /F /PID {}", child.id());
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn launch_detached(_extra_args: &[String]) -> Result<()> {
+    bail!("launch_detached is only supported on Windows; use `install` for systemd/launchd")
+}
 
 fn install_windows(exe: &str, extra_args: &[String]) -> Result<()> {
     let args = exec_start(exe, extra_args);
-    // We can't assume NSSM is installed; print the commands for the user.
-    println!("Windows service install (requires NSSM: https://nssm.cc):");
+
+    // First, try launching with `start /b` as a quick option.
+    println!("=== Quick launch (detached process) ===");
+    println!("To run in background without a service:");
+    println!("  remote-agent launch {}", extra_args.join(" "));
+    println!();
+
+    // Also print NSSM instructions for a full service install.
+    println!("=== Full service install (requires NSSM: https://nssm.cc) ===");
     println!("  nssm install {} \"{}\"", SERVICE_NAME, exe);
     println!("  nssm set {} AppParameters \"run {}\"", SERVICE_NAME, extra_args.join(" "));
     println!("  nssm set {} Start SERVICE_AUTO_START", SERVICE_NAME);
@@ -194,6 +240,8 @@ fn uninstall_windows() -> Result<()> {
     println!("Windows service uninstall:");
     println!("  nssm stop {}", SERVICE_NAME);
     println!("  nssm remove {} confirm", SERVICE_NAME);
+    println!("\nIf using detached mode, kill the process:");
+    println!("  taskkill /F /IM remote-agent.exe");
     Ok(())
 }
 

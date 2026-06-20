@@ -132,6 +132,22 @@ enum Commands {
     /// Remove the installed background service
     Uninstall,
 
+    /// Launch the agent as a detached background process (Windows only).
+    /// Simpler than a full service install but won't auto-restart on crash.
+    Launch {
+        /// Room name to join
+        #[arg(short, long)]
+        room: Option<String>,
+
+        /// Authentication token
+        #[arg(short, long)]
+        token: Option<String>,
+
+        /// Relay server URL
+        #[arg(long)]
+        relay: Option<String>,
+    },
+
     /// Register this binary as an MCP server in a popular AI agent's config
     /// (Claude Desktop/Code, Cursor, Cline, Roo, Kilo, Windsurf, Zed, opencode,
     /// Continue, Goose). Connection flags are baked into the server's args.
@@ -232,6 +248,22 @@ async fn main() -> Result<()> {
         }
         Commands::Uninstall => {
             daemon::uninstall()?;
+        }
+        Commands::Launch { room, token, relay } => {
+            let mut args = Vec::new();
+            if let Some(room) = room {
+                args.push("--room".to_string());
+                args.push(room);
+            }
+            if let Some(token) = token {
+                args.push("--token".to_string());
+                args.push(token);
+            }
+            if let Some(relay) = relay {
+                args.push("--relay".to_string());
+                args.push(relay);
+            }
+            daemon::launch_detached(&args)?;
         }
         Commands::InstallMcp {
             client,

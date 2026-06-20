@@ -756,6 +756,8 @@ mod tests {
             stdout: "hi".into(),
             stderr: String::new(),
             exit_code: 0,
+            duration_ms: None,
+            timed_out: None,
         });
         assert!(other.contains("Exec"), "got: {other}");
     }

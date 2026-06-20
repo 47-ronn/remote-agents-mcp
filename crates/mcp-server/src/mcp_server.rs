@@ -585,6 +585,22 @@ impl ServerHandler for McpHandler {
         // Build the command
         let command = self.build_command(tool_name, &args)?;
 
+        // Validate send_file: source (agent_id) must differ from dest_id
+        if tool_name == "send_file" {
+            if let Command::SendFileTo { ref dest_id, .. } = command {
+                // If no agent_id, the source is the local node
+                let source_id = agent_id.as_deref().unwrap_or("");
+                // Get local node ID for comparison
+                let local_id = self.state.blocking_read().config.id.clone();
+                let effective_source = if source_id.is_empty() { &local_id } else { source_id };
+                if effective_source == dest_id {
+                    return Err(exec_error(
+                        "Cannot send file to itself. Source and destination must be different agents.",
+                    ));
+                }
+            }
+        }
+
         // Execute locally or remotely based on agent_id
         let result = if let Some(ref aid) = agent_id {
             debug!("Routing {} to remote agent {}", tool_name, aid);
@@ -1090,6 +1106,8 @@ fn format_result(result: &CommandResult) -> String {
             stdout,
             stderr,
             exit_code,
+            duration_ms,
+            timed_out,
         } => {
             let mut out = String::new();
             if !stdout.is_empty() {
@@ -1101,7 +1119,13 @@ fn format_result(result: &CommandResult) -> String {
                 }
                 out.push_str(stderr);
             }
-            out.push_str(&format!("\n[exit code: {}]", exit_code));
+            // Telemetry suffix: exit code, duration, timeout flag
+            let timeout_flag = if *timed_out == Some(true) { ", TIMED OUT" } else { "" };
+            if let Some(ms) = duration_ms {
+                out.push_str(&format!("\n[exit code: {}, {}ms{}]", exit_code, ms, timeout_flag));
+            } else {
+                out.push_str(&format!("\n[exit code: {}{}]", exit_code, timeout_flag));
+            }
             out
         }
         CommandResult::File { content, size } => {
@@ -1517,12 +1541,14 @@ mod tests {
             stdout: "out".into(),
             stderr: "err".into(),
             exit_code: 2,
+            duration_ms: Some(150),
+            timed_out: Some(false),
         };
         let s = format_result(&r);
         assert!(s.contains("out"));
         assert!(s.contains("--- stderr ---"));
         assert!(s.contains("err"));
-        assert!(s.contains("[exit code: 2]"));
+        assert!(s.contains("[exit code: 2, 150ms]"));
     }
 
     #[test]
@@ -1531,10 +1557,26 @@ mod tests {
             stdout: "only".into(),
             stderr: String::new(),
             exit_code: 0,
+            duration_ms: None,
+            timed_out: None,
         };
         let s = format_result(&r);
         assert!(!s.contains("--- stderr ---"));
         assert!(s.contains("[exit code: 0]"));
+    }
+
+    #[test]
+    fn format_result_exec_shows_timed_out_flag() {
+        let r = CommandResult::Exec {
+            stdout: String::new(),
+            stderr: "command timed out".into(),
+            exit_code: -1,
+            duration_ms: Some(30000),
+            timed_out: Some(true),
+        };
+        let s = format_result(&r);
+        assert!(s.contains("TIMED OUT"));
+        assert!(s.contains("30000ms"));
     }
 
     #[test]

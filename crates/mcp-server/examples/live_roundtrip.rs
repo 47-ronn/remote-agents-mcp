@@ -63,8 +63,12 @@ async fn main() -> Result<()> {
                 stdout,
                 stderr,
                 exit_code,
+                duration_ms,
+                timed_out,
             } => {
-                print!("[{id}] exit={exit_code}\n--- stdout ---\n{stdout}");
+                let timeout_flag = if timed_out == Some(true) { " TIMED_OUT" } else { "" };
+                let ms = duration_ms.map(|d| format!(" {d}ms")).unwrap_or_default();
+                print!("[{id}] exit={exit_code}{ms}{timeout_flag}\n--- stdout ---\n{stdout}");
                 if !stderr.is_empty() {
                     print!("--- stderr ---\n{stderr}");
                 }
