@@ -294,6 +294,9 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     let mut alive = true;
     let mut commands_handled: u64 = 0;
 
+    // Channel for agent info updates (e.g. mode change)
+    let mut info_update_rx = state.take_info_update_rx().await;
+
     // Main loop
     loop {
         tokio::select! {
@@ -364,6 +367,16 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                     let msg = ClientMessage::Notify { event };
                     write.send(Message::Text(msg.to_json()?)).await?;
                 }
+            }
+
+            // Agent info update (e.g. mode change) - send UpdateAgent to relay
+            _ = info_update_rx.recv() => {
+                let updated_info = build_agent_info(config, state.mode().await);
+                let msg = ClientMessage::UpdateAgent {
+                    agent_info: Box::new(updated_info),
+                };
+                write.send(Message::Text(msg.to_json()?)).await?;
+                debug!("Sent UpdateAgent to relay after mode change");
             }
 
             // Health check tick

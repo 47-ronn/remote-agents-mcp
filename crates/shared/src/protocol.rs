@@ -87,6 +87,11 @@ pub enum ClientMessage {
 
     /// Graceful disconnect
     Close,
+
+    /// Update this agent's info (e.g. after mode change)
+    UpdateAgent {
+        agent_info: Box<AgentInfo>,
+    },
 }
 
 /// Commands that can be executed on agents

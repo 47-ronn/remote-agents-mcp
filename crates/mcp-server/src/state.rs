@@ -31,6 +31,11 @@ pub struct AgentState {
     transfers: Arc<TransferStore>,
     /// Registry of Cloudflare quick tunnels this node started.
     tunnels: Arc<crate::tunnel::TunnelStore>,
+    /// Sender for info update notifications (e.g. mode change); connection loop
+    /// sends UpdateAgent to relay when it receives from this channel.
+    info_update_tx: mpsc::UnboundedSender<()>,
+    /// Receiver for info update notifications.
+    info_update_rx: Arc<Mutex<mpsc::UnboundedReceiver<()>>>,
 }
 
 impl AgentState {
@@ -38,6 +43,7 @@ impl AgentState {
         let mode = config.security.mode;
         let scheduler = Arc::new(Scheduler::load(schedule_path()));
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (info_update_tx, info_update_rx) = mpsc::unbounded_channel::<()>();
         let autonomous = Arc::new(AutonomousStore::load(
             tasks_path(),
             config.autonomous.clone(),
@@ -52,6 +58,8 @@ impl AgentState {
             peers: Arc::new(RwLock::new(Vec::new())),
             transfers: Arc::new(TransferStore::default()),
             tunnels: Arc::new(crate::tunnel::TunnelStore::default()),
+            info_update_tx,
+            info_update_rx: Arc::new(Mutex::new(info_update_rx)),
         }
     }
 
@@ -102,9 +110,20 @@ impl AgentState {
         *self.mode.read().await
     }
 
-    /// Update the operating mode.
+    /// Update the operating mode and notify the connection loop to send
+    /// an UpdateAgent message to the relay.
     pub async fn set_mode(&self, mode: AgentMode) {
         *self.mode.write().await = mode;
+        // Notify connection loop to send UpdateAgent; ignore send errors
+        // (e.g. if not connected to relay).
+        let _ = self.info_update_tx.send(());
+    }
+
+    /// Take the info update receiver (called once by connection loop).
+    pub async fn take_info_update_rx(&self) -> mpsc::UnboundedReceiver<()> {
+        // Replace with a dummy channel; the real one is taken by connection.
+        let (_, dummy_rx) = mpsc::unbounded_channel::<()>();
+        std::mem::replace(&mut *self.info_update_rx.lock().await, dummy_rx)
     }
 
     /// The shared scheduler.

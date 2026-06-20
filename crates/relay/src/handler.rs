@@ -346,6 +346,27 @@ fn handle_client_msg(
         ClientMessage::Auth { .. } => {}
 
         ClientMessage::Close => return ControlFlow::Break(()),
+
+        // Agent is updating its info (e.g. after mode change)
+        ClientMessage::UpdateAgent { agent_info: new_info } => {
+            // Update the stored agent info for this session
+            if let Some(mut entry) = room.agents.get_mut(session_id) {
+                // Preserve session_id from the existing entry
+                let mut updated = (*new_info).clone();
+                updated.session_id = entry.info.session_id.clone();
+                entry.info = updated;
+                
+                // Broadcast the update to all peers (like AgentJoined but for updates)
+                let merged = dedup_agents(room)
+                    .into_iter()
+                    .find(|a| a.id == new_info.id)
+                    .unwrap_or_else(|| entry.info.clone());
+                let update_msg = ServerMessage::AgentJoined { agent: Box::new(merged) };
+                broadcast_mcp(room, &update_msg);
+                broadcast_agents(room, &update_msg, Some(&new_info.id));
+                debug!("agent updated: {} ({})", new_info.name, new_info.id);
+            }
+        }
     }
 
     ControlFlow::Continue(())
