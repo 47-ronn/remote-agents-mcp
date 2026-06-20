@@ -49,6 +49,8 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
                 stdout: result.stdout,
                 stderr: result.stderr,
                 exit_code: result.exit_code,
+                duration_ms: Some(result.duration_ms),
+                timed_out: Some(result.timed_out),
             })
         }
 

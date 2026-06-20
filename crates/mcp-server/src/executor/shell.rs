@@ -2,18 +2,28 @@
 
 use anyhow::Result;
 use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// Wall-clock execution time in milliseconds.
+    pub duration_ms: u64,
+    /// `true` if the command was killed due to timeout.
+    pub timed_out: bool,
 }
 
-/// Execute a shell command with timeout
+/// Maximum partial output to capture on timeout (128 KB per stream).
+const MAX_PARTIAL_OUTPUT: usize = 128 * 1024;
+
+/// Execute a shell command with timeout. On timeout, returns any partial
+/// stdout/stderr captured so far instead of empty strings.
 pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<ExecResult> {
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let shell_arg = if cfg!(windows) { "/C" } else { "-c" };
@@ -44,23 +54,102 @@ pub async fn exec(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<E
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id();
-    let duration = Duration::from_millis(timeout_ms);
+    let deadline = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
 
-    let output = match timeout(duration, child.wait_with_output()).await {
-        Ok(res) => res?,
-        Err(elapsed) => {
-            kill_process_group(pid);
-            return Err(elapsed.into());
+    // Take stdout/stderr handles for incremental capture.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    // Shared buffers for partial output capture.
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+
+    // Spawn tasks to read stdout/stderr line by line.
+    let stdout_buf_clone = stdout_buf.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout_handle {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stdout_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
         }
-    };
+    });
+    let stdout_abort = stdout_task.abort_handle();
 
-    Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
+    let stderr_buf_clone = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr_handle {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stderr_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stderr_abort = stderr_task.abort_handle();
+
+    // Wait for child with timeout, collecting output in parallel.
+    let wait_result = timeout(deadline, async {
+        let status = child.wait().await;
+        // Wait for readers to finish after child exits.
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        status
     })
+    .await;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_buf.lock().await.clone();
+            let stderr = stderr_buf.lock().await.clone();
+            Ok(ExecResult {
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(-1),
+                duration_ms: elapsed_ms,
+                timed_out: false,
+            })
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_timeout) => {
+            // Kill the process tree first.
+            kill_process_group(pid);
+            // Abort the reader tasks (they may be blocked on the dead process).
+            stdout_abort.abort();
+            stderr_abort.abort();
+            // Collect whatever partial output we captured.
+            let partial_stdout = stdout_buf.lock().await.clone();
+            let partial_stderr = stderr_buf.lock().await.clone();
+            let mut stderr_out = partial_stderr;
+            if !stderr_out.is_empty() {
+                stderr_out.push('\n');
+            }
+            stderr_out.push_str(&format!("[command timed out after {}ms]", elapsed_ms));
+            Ok(ExecResult {
+                stdout: partial_stdout,
+                stderr: stderr_out,
+                exit_code: -1,
+                duration_ms: elapsed_ms,
+                timed_out: true,
+            })
+        }
+    }
 }
 
 /// SIGKILL the whole process group led by `pid` (no-op if the child already
@@ -97,7 +186,7 @@ pub(crate) fn kill_process_group(_pid: Option<u32>) {}
 /// Execute a shell command, feeding `stdin_data` to its standard input, with a
 /// timeout. The stdin write runs concurrently with output collection so a child
 /// that streams large output while we are still writing input cannot deadlock
-/// on a full pipe.
+/// on a full pipe. On timeout, returns any partial stdout/stderr captured so far.
 pub async fn exec_with_stdin(
     command: &str,
     stdin_data: &str,
@@ -124,6 +213,8 @@ pub async fn exec_with_stdin(
 
     // Write (and close) stdin from a separate task to avoid pipe deadlock.
     let stdin = child.stdin.take();
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
     let data = stdin_data.to_string();
     let writer = tokio::spawn(async move {
         if let Some(mut si) = stdin {
@@ -131,25 +222,100 @@ pub async fn exec_with_stdin(
             let _ = si.shutdown().await; // EOF for the child
         }
     });
+    let writer_abort = writer.abort_handle();
 
-    let duration = Duration::from_millis(timeout_ms);
-    let output = match timeout(duration, child.wait_with_output()).await {
-        Ok(res) => res?,
-        Err(elapsed) => {
-            kill_process_group(pid);
-            // The writer may be parked on a full stdin pipe; the kill closes it,
-            // but abort so we never block on a child that's gone.
-            writer.abort();
-            return Err(elapsed.into());
+    // Shared buffers for partial output capture.
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+
+    // Spawn tasks to read stdout/stderr line by line.
+    let stdout_buf_clone = stdout_buf.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout_handle {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stdout_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
         }
-    };
-    let _ = writer.await;
+    });
+    let stdout_abort = stdout_task.abort_handle();
 
-    Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
+    let stderr_buf_clone = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr_handle {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut buf = stderr_buf_clone.lock().await;
+                if buf.len() < MAX_PARTIAL_OUTPUT {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+            }
+        }
+    });
+    let stderr_abort = stderr_task.abort_handle();
+
+    let deadline = Duration::from_millis(timeout_ms);
+    let start = Instant::now();
+
+    // Wait for child with timeout, collecting output in parallel.
+    let wait_result = timeout(deadline, async {
+        let status = child.wait().await;
+        // Wait for readers to finish after child exits.
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        let _ = writer.await;
+        status
     })
+    .await;
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    match wait_result {
+        Ok(Ok(status)) => {
+            let stdout = stdout_buf.lock().await.clone();
+            let stderr = stderr_buf.lock().await.clone();
+            Ok(ExecResult {
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(-1),
+                duration_ms: elapsed_ms,
+                timed_out: false,
+            })
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_timeout) => {
+            // Kill the process tree first.
+            kill_process_group(pid);
+            // Abort the reader/writer tasks (they may be blocked).
+            stdout_abort.abort();
+            stderr_abort.abort();
+            writer_abort.abort();
+            // Collect whatever partial output we captured.
+            let partial_stdout = stdout_buf.lock().await.clone();
+            let partial_stderr = stderr_buf.lock().await.clone();
+            let mut stderr_out = partial_stderr;
+            if !stderr_out.is_empty() {
+                stderr_out.push('\n');
+            }
+            stderr_out.push_str(&format!("[command timed out after {}ms]", elapsed_ms));
+            Ok(ExecResult {
+                stdout: partial_stdout,
+                stderr: stderr_out,
+                exit_code: -1,
+                duration_ms: elapsed_ms,
+                timed_out: true,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,8 +430,8 @@ mod tests {
             "the sleep child never started"
         );
 
-        let res = handle.await.unwrap();
-        assert!(res.is_err(), "exec should have timed out");
+        let res = handle.await.unwrap().unwrap();
+        assert!(res.timed_out, "exec should have timed out");
 
         // After the timed-out future is dropped, kill_on_drop must reap the child.
         assert!(
@@ -289,8 +455,8 @@ mod tests {
             "the sleep child never started"
         );
 
-        let res = handle.await.unwrap();
-        assert!(res.is_err(), "exec_with_stdin should have timed out");
+        let res = handle.await.unwrap().unwrap();
+        assert!(res.timed_out, "exec_with_stdin should have timed out");
 
         assert!(
             poll_liveness(marker, false, Duration::from_secs(12)).await,
@@ -318,8 +484,8 @@ mod tests {
             "the backgrounded child never started"
         );
 
-        let res = handle.await.unwrap();
-        assert!(res.is_err(), "exec should have timed out");
+        let res = handle.await.unwrap().unwrap();
+        assert!(res.timed_out, "exec should have timed out");
 
         assert!(
             poll_liveness(marker, false, Duration::from_secs(12)).await,
@@ -342,12 +508,55 @@ mod tests {
             "the backgrounded child never started"
         );
 
-        let res = handle.await.unwrap();
-        assert!(res.is_err(), "exec_with_stdin should have timed out");
+        let res = handle.await.unwrap().unwrap();
+        assert!(res.timed_out, "exec_with_stdin should have timed out");
 
         assert!(
             poll_liveness(marker, false, Duration::from_secs(12)).await,
             "timed-out exec_with_stdin leaked a backgrounded grandchild '{marker}'"
         );
+    }
+
+    /// On timeout, any partial output captured before the kill is preserved.
+    /// This tests that a command printing output before hanging returns that
+    /// output even after being terminated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_exec_captures_partial_output() {
+        // Print some lines, then hang forever.
+        let result = exec(
+            "echo 'line 1'; echo 'line 2'; sleep 999",
+            None,
+            500, // short timeout
+        )
+        .await
+        .unwrap();
+
+        assert!(result.timed_out, "expected timeout");
+        assert!(
+            result.stdout.contains("line 1"),
+            "partial stdout missing 'line 1', got: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("line 2"),
+            "partial stdout missing 'line 2', got: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stderr.contains("timed out"),
+            "stderr should mention timeout, got: {:?}",
+            result.stderr
+        );
+    }
+
+    /// Telemetry: duration_ms is populated even on success.
+    #[tokio::test]
+    async fn exec_populates_duration_ms() {
+        let result = exec("echo quick", None, 5000).await.unwrap();
+        assert!(!result.timed_out);
+        // Duration should be non-zero (command took at least some time).
+        // Just check it's reasonable — less than 5 seconds.
+        assert!(result.duration_ms < 5000, "duration_ms too large: {}", result.duration_ms);
     }
 }

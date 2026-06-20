@@ -437,6 +437,12 @@ pub enum CommandResult {
         stdout: String,
         stderr: String,
         exit_code: i32,
+        /// Wall-clock execution time in milliseconds.
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        /// `true` if the command was killed due to timeout.
+        #[serde(default)]
+        timed_out: Option<bool>,
     },
 
     /// File content
@@ -704,6 +710,8 @@ mod tests {
             stdout: big.clone(),
             stderr: String::new(),
             exit_code: 0,
+            duration_ms: Some(42),
+            timed_out: Some(false),
         };
         let envelope = result.encrypt(&cipher).unwrap();
         // The base64 envelope is far smaller than the plaintext — proving the

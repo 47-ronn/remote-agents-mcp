@@ -10,6 +10,11 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
+#[cfg(windows)]
+use std::sync::OnceLock;
+#[cfg(windows)]
+use tokio::sync::Mutex;
+
 /// Upper bound on any single `git` invocation. Local ops (status/commit) finish
 /// in milliseconds; this only backstops *network* subcommands (`pull`/`push`)
 /// that would otherwise stall indefinitely — a wedged TLS/SSH connection, or an
@@ -36,8 +41,91 @@ fn git_ssh_command(existing: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Track which paths we've already added to safe.directory to avoid repeating.
+#[cfg(windows)]
+static SAFE_DIRS_ADDED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// On Windows, detect if `repo` is on a network/mapped drive and auto-add it to
+/// git's `safe.directory` config to avoid the "dubious ownership" error. Git
+/// refuses to operate on network drives by default because the ownership check
+/// is unreliable — but for our headless agent this is a reasonable default.
+///
+/// This is idempotent: each path is only added once per process lifetime.
+#[cfg(windows)]
+async fn ensure_safe_directory(repo: &str) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ffi::OsStr;
+
+    // Normalize the path so git config matching works.
+    let path = match std::fs::canonicalize(repo) {
+        Ok(p) => p,
+        Err(_) => return Ok(()), // Path doesn't exist, git will fail anyway
+    };
+    let path_str = path.to_string_lossy().to_string();
+
+    // Check if this is a network/UNC path or a mapped network drive.
+    // UNC paths start with `\\` and mapped drives like `N:\` might be network drives.
+    let is_network = path_str.starts_with(r"\\")
+        || is_network_drive(&path_str);
+
+    if !is_network {
+        return Ok(());
+    }
+
+    // Check if we've already added this path.
+    let added = SAFE_DIRS_ADDED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    {
+        let mut guard = added.lock().await;
+        if guard.contains(&path_str) {
+            return Ok(());
+        }
+        guard.insert(path_str.clone());
+    }
+
+    // Add to safe.directory. Use forward slashes as git prefers.
+    let safe_path = path_str.replace('\\', "/");
+    tracing::info!("Adding network path to git safe.directory: {}", safe_path);
+    
+    let mut cmd = Command::new("git");
+    cmd.args(["config", "--global", "--add", "safe.directory", &safe_path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.spawn()?.wait().await;
+    Ok(())
+}
+
+/// Check if a drive letter path is a network drive (GetDriveTypeW returns DRIVE_REMOTE).
+#[cfg(windows)]
+fn is_network_drive(path: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ffi::OsStr;
+
+    // Extract drive letter (e.g., "N:" from "N:\foo\bar")
+    if path.len() < 2 || !path.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        return false;
+    }
+    let root: Vec<u16> = OsStr::new(&format!("{}\\", &path[..2]))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // DRIVE_REMOTE = 4
+    // Safety: GetDriveTypeW is a simple Windows API that reads a null-terminated string.
+    const DRIVE_REMOTE: u32 = 4;
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE
+    }
+}
+
+#[cfg(not(windows))]
+async fn ensure_safe_directory(_repo: &str) -> Result<()> {
+    Ok(())
+}
+
 /// Run a git subcommand in `repo` and capture its output.
 async fn git(repo: &str, args: &[&str]) -> Result<(String, String, i32)> {
+    // On Windows, ensure network paths are in safe.directory.
+    ensure_safe_directory(repo).await?;
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo)
