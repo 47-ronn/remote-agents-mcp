@@ -193,8 +193,12 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // Initialize logging
+    // Initialize logging. Write to STDERR, never STDOUT: in `mcp` mode stdout is
+    // the MCP JSON-RPC channel, and log lines there corrupt the protocol (a
+    // client can't parse responses). stderr is captured by systemd/journald for
+    // `run` mode just the same.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive("remote_agent=info".parse()?)

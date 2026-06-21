@@ -68,17 +68,67 @@ pub fn reflexive_endpoint(reflected: Option<Endpoint>, local: Endpoint) -> Optio
     reflected.map(|r| Endpoint::new(r.addr, local.port))
 }
 
+/// Best-effort local egress IP: the address the OS routes through to reach a
+/// public destination. A wildcard-bound UDP socket reports `0.0.0.0`, which is
+/// useless as a hole-punch candidate; this yields the real LAN/interface IP so
+/// same-host/LAN peers have something reachable to probe. No packets are sent —
+/// `connect` on a UDP socket only selects the route. Returns `None` on failure.
+pub fn local_egress_ip() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Any routable address works to pick the default egress interface.
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Every non-loopback local interface IPv4 address. A multi-homed host (VPN +
+/// LAN + VM bridge) has several, and the single egress IP (`local_egress_ip`) is
+/// often NOT the one a given peer shares a network with — so we advertise them
+/// all as hole-punch candidates and let the peer probe each.
+pub fn local_candidate_ips() -> Vec<std::net::IpAddr> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .map(|i| i.ip())
+            .filter(|ip| ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Ordered, de-duplicated hole-punch candidate addresses from a peer's signaled
-/// endpoints: the local (private) address first — reachable for same-host/LAN
-/// peers — then the public (reflexive) address for peers behind a different NAT.
-/// `punch_hole` probes every candidate and locks onto whichever answers.
+/// endpoints: every advertised local-interface address (`extra` — reachable for
+/// same-host/LAN peers), the primary local endpoint, then the public (reflexive)
+/// address for peers behind a different NAT. `punch_hole` probes every candidate
+/// and locks onto whichever answers.
 pub fn candidate_addrs(local: Endpoint, public: Option<Endpoint>) -> Vec<SocketAddr> {
-    let mut v = vec![local.to_socket_addr()];
-    if let Some(p) = public {
-        let pa = p.to_socket_addr();
-        if !v.contains(&pa) {
-            v.push(pa);
+    candidate_addrs_multi(local, &[], public)
+}
+
+/// Like [`candidate_addrs`] but also folds in a peer's full list of advertised
+/// local-interface endpoints (`extra`), so multi-homed peers are reachable via
+/// whichever interface shares a network with us.
+pub fn candidate_addrs_multi(
+    local: Endpoint,
+    extra: &[Endpoint],
+    public: Option<Endpoint>,
+) -> Vec<SocketAddr> {
+    let mut v: Vec<SocketAddr> = Vec::new();
+    let push = |ep: SocketAddr, v: &mut Vec<SocketAddr>| {
+        if !v.contains(&ep) {
+            v.push(ep);
         }
+    };
+    for e in extra {
+        push(e.to_socket_addr(), &mut v);
+    }
+    push(local.to_socket_addr(), &mut v);
+    if let Some(p) = public {
+        push(p.to_socket_addr(), &mut v);
     }
     v
 }
@@ -109,6 +159,10 @@ pub struct UdpOffer {
     pub to_session: String,
     /// Local endpoint (behind NAT, may not be directly reachable)
     pub local_endpoint: Endpoint,
+    /// All local-interface endpoints (multi-homed hosts have several); the peer
+    /// probes each so it can connect via whichever shares a network with it.
+    #[serde(default)]
+    pub local_candidates: Vec<Endpoint>,
     /// Public endpoint as seen by the relay/STUN (reflexive address)
     pub public_endpoint: Option<Endpoint>,
     /// Random nonce for this offer (used in hole-punching probes)
@@ -124,6 +178,9 @@ pub struct UdpAnswer {
     pub from_session: String,
     /// Local endpoint
     pub local_endpoint: Endpoint,
+    /// All local-interface endpoints (see `UdpOffer::local_candidates`).
+    #[serde(default)]
+    pub local_candidates: Vec<Endpoint>,
     /// Public endpoint
     pub public_endpoint: Option<Endpoint>,
     /// Nonce for this answer

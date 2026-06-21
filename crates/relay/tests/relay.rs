@@ -360,6 +360,7 @@ fn make_offer(from: &str, to: &str) -> UdpOffer {
         from_session: from.to_string(),
         to_session: to.to_string(),
         local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+        local_candidates: Vec::new(),
         public_endpoint: None,
         nonce: [0u8; 16],
     }

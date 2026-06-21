@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    candidate_addrs, reflexive_endpoint, ChannelState, Cipher, Endpoint, UdpAnswer, UdpChannel, UdpChannelResult,
-    UdpConfig, UdpOffer,
+    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, ChannelState, Cipher, Endpoint,
+    UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,7 +109,7 @@ impl UdpTransport {
         .context("Failed to create UDP channel")?;
         self.spawn_inbound_forwarder(peer_session.clone(), recv_rx);
 
-        let local_endpoint = channel.local_endpoint()?;
+        let local_endpoint = channel.advertised_endpoint()?;
         
         // Try STUN discovery first, fall back to relay-provided endpoint
         let public_endpoint = match channel.discover_public_endpoint().await {
@@ -123,11 +123,16 @@ impl UdpTransport {
             }
         };
 
+        let local_candidates: Vec<Endpoint> = local_candidate_ips()
+            .into_iter()
+            .map(|ip| Endpoint::new(ip, local_endpoint.port))
+            .collect();
         let offer = UdpOffer {
             channel_id: channel_id.clone(),
             from_session: self.session_id.clone(),
             to_session: peer_session.clone(),
             local_endpoint,
+            local_candidates,
             public_endpoint,
             nonce: channel.local_nonce(),
         };
@@ -164,7 +169,7 @@ impl UdpTransport {
         .context("Failed to create UDP channel for answer")?;
         self.spawn_inbound_forwarder(offer.from_session.clone(), recv_rx);
 
-        let local_endpoint = channel.local_endpoint()?;
+        let local_endpoint = channel.advertised_endpoint()?;
         
         // Try STUN discovery first, fall back to relay-provided endpoint
         let public_endpoint = match channel.discover_public_endpoint().await {
@@ -178,20 +183,25 @@ impl UdpTransport {
             }
         };
 
-        // Provide BOTH candidate endpoints (local + public); punch_hole probes
-        // each and locks onto the reachable one (local for same-host/LAN peers,
-        // public across NATs) instead of guessing public-only.
+        // Probe every candidate the offerer advertised (all its interfaces +
+        // public); punch_hole locks onto the reachable one — local for
+        // same-host/LAN, public across NATs.
         channel
             .set_peer_candidates(
-                candidate_addrs(offer.local_endpoint, offer.public_endpoint),
+                candidate_addrs_multi(offer.local_endpoint, &offer.local_candidates, offer.public_endpoint),
                 offer.nonce,
             )
             .await;
 
+        let local_candidates: Vec<Endpoint> = local_candidate_ips()
+            .into_iter()
+            .map(|ip| Endpoint::new(ip, local_endpoint.port))
+            .collect();
         let answer = UdpAnswer {
             channel_id: offer.channel_id.clone(),
             from_session: self.session_id.clone(),
             local_endpoint,
+            local_candidates,
             public_endpoint,
             nonce: channel.local_nonce(),
             accepted: true,
@@ -239,7 +249,7 @@ impl UdpTransport {
         // Set peer endpoint
         channel
             .set_peer_candidates(
-                candidate_addrs(answer.local_endpoint, answer.public_endpoint),
+                candidate_addrs_multi(answer.local_endpoint, &answer.local_candidates, answer.public_endpoint),
                 answer.nonce,
             )
             .await;
@@ -420,6 +430,7 @@ mod tests {
             channel_id: "c1".into(),
             from_session: "peer".into(),
             local_endpoint: endpoint(1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
             accepted: false,
@@ -436,6 +447,7 @@ mod tests {
             channel_id: "c1".into(),
             from_session: "ghost".into(),
             local_endpoint: endpoint(1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
             accepted: true,

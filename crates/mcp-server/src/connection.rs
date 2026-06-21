@@ -473,6 +473,13 @@ async fn handle_server_message(
                             .await
                             .map(|id| CommandResult::TransferQueued { id })
                     }
+                    // Transfer chunk over the relay/WS path: keep the size cap
+                    // UNLESS a direct UDP channel to the sender exists (then this
+                    // is a p2p transfer that merely used WS for this slice).
+                    Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. } => {
+                        let over_udp = udp_transport.has_udp_channel(&from_session).await;
+                        executor::recv_file_chunk(&state, &dest_path, offset, &bytes, eof, sha256.as_deref(), over_udp).await
+                    }
                     other => executor::execute(&other, &state).await,
                 };
 
@@ -660,7 +667,8 @@ async fn handle_udp_inbound(
             let tx = tx.clone();
             let udp_transport = udp_transport.clone();
             let pending = pending.clone();
-            
+            let peer_session = peer_session.to_string();
+
             tokio::spawn(async move {
                 let exec_result: Result<CommandResult> = match command {
                     // SendFileTo must be intercepted here too (not just on the WS
@@ -672,9 +680,33 @@ async fn handle_udp_inbound(
                             .await
                             .map(|id| CommandResult::TransferQueued { id })
                     }
+                    // Chunk arrived over the direct UDP channel → p2p, no relay to
+                    // protect → no size cap.
+                    Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. } => {
+                        executor::recv_file_chunk(&state, &dest_path, offset, &bytes, eof, sha256.as_deref(), true).await
+                    }
                     other => executor::execute(&other, &state).await,
                 };
-                
+
+                // Reply over the SAME UDP channel back to the initiator. The
+                // command came over UDP and bypassed the relay, so a WS reply
+                // can't route back to an *agent* initiator (the relay has no
+                // pending mapping for request_id and would broadcast it to MCP
+                // observers only). Sending UdpFrame::Result to peer_session
+                // resolves the initiator's pending map directly. We ALSO emit the
+                // WS reply: an MCP-observer initiator can't receive UDP, but the
+                // relay's broadcast reaches it. Duplicate delivery is harmless
+                // (the pending entry resolves once).
+                let udp_reply: Option<UdpFrame> = match &exec_result {
+                    Ok(result) => result
+                        .encrypt(&cipher)
+                        .ok()
+                        .map(|envelope| UdpFrame::Result { request_id: request_id.clone(), result: envelope }),
+                    Err(e) => Some(UdpFrame::Error { request_id: request_id.clone(), error: e.to_string() }),
+                };
+                if let Some(frame) = udp_reply {
+                    let _ = udp_transport.send_via_udp(&peer_session, &frame.to_bytes()).await;
+                }
                 let reply = encode_udp_reply(&cipher, request_id, exec_result);
                 let _ = tx.send(reply).await;
             });
@@ -863,6 +895,7 @@ mod tests {
             from_session: claimed_from.into(),
             to_session: "me".into(),
             local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
         }
@@ -894,6 +927,7 @@ mod tests {
             channel_id: "ch".into(),
             from_session: "victim".into(),
             local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
             accepted: true,

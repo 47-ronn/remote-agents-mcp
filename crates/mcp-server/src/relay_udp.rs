@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    candidate_addrs, reflexive_endpoint, ChannelState, Cipher, Endpoint, UdpAnswer, UdpChannel,
-    UdpChannelResult, UdpConfig, UdpOffer,
+    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, ChannelState, Cipher, Endpoint,
+    UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +27,11 @@ pub struct UdpTransport {
     config: UdpConfig,
     /// Channel for outgoing signaling messages
     signal_tx: mpsc::Sender<SignalMessage>,
+    /// Inbound application data received over any UDP channel, tagged with the
+    /// peer session it came from. The controller drains this to resolve replies
+    /// and execute commands that arrived over UDP — without it the controller is
+    /// send-only and any reply/command over UDP is silently dropped.
+    inbound_tx: mpsc::Sender<(String, Vec<u8>)>,
 }
 
 /// Signaling messages to send via WS relay.
@@ -38,8 +43,13 @@ pub enum SignalMessage {
 }
 
 impl UdpTransport {
-    /// Create a new UDP transport manager.
-    pub fn new(cipher: Cipher, signal_tx: mpsc::Sender<SignalMessage>) -> Self {
+    /// Create a new UDP transport manager. `inbound_tx` receives `(peer_session,
+    /// bytes)` for application data arriving over any channel.
+    pub fn new(
+        cipher: Cipher,
+        signal_tx: mpsc::Sender<SignalMessage>,
+        inbound_tx: mpsc::Sender<(String, Vec<u8>)>,
+    ) -> Self {
         Self {
             cipher,
             channels: RwLock::new(HashMap::new()),
@@ -47,7 +57,21 @@ impl UdpTransport {
             session_id: RwLock::new(None),
             config: UdpConfig::default(),
             signal_tx,
+            inbound_tx,
         }
+    }
+
+    /// Forward a channel's received application data into the shared inbound
+    /// queue, tagged with the peer session, until the channel closes.
+    fn spawn_inbound_forwarder(&self, peer_session: String, mut recv_rx: mpsc::Receiver<Vec<u8>>) {
+        let inbound_tx = self.inbound_tx.clone();
+        tokio::spawn(async move {
+            while let Some(data) = recv_rx.recv().await {
+                if inbound_tx.send((peer_session.clone(), data)).await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Set our session ID (after authentication).
@@ -75,17 +99,25 @@ impl UdpTransport {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session ID not set"))?;
 
+        // Never dial ourselves: a self-channel would route own-id commands (the
+        // `send_file`-with-no-agent_id loopback) into our own recv path instead of
+        // the WS handler that knows how to source a transfer.
+        if agent_session == session_id {
+            anyhow::bail!("refusing to open a UDP channel to self");
+        }
+
         let channel_id = uuid::Uuid::new_v4().to_string();
 
-        let (channel, _recv_rx) = UdpChannel::new(
+        let (channel, recv_rx) = UdpChannel::new(
             channel_id.clone(),
             self.cipher.clone(),
             self.config.clone(),
         )
         .await
         .context("Failed to create UDP channel")?;
+        self.spawn_inbound_forwarder(agent_session.clone(), recv_rx);
 
-        let local_endpoint = channel.local_endpoint()?;
+        let local_endpoint = channel.advertised_endpoint()?;
         
         // Try STUN discovery first, fall back to relay-provided endpoint
         let public_endpoint = match channel.discover_public_endpoint().await {
@@ -99,11 +131,16 @@ impl UdpTransport {
             }
         };
 
+        let local_candidates: Vec<Endpoint> = local_candidate_ips()
+            .into_iter()
+            .map(|ip| Endpoint::new(ip, local_endpoint.port))
+            .collect();
         let offer = UdpOffer {
             channel_id: channel_id.clone(),
             from_session: session_id,
             to_session: agent_session.clone(),
             local_endpoint,
+            local_candidates,
             public_endpoint,
             nonce: channel.local_nonce(),
         };
@@ -141,15 +178,16 @@ impl UdpTransport {
             offer.from_session, offer.channel_id
         );
 
-        let (channel, _recv_rx) = UdpChannel::new(
+        let (channel, recv_rx) = UdpChannel::new(
             offer.channel_id.clone(),
             self.cipher.clone(),
             self.config.clone(),
         )
         .await
         .context("Failed to create UDP channel for answer")?;
+        self.spawn_inbound_forwarder(offer.from_session.clone(), recv_rx);
 
-        let local_endpoint = channel.local_endpoint()?;
+        let local_endpoint = channel.advertised_endpoint()?;
         
         // Try STUN discovery first, fall back to relay-provided endpoint
         let public_endpoint = match channel.discover_public_endpoint().await {
@@ -163,20 +201,25 @@ impl UdpTransport {
             }
         };
 
-        // Provide BOTH candidate endpoints (local + public); punch_hole probes
-        // each and locks onto the reachable one (local for same-host/LAN, public
-        // across NATs) rather than guessing public-only.
+        // Probe every candidate the offerer advertised (all interfaces + public);
+        // punch_hole locks onto the reachable one — local for same-host/LAN,
+        // public across NATs.
         channel
             .set_peer_candidates(
-                candidate_addrs(offer.local_endpoint, offer.public_endpoint),
+                candidate_addrs_multi(offer.local_endpoint, &offer.local_candidates, offer.public_endpoint),
                 offer.nonce,
             )
             .await;
 
+        let local_candidates: Vec<Endpoint> = local_candidate_ips()
+            .into_iter()
+            .map(|ip| Endpoint::new(ip, local_endpoint.port))
+            .collect();
         let answer = UdpAnswer {
             channel_id: offer.channel_id.clone(),
             from_session: session_id,
             local_endpoint,
+            local_candidates,
             public_endpoint,
             nonce: channel.local_nonce(),
             accepted: true,
@@ -222,7 +265,7 @@ impl UdpTransport {
 
         channel
             .set_peer_candidates(
-                candidate_addrs(answer.local_endpoint, answer.public_endpoint),
+                candidate_addrs_multi(answer.local_endpoint, &answer.local_candidates, answer.public_endpoint),
                 answer.nonce,
             )
             .await;
@@ -349,7 +392,7 @@ mod tests {
     fn transport() -> (UdpTransport, mpsc::Receiver<SignalMessage>) {
         let cipher = Cipher::from_passphrase("test-key");
         let (tx, rx) = mpsc::channel(16);
-        (UdpTransport::new(cipher, tx), rx)
+        (UdpTransport::new(cipher, tx, mpsc::channel(8).0), rx)
     }
 
     fn endpoint(port: u16) -> Endpoint {
@@ -389,6 +432,7 @@ mod tests {
             from_session: "peer".to_string(),
             to_session: "me".to_string(),
             local_endpoint: endpoint(1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
         };
@@ -403,6 +447,7 @@ mod tests {
             channel_id: "c1".to_string(),
             from_session: "peer".to_string(),
             local_endpoint: endpoint(1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
             accepted: false,
@@ -419,6 +464,7 @@ mod tests {
             channel_id: "c1".to_string(),
             from_session: "ghost".to_string(),
             local_endpoint: endpoint(1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [0u8; 16],
             accepted: true,

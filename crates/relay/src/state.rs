@@ -41,6 +41,10 @@ pub struct Room {
     /// result route back to the specific peer that issued it (peer-model: a room
     /// has many potential initiators), instead of broadcasting to all clients.
     pub pending: DashMap<String, String>,
+    /// UDP signaling: `channel_id → offerer session id`. Lets a `UdpAnswer` route
+    /// back to the exact peer that made the offer (a full-peer controller lives in
+    /// `agents`, not `mcp`, so the old broadcast-to-mcp path missed it).
+    pub udp_offers: DashMap<String, String>,
 }
 
 impl Room {

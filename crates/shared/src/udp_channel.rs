@@ -112,9 +112,24 @@ mod channel_impl {
             Ok((channel, recv_rx))
         }
 
-        /// Get the local endpoint.
+        /// Get the local endpoint (the raw bound address — `0.0.0.0:port` for a
+        /// wildcard bind).
         pub fn local_endpoint(&self) -> Result<Endpoint, UdpChannelError> {
             Ok(self.socket.local_addr()?.into())
+        }
+
+        /// Local endpoint to ADVERTISE in an offer/answer for hole-punching. The
+        /// socket binds `0.0.0.0`, so substitute the host's real egress IP when
+        /// available — otherwise the peer gets `0.0.0.0` as a candidate and can't
+        /// reach us on the LAN. Keeps the bound port.
+        pub fn advertised_endpoint(&self) -> Result<Endpoint, UdpChannelError> {
+            let ep = self.local_endpoint()?;
+            if ep.addr.is_unspecified() {
+                if let Some(ip) = crate::udp::local_egress_ip() {
+                    return Ok(Endpoint::new(ip, ep.port));
+                }
+            }
+            Ok(ep)
         }
 
         /// Discover our public endpoint via STUN.
@@ -160,6 +175,16 @@ mod channel_impl {
             }
             *self.peer_candidates.write().await = deduped;
             *self.remote_nonce.write().await = Some(nonce);
+        }
+
+        /// Adopt `from` as the confirmed peer endpoint when a payload authenticated
+        /// it (successful E2E decrypt) and it differs from the current one. Lets the
+        /// channel follow the peer's real source address across asymmetric
+        /// multi-candidate punches and NAT/bridge rebinds.
+        async fn adopt_peer(&self, from: SocketAddr) {
+            if *self.peer_endpoint.read().await != Some(from) {
+                *self.peer_endpoint.write().await = Some(from);
+            }
         }
 
         /// Start hole-punching to establish connectivity. Probes EVERY candidate
@@ -220,15 +245,32 @@ mod channel_impl {
                 }
                 attempts += 1;
 
-                // Try to receive a probe / probe-ack from any candidate.
+                // Try to receive a probe / probe-ack. We accept packets from any
+                // known candidate, AND from any source whose embedded nonce
+                // authenticates it as our peer (peer-reflexive candidate) — this
+                // is how we learn the peer's real source address when it differs
+                // from what was signaled (NAT/bridge translation).
                 let mut recv_buf = [0u8; UDP_MAX_PACKET];
                 match tokio::time::timeout(interval, self.socket.recv_from(&mut recv_buf)).await {
                     Ok(Ok((len, from))) => {
-                        if candidates.contains(&from) && len >= UDP_HEADER_SIZE {
+                        if len >= UDP_HEADER_SIZE {
                             if let Some(h) = UdpPacketHeader::parse(&recv_buf[..len]) {
+                                let expected = *self.remote_nonce.read().await;
+                                // The nonce a Probe/ProbeAck carries, if present.
+                                let carried: Option<[u8; 16]> = if len >= UDP_HEADER_SIZE + 16 {
+                                    Some(
+                                        recv_buf[UDP_HEADER_SIZE..UDP_HEADER_SIZE + 16]
+                                            .try_into()
+                                            .unwrap(),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let nonce_ok = carried.is_some() && carried == expected;
+                                let known = candidates.contains(&from);
                                 match h.packet_type {
-                                    UdpPacketType::Probe => {
-                                        // Ack whoever probed us (on its address).
+                                    UdpPacketType::Probe if known || nonce_ok => {
+                                        // Ack whoever probed us (on its source addr).
                                         let ack_header = UdpPacketHeader {
                                             packet_type: UdpPacketType::ProbeAck,
                                             sequence: h.sequence,
@@ -238,20 +280,20 @@ mod channel_impl {
                                         ack_header.write(&mut ack_buf);
                                         ack_buf[UDP_HEADER_SIZE..].copy_from_slice(&self.local_nonce);
                                         let _ = self.socket.send_to(&ack_buf, from).await;
-                                    }
-                                    UdpPacketType::ProbeAck if len >= UDP_HEADER_SIZE + 16 => {
-                                        // Connected once the peer echoes our expected
-                                        // nonce — lock onto the candidate that answered.
-                                        let expected = *self.remote_nonce.read().await;
-                                        let received: [u8; 16] = recv_buf
-                                            [UDP_HEADER_SIZE..UDP_HEADER_SIZE + 16]
-                                            .try_into()
-                                            .unwrap();
-                                        if expected == Some(received) {
+                                        // An authenticated probe means `from` is a
+                                        // working return path — lock onto it.
+                                        if nonce_ok {
                                             *self.peer_endpoint.write().await = Some(from);
                                             *self.state.write().await = ChannelState::Connected;
                                             return Ok(());
                                         }
+                                    }
+                                    UdpPacketType::ProbeAck if nonce_ok => {
+                                        // Connected once the peer echoes our expected
+                                        // nonce — lock onto the address that answered.
+                                        *self.peer_endpoint.write().await = Some(from);
+                                        *self.state.write().await = ChannelState::Connected;
+                                        return Ok(());
                                     }
                                     _ => {}
                                 }
@@ -398,14 +440,14 @@ mod channel_impl {
 
                 let (len, from) = self.socket.recv_from(&mut buf).await?;
 
-                // Verify sender
-                let expected_peer = *self.peer_endpoint.read().await;
-                if let Some(peer) = expected_peer {
-                    if from != peer {
-                        continue; // Ignore packets from unknown sources
-                    }
-                }
-
+                // We deliberately do NOT drop packets whose source differs from
+                // the confirmed peer endpoint. With multi-candidate punching the
+                // two ends can lock onto asymmetric addresses, and NAT/bridge
+                // rebinding can move the source mid-stream. Application payloads
+                // are E2E-encrypted (AES-GCM), so a successful decrypt — not the
+                // source address — authenticates the peer; on a valid decrypt we
+                // ADOPT `from` as the peer endpoint (below) so our sends follow
+                // the peer's real address. Control frames are answered to `from`.
                 if len < UDP_HEADER_SIZE {
                     continue;
                 }
@@ -432,6 +474,7 @@ mod channel_impl {
                             let encrypted =
                                 String::from_utf8_lossy(&buf[UDP_HEADER_SIZE..len]).to_string();
                             if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                                self.adopt_peer(from).await;
                                 let _ = self.recv_tx.send(decrypted).await;
                             }
                         }
@@ -457,6 +500,7 @@ mod channel_impl {
                             if let Some(body) = completed {
                                 let encrypted = String::from_utf8_lossy(&body).to_string();
                                 if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                                    self.adopt_peer(from).await;
                                     let _ = self.recv_tx.send(decrypted).await;
                                 }
                             }
@@ -469,6 +513,7 @@ mod channel_impl {
                             let encrypted =
                                 String::from_utf8_lossy(&buf[UDP_HEADER_SIZE..len]).to_string();
                             if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                                self.adopt_peer(from).await;
                                 let _ = self.recv_tx.send(decrypted).await;
                             }
                         }

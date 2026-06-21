@@ -26,7 +26,7 @@ async fn mcp_dials_agent_and_sends_command_over_udp() {
 
     // MCP-side transport (dials).
     let (mcp_sig_tx, mut mcp_sig_rx) = mpsc::channel(16);
-    let mcp = Arc::new(relay_udp::UdpTransport::new(cipher.clone(), mcp_sig_tx));
+    let mcp = Arc::new(relay_udp::UdpTransport::new(cipher.clone(), mcp_sig_tx, mpsc::channel(16).0));
     mcp.set_session_id("MCP".into()).await;
     mcp.set_public_endpoint(lo).await;
 
