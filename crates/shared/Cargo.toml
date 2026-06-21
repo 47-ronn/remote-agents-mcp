@@ -25,3 +25,6 @@ socket2 = "0.5"
 [features]
 default = []
 udp = ["tokio"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
