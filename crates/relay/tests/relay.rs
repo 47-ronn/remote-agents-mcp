@@ -154,7 +154,7 @@ async fn full_round_trip() {
         &ClientMessage::Command {
             request_id: "req-1".into(),
             target: Target::All,
-            payload: "QUJDREVG".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -163,7 +163,7 @@ async fn full_round_trip() {
             request_id, payload, ..
         } => {
             assert_eq!(request_id, "req-1");
-            assert_eq!(payload, "QUJDREVG"); // forwarded opaquely
+            assert_eq!(payload, b"PAY");
         }
         other => panic!("expected command, got {:?}", other),
     }
@@ -173,7 +173,7 @@ async fn full_round_trip() {
         &mut agent,
         &ClientMessage::CommandResult {
             request_id: "req-1".into(),
-            result: "UkVTVUxU".into(),
+            result: b"RES".to_vec(),
         },
     )
     .await;
@@ -185,7 +185,7 @@ async fn full_round_trip() {
         } => {
             assert_eq!(request_id, "req-1");
             assert_eq!(agent_id, "a1");
-            assert_eq!(result, "UkVTVUxU");
+            assert_eq!(result, b"RES");
         }
         other => panic!("expected command_result, got {:?}", other),
     }
@@ -217,7 +217,7 @@ async fn full_round_trip() {
             target: Target::Tagged {
                 tags: vec!["frontend".into()],
             },
-            payload: "WA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -382,7 +382,7 @@ async fn relay_has_no_role_authorization() {
         &ClientMessage::Command {
             request_id: "x".into(),
             target: Target::Tagged { tags: vec!["nobody".into()] },
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -451,7 +451,7 @@ async fn result_routes_only_to_requesting_mcp() {
         &ClientMessage::Command {
             request_id: "req-x".into(),
             target: Target::Agent { id: "a1".into() },
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -463,7 +463,7 @@ async fn result_routes_only_to_requesting_mcp() {
         &mut agent,
         &ClientMessage::CommandResult {
             request_id: "req-x".into(),
-            result: "Ug==".into(),
+            result: b"RES".to_vec(),
         },
     )
     .await;
@@ -472,7 +472,7 @@ async fn result_routes_only_to_requesting_mcp() {
     match recv(&mut mcp1).await {
         ServerMessage::CommandResult { request_id, result, .. } => {
             assert_eq!(request_id, "req-x");
-            assert_eq!(result, "Ug==");
+            assert_eq!(result, b"RES");
         }
         other => panic!("expected CommandResult at mcp1, got {:?}", other),
     }
@@ -516,7 +516,7 @@ async fn agent_peer_can_initiate_command() {
         &ClientMessage::Command {
             request_id: "p2p".into(),
             target: Target::Agent { id: "a1".into() },
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -528,7 +528,7 @@ async fn agent_peer_can_initiate_command() {
         &mut a1,
         &ClientMessage::CommandResult {
             request_id: "p2p".into(),
-            result: "Ug==".into(),
+            result: b"RES".to_vec(),
         },
     )
     .await;
@@ -537,7 +537,7 @@ async fn agent_peer_can_initiate_command() {
     match recv(&mut a2).await {
         ServerMessage::CommandResult { request_id, result, .. } => {
             assert_eq!(request_id, "p2p");
-            assert_eq!(result, "Ug==");
+            assert_eq!(result, b"RES");
         }
         other => panic!("expected CommandResult at a2, got {:?}", other),
     }
@@ -585,7 +585,7 @@ async fn peer_visibility_and_anonymous_observer() {
         &ClientMessage::Command {
             request_id: "bc".into(),
             target: Target::All,
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -656,7 +656,7 @@ async fn duplicate_connection_disconnect_keeps_host_present() {
         &ClientMessage::Command {
             request_id: "to-live".into(),
             target: Target::Agent { id: "dup".into() },
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;
@@ -721,7 +721,7 @@ async fn duplicate_connections_merge_capabilities_and_route_to_capable() {
         &ClientMessage::Command {
             request_id: "to-auto".into(),
             target: Target::Agent { id: "ojo".into() },
-            payload: "UA==".into(),
+            payload: b"PAY".to_vec(),
         },
     )
     .await;

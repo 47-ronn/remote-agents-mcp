@@ -51,7 +51,7 @@ pub(crate) fn relay_payload_too_large(len: usize) -> bool {
 /// error when the envelope is too big for the relay's WS frame (a silent drop
 /// otherwise). Used by both the WS- and UDP-inbound command paths (and the
 /// mcp-mode peer in `relay_controller`).
-pub(crate) fn relay_safe_result(request_id: String, envelope: String) -> ClientMessage {
+pub(crate) fn relay_safe_result(request_id: String, envelope: Vec<u8>) -> ClientMessage {
     if relay_payload_too_large(envelope.len()) {
         ClientMessage::CommandError {
             request_id,
@@ -489,8 +489,12 @@ async fn handle_server_message(
                     Ok(result) => match result.encrypt(&cipher) {
                         Ok(envelope) => {
                             if udp_transport.has_udp_channel(&from_session).await {
+                                let frame = UdpFrame::Result {
+                                    request_id: request_id.clone(),
+                                    result: envelope.clone(),
+                                };
                                 let _ = udp_transport
-                                    .send_via_udp(&from_session, envelope.as_bytes())
+                                    .send_via_udp(&from_session, &frame.to_bytes())
                                     .await;
                             }
                             // Guard the WS-relay frame size (UDP, if used, has no such
@@ -1037,15 +1041,15 @@ mod tests {
     #[test]
     fn relay_safe_result_guards_oversized_envelopes() {
         // A small envelope passes through as a CommandResult.
-        match relay_safe_result("r1".into(), "small".into()) {
+        match relay_safe_result("r1".into(), b"small".to_vec()) {
             ClientMessage::CommandResult { request_id, result } => {
                 assert_eq!(request_id, "r1");
-                assert_eq!(result, "small");
+                assert_eq!(result, b"small");
             }
             other => panic!("expected CommandResult, got {other:?}"),
         }
         // An over-limit envelope becomes a clear error (not a silent relay drop).
-        let big = "x".repeat(MAX_RELAY_PAYLOAD + 1);
+        let big = vec![b'x'; MAX_RELAY_PAYLOAD + 1];
         match relay_safe_result("r2".into(), big) {
             ClientMessage::CommandError { request_id, error } => {
                 assert_eq!(request_id, "r2");
@@ -1054,7 +1058,7 @@ mod tests {
             other => panic!("expected CommandError, got {other:?}"),
         }
         // Exactly at the limit still passes.
-        let edge = "x".repeat(MAX_RELAY_PAYLOAD);
+        let edge = vec![b'x'; MAX_RELAY_PAYLOAD];
         assert!(matches!(
             relay_safe_result("r3".into(), edge),
             ClientMessage::CommandResult { .. }

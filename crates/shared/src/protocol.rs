@@ -44,18 +44,18 @@ pub enum ClientMessage {
     ListAgents,
 
     /// Send a command to agent(s) (MCP only). `payload` is an encrypted
-    /// [`Command`] envelope (see [`Command::encrypt`]).
+    /// [`Command`] envelope (raw bytes — see [`Command::encrypt`]).
     Command {
         request_id: String,
         target: Target,
-        payload: String,
+        payload: Vec<u8>,
     },
 
     /// Command result from agent (Agent only). `result` is an encrypted
-    /// [`CommandResult`] envelope (see [`CommandResult::encrypt`]).
+    /// [`CommandResult`] envelope (raw bytes — see [`CommandResult::encrypt`]).
     CommandResult {
         request_id: String,
-        result: String,
+        result: Vec<u8>,
     },
 
     /// Command error from agent (Agent only)
@@ -368,19 +368,19 @@ pub enum ServerMessage {
     },
 
     /// Command to execute (sent to agents). `payload` is an encrypted
-    /// [`Command`] envelope.
+    /// [`Command`] envelope (raw bytes).
     Command {
         request_id: String,
         from_session: String,
-        payload: String,
+        payload: Vec<u8>,
     },
 
     /// Command result (forwarded from agent to MCP). `result` is an encrypted
-    /// [`CommandResult`] envelope.
+    /// [`CommandResult`] envelope (raw bytes).
     CommandResult {
         request_id: String,
         agent_id: String,
-        result: String,
+        result: Vec<u8>,
     },
 
     /// Command error (forwarded from agent to MCP)
@@ -592,15 +592,16 @@ pub enum CommandResult {
 
 impl Command {
     /// Serialize, transparently compress (large payloads), and encrypt this
-    /// command into a base64 envelope string.
-    pub fn encrypt(&self, cipher: &Cipher) -> Result<String, EnvelopeError> {
+    /// command into a raw binary envelope (`nonce‖ct‖tag`, no base64). The
+    /// envelope is the opaque `payload` the relay forwards blind.
+    pub fn encrypt(&self, cipher: &Cipher) -> Result<Vec<u8>, EnvelopeError> {
         let json = serde_json::to_vec(self)?;
-        Ok(cipher.encrypt(&crate::compress::maybe_compress(&json))?)
+        Ok(cipher.encrypt_bytes(&crate::compress::maybe_compress(&json))?)
     }
 
     /// Decrypt, decompress if needed, and deserialize a command.
-    pub fn decrypt(envelope: &str, cipher: &Cipher) -> Result<Self, EnvelopeError> {
-        let raw = cipher.decrypt(envelope)?;
+    pub fn decrypt(envelope: &[u8], cipher: &Cipher) -> Result<Self, EnvelopeError> {
+        let raw = cipher.decrypt_bytes(envelope)?;
         let json = crate::compress::maybe_decompress(&raw)?;
         Ok(serde_json::from_slice(&json)?)
     }
@@ -608,15 +609,15 @@ impl Command {
 
 impl CommandResult {
     /// Serialize, transparently compress (large payloads), and encrypt this
-    /// result into a base64 envelope string.
-    pub fn encrypt(&self, cipher: &Cipher) -> Result<String, EnvelopeError> {
+    /// result into a raw binary envelope (`nonce‖ct‖tag`, no base64).
+    pub fn encrypt(&self, cipher: &Cipher) -> Result<Vec<u8>, EnvelopeError> {
         let json = serde_json::to_vec(self)?;
-        Ok(cipher.encrypt(&crate::compress::maybe_compress(&json))?)
+        Ok(cipher.encrypt_bytes(&crate::compress::maybe_compress(&json))?)
     }
 
     /// Decrypt, decompress if needed, and deserialize a result.
-    pub fn decrypt(envelope: &str, cipher: &Cipher) -> Result<Self, EnvelopeError> {
-        let raw = cipher.decrypt(envelope)?;
+    pub fn decrypt(envelope: &[u8], cipher: &Cipher) -> Result<Self, EnvelopeError> {
+        let raw = cipher.decrypt_bytes(envelope)?;
         let json = crate::compress::maybe_decompress(&raw)?;
         Ok(serde_json::from_slice(&json)?)
     }
@@ -699,8 +700,8 @@ mod tests {
             cwd: None,
         };
         let envelope = cmd.encrypt(&cipher).unwrap();
-        // Ciphertext must not leak the plaintext command.
-        assert!(!envelope.contains("whoami"));
+        // Ciphertext (raw bytes) must not leak the plaintext command.
+        assert!(!envelope.windows(6).any(|w| w == b"whoami"));
         let decrypted = Command::decrypt(&envelope, &cipher).unwrap();
         matches!(decrypted, Command::Exec { .. });
     }
@@ -908,8 +909,8 @@ mod tests {
     #[test]
     fn command_decrypt_rejects_malformed_envelope() {
         let cipher = Cipher::for_transport("room-token", None);
-        // Not valid base64 / not a real envelope → decrypt error, never a panic.
-        assert!(Command::decrypt("!!!not-base64!!!", &cipher).is_err());
-        assert!(Command::decrypt("", &cipher).is_err());
+        // Not a real envelope (too short / garbage) → decrypt error, never a panic.
+        assert!(Command::decrypt(b"!!!garbage!!!", &cipher).is_err());
+        assert!(Command::decrypt(b"", &cipher).is_err());
     }
 }
