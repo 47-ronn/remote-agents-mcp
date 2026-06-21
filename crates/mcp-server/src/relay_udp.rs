@@ -106,6 +106,14 @@ impl UdpTransport {
             anyhow::bail!("refusing to open a UDP channel to self");
         }
 
+        // Idempotent per session: reuse an existing channel instead of creating a
+        // second one that would OVERWRITE the map entry — clobbering an
+        // already-connected channel with a fresh (still-punching or failed) one
+        // and forcing data onto the slow WS fallback.
+        if let Some(ch) = self.channels.read().await.get(&agent_session) {
+            return Ok(ch.channel_id.clone());
+        }
+
         let channel_id = uuid::Uuid::new_v4().to_string();
 
         let (channel, recv_rx) = UdpChannel::new(
@@ -145,9 +153,14 @@ impl UdpTransport {
             nonce: channel.local_nonce(),
         };
 
-        // Store channel
+        // Store channel — but lose the race gracefully: if a concurrent dial for
+        // the same session already inserted one (both passed the read-check above
+        // before either inserted), keep theirs and drop ours rather than clobber.
         {
             let mut channels = self.channels.write().await;
+            if let Some(ch) = channels.get(&agent_session) {
+                return Ok(ch.channel_id.clone());
+            }
             channels.insert(agent_session.clone(), Arc::new(channel));
         }
 
