@@ -20,6 +20,8 @@ pub mod proto {
 pub mod proto_convert;
 pub use proto_convert::{ConvertError, WireError};
 #[cfg(feature = "udp")]
+pub mod quic;
+#[cfg(feature = "udp")]
 pub mod udp_channel;
 
 pub use crypto::Cipher;

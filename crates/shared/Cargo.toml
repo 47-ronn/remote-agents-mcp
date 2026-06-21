@@ -23,6 +23,15 @@ if-addrs = "0.15"
 socket2 = "0.5"
 postcard = { version = "1", features = ["use-std"] }
 
+# QUIC data transport over the hole-punched socket (optional, `udp` feature).
+# quinn brings mature congestion control + GSO/GRO batched syscalls — far past
+# our hand-rolled per-packet-ACK ARQ. rcgen mints a self-signed cert; the peer
+# is already authenticated by the hole-punch nonce + our E2E cipher, so QUIC's
+# TLS uses an accept-any verifier.
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.13", optional = true }
+
 # Protobuf wire types, generated from proto/remote_agents.proto at build time.
 prost = "0.13"
 
@@ -34,7 +43,7 @@ prost-build = "0.13"
 
 [features]
 default = []
-udp = ["tokio"]
+udp = ["tokio", "quinn", "rustls", "rcgen"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
