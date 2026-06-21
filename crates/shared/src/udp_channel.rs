@@ -92,6 +92,24 @@ mod channel_impl {
                 let s = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
                 let _ = s.set_recv_buffer_size(8 * 1024 * 1024);
                 let _ = s.set_send_buffer_size(8 * 1024 * 1024);
+                // Windows honors the request above directly (no global cap); macOS
+                // clamps to kern.ipc.maxsockbuf. Linux clamps SO_RCVBUF to
+                // net.core.rmem_max (~208 KiB default) — SO_*BUFFORCE bypasses that
+                // cap when we have CAP_NET_ADMIN (e.g. running as root via systemd),
+                // so we get the large buffer without requiring a sysctl change.
+                // Best-effort: silently ignored (EPERM) when unprivileged.
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = s.as_raw_fd();
+                    let sz: libc::c_int = 8 * 1024 * 1024;
+                    let p = &sz as *const libc::c_int as *const libc::c_void;
+                    let len = std::mem::size_of_val(&sz) as libc::socklen_t;
+                    unsafe {
+                        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUFFORCE, p, len);
+                        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUFFORCE, p, len);
+                    }
+                }
                 s.set_nonblocking(true)?;
                 s.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
                 UdpSocket::from_std(s.into())?
