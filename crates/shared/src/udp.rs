@@ -335,7 +335,13 @@ impl Default for UdpConfig {
             max_probe_attempts: 50,
             keepalive_interval_ms: 10000,
             rto_ms: 200,
-            max_retransmissions: 5,
+            // A fragment dropped more than this many times is abandoned, which
+            // fails the whole slice (the receiver can't reassemble → no reply →
+            // the sender's per-slice timeout fires). 5 is too few for a lossy WAN
+            // where a burst can drop a fragment several times in a row; 20 (≈ up
+            // to rto_ms*20 = 4s of recovery) lets transfers complete across the
+            // public internet at the cost of latency under heavy loss.
+            max_retransmissions: 20,
         }
     }
 }
