@@ -47,8 +47,13 @@ mod channel_impl {
         pub channel_id: String,
         /// Local UDP socket
         socket: Arc<UdpSocket>,
-        /// Remote peer's endpoint (after hole-punching)
+        /// Remote peer's CONFIRMED endpoint (the candidate that answered the
+        /// punch). `None` until hole-punching locks onto a working candidate.
         peer_endpoint: RwLock<Option<SocketAddr>>,
+        /// Candidate peer endpoints to probe during hole-punching (local + public,
+        /// ICE-style). Same-host/LAN peers connect via the local candidate; peers
+        /// behind different NATs via the public one.
+        peer_candidates: RwLock<Vec<SocketAddr>>,
         /// Channel state
         state: RwLock<ChannelState>,
         /// E2E encryption cipher
@@ -91,6 +96,7 @@ mod channel_impl {
                 channel_id,
                 socket,
                 peer_endpoint: RwLock::new(None),
+                peer_candidates: RwLock::new(Vec::new()),
                 state: RwLock::new(ChannelState::Disconnected),
                 cipher,
                 send_seq: Mutex::new(0),
@@ -134,17 +140,50 @@ mod channel_impl {
             *self.state.read().await
         }
 
-        /// Set the remote peer's endpoint and nonce (from signaling).
+        /// Set a single known remote endpoint and nonce (from signaling). The
+        /// endpoint is both the confirmed peer and the sole punch candidate.
         pub async fn set_peer(&self, endpoint: SocketAddr, nonce: [u8; 16]) {
             *self.peer_endpoint.write().await = Some(endpoint);
+            *self.peer_candidates.write().await = vec![endpoint];
             *self.remote_nonce.write().await = Some(nonce);
         }
 
-        /// Start hole-punching to establish connectivity.
+        /// Set multiple candidate endpoints (local + public) and the peer nonce.
+        /// `peer_endpoint` stays `None` until `punch_hole` confirms which
+        /// candidate is reachable. Empty/duplicate candidates are ignored.
+        pub async fn set_peer_candidates(&self, candidates: Vec<SocketAddr>, nonce: [u8; 16]) {
+            let mut deduped: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
+            for c in candidates {
+                if !deduped.contains(&c) {
+                    deduped.push(c);
+                }
+            }
+            *self.peer_candidates.write().await = deduped;
+            *self.remote_nonce.write().await = Some(nonce);
+        }
+
+        /// Start hole-punching to establish connectivity. Probes EVERY candidate
+        /// endpoint (local + public) each round and locks onto the first one that
+        /// answers with a nonce-matching ProbeAck — so same-host/LAN peers connect
+        /// via their local address and cross-NAT peers via the public one, with no
+        /// a-priori guess about which is reachable.
         pub async fn punch_hole(&self) -> Result<(), UdpChannelError> {
-            let peer = self.peer_endpoint.read().await.ok_or_else(|| {
-                UdpChannelError::HolePunchFailed("peer endpoint not set".to_string())
-            })?;
+            let candidates: Vec<SocketAddr> = {
+                let cands = self.peer_candidates.read().await.clone();
+                if !cands.is_empty() {
+                    cands
+                } else {
+                    // Back-compat: fall back to a single confirmed endpoint.
+                    match *self.peer_endpoint.read().await {
+                        Some(p) => vec![p],
+                        None => {
+                            return Err(UdpChannelError::HolePunchFailed(
+                                "peer endpoint not set".to_string(),
+                            ))
+                        }
+                    }
+                }
+            };
 
             *self.state.write().await = ChannelState::Probing;
 
@@ -168,7 +207,7 @@ mod channel_impl {
                     ));
                 }
 
-                // Send probe packet
+                // Send a probe to every candidate this round.
                 let header = UdpPacketHeader {
                     packet_type: UdpPacketType::Probe,
                     sequence: attempts,
@@ -176,19 +215,20 @@ mod channel_impl {
                 };
                 header.write(&mut probe_buf);
                 probe_buf[UDP_HEADER_SIZE..].copy_from_slice(&self.local_nonce);
-
-                self.socket.send_to(&probe_buf, peer).await?;
+                for cand in &candidates {
+                    let _ = self.socket.send_to(&probe_buf, *cand).await;
+                }
                 attempts += 1;
 
-                // Try to receive probe ack
+                // Try to receive a probe / probe-ack from any candidate.
                 let mut recv_buf = [0u8; UDP_MAX_PACKET];
                 match tokio::time::timeout(interval, self.socket.recv_from(&mut recv_buf)).await {
                     Ok(Ok((len, from))) => {
-                        if from == peer && len >= UDP_HEADER_SIZE {
+                        if candidates.contains(&from) && len >= UDP_HEADER_SIZE {
                             if let Some(h) = UdpPacketHeader::parse(&recv_buf[..len]) {
                                 match h.packet_type {
                                     UdpPacketType::Probe => {
-                                        // Send probe ack
+                                        // Ack whoever probed us (on its address).
                                         let ack_header = UdpPacketHeader {
                                             packet_type: UdpPacketType::ProbeAck,
                                             sequence: h.sequence,
@@ -197,16 +237,18 @@ mod channel_impl {
                                         let mut ack_buf = [0u8; UDP_HEADER_SIZE + 16];
                                         ack_header.write(&mut ack_buf);
                                         ack_buf[UDP_HEADER_SIZE..].copy_from_slice(&self.local_nonce);
-                                        let _ = self.socket.send_to(&ack_buf, peer).await;
+                                        let _ = self.socket.send_to(&ack_buf, from).await;
                                     }
                                     UdpPacketType::ProbeAck if len >= UDP_HEADER_SIZE + 16 => {
-                                        // Connected once the peer echoes our expected nonce.
+                                        // Connected once the peer echoes our expected
+                                        // nonce — lock onto the candidate that answered.
                                         let expected = *self.remote_nonce.read().await;
                                         let received: [u8; 16] = recv_buf
                                             [UDP_HEADER_SIZE..UDP_HEADER_SIZE + 16]
                                             .try_into()
                                             .unwrap();
                                         if expected == Some(received) {
+                                            *self.peer_endpoint.write().await = Some(from);
                                             *self.state.write().await = ChannelState::Connected;
                                             return Ok(());
                                         }
@@ -618,6 +660,47 @@ mod channel_impl {
 
             assert_eq!(a.state().await, ChannelState::Connected);
             assert_eq!(b.state().await, ChannelState::Connected);
+        }
+
+        /// Local-candidate punching: when the FIRST candidate is unreachable (a
+        /// dead address, e.g. a public IP that hairpins) the punch must still
+        /// connect via a later reachable candidate (the loopback/LAN one) and
+        /// lock `peer_endpoint` onto it.
+        #[tokio::test]
+        async fn punch_connects_via_non_first_candidate() {
+            let cipher = Cipher::from_passphrase("multi-cand-key");
+            let (a, _arx) = UdpChannel::new("ch".into(), cipher.clone(), UdpConfig::default())
+                .await
+                .unwrap();
+            let (b, _brx) = UdpChannel::new("ch".into(), cipher, UdpConfig::default())
+                .await
+                .unwrap();
+            let (a, b) = (Arc::new(a), Arc::new(b));
+
+            let (a_peer, b_peer) = (loopback_peer(&a), loopback_peer(&b));
+            // A dead candidate (TEST-NET-1, never answers) placed FIRST, the real
+            // loopback peer SECOND — mirrors "public unreachable, local works".
+            let dead = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+            a.set_peer_candidates(vec![dead, b_peer], b.local_nonce()).await;
+            b.set_peer_candidates(vec![dead, a_peer], a.local_nonce()).await;
+
+            let (ra, rb) = (a.clone(), b.clone());
+            let handshake = async move {
+                let ha = tokio::spawn(async move { ra.punch_hole().await });
+                let hb = tokio::spawn(async move { rb.punch_hole().await });
+                let (resa, resb) = tokio::join!(ha, hb);
+                resa.unwrap().expect("A hole-punch failed");
+                resb.unwrap().expect("B hole-punch failed");
+            };
+            tokio::time::timeout(Duration::from_secs(10), handshake)
+                .await
+                .expect("hole-punching did not converge via fallback candidate");
+
+            assert_eq!(a.state().await, ChannelState::Connected);
+            assert_eq!(b.state().await, ChannelState::Connected);
+            // Each side locked onto the reachable loopback candidate, not the dead one.
+            assert_eq!(*a.peer_endpoint.read().await, Some(b_peer));
+            assert_eq!(*b.peer_endpoint.read().await, Some(a_peer));
         }
     }
 }

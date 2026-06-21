@@ -15,9 +15,9 @@ pub use crypto::Cipher;
 pub use protocol::*;
 pub use types::*;
 pub use udp::{
-    reflexive_endpoint, ChannelState, Endpoint, UdpAnswer, UdpChannelResult, UdpConfig, UdpFrame,
-    UdpOffer, UdpPacketHeader, UdpPacketType, UDP_HEADER_SIZE, UDP_MAX_PACKET, UDP_MAX_PAYLOAD,
-    STUN_SERVERS,
+    candidate_addrs, reflexive_endpoint, ChannelState, Endpoint, UdpAnswer, UdpChannelResult,
+    UdpConfig, UdpFrame, UdpOffer, UdpPacketHeader, UdpPacketType, UDP_HEADER_SIZE, UDP_MAX_PACKET,
+    UDP_MAX_PAYLOAD, STUN_SERVERS,
 };
 #[cfg(feature = "udp")]
 pub use udp::stun_discover;
