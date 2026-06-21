@@ -86,7 +86,18 @@ impl UdpTransport {
         .context("Failed to create UDP channel")?;
 
         let local_endpoint = channel.local_endpoint()?;
-        let public_endpoint = reflexive_endpoint(*self.public_endpoint.read().await, local_endpoint);
+        
+        // Try STUN discovery first, fall back to relay-provided endpoint
+        let public_endpoint = match channel.discover_public_endpoint().await {
+            Some(ep) => {
+                info!("STUN discovered public endpoint: {}", ep);
+                Some(ep)
+            }
+            None => {
+                debug!("STUN discovery failed, using relay endpoint");
+                reflexive_endpoint(*self.public_endpoint.read().await, local_endpoint)
+            }
+        };
 
         let offer = UdpOffer {
             channel_id: channel_id.clone(),
@@ -139,7 +150,18 @@ impl UdpTransport {
         .context("Failed to create UDP channel for answer")?;
 
         let local_endpoint = channel.local_endpoint()?;
-        let public_endpoint = reflexive_endpoint(*self.public_endpoint.read().await, local_endpoint);
+        
+        // Try STUN discovery first, fall back to relay-provided endpoint
+        let public_endpoint = match channel.discover_public_endpoint().await {
+            Some(ep) => {
+                info!("STUN discovered public endpoint: {}", ep);
+                Some(ep)
+            }
+            None => {
+                debug!("STUN discovery failed, using relay endpoint");
+                reflexive_endpoint(*self.public_endpoint.read().await, local_endpoint)
+            }
+        };
 
         // Set peer endpoint - prefer public if available
         let peer_endpoint = offer

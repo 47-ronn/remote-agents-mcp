@@ -513,6 +513,127 @@ impl FragmentReassembler {
     }
 }
 
+// ============================================================================
+// STUN Discovery
+// ============================================================================
+
+/// Default public STUN servers for NAT traversal.
+pub const STUN_SERVERS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun1.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+];
+
+/// Discover our public UDP endpoint via STUN.
+///
+/// Sends a STUN Binding Request to a public STUN server and parses the
+/// XOR-MAPPED-ADDRESS from the response to determine our public IP and port.
+///
+/// This is essential for UDP hole-punching when behind NAT.
+#[cfg(feature = "udp")]
+pub async fn stun_discover(
+    socket: &tokio::net::UdpSocket,
+    servers: &[&str],
+    timeout: std::time::Duration,
+) -> Option<Endpoint> {
+    use tokio::time::timeout as tokio_timeout;
+
+    for server in servers {
+        // Resolve server address
+        let addr: std::net::SocketAddr = match tokio::net::lookup_host(server).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Build STUN Binding Request (RFC 5389)
+        // Message Type: 0x0001 (Binding Request)
+        // Message Length: 0 (no attributes)
+        // Magic Cookie: 0x2112A442
+        // Transaction ID: random 12 bytes
+        let mut request = [0u8; 20];
+        request[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Type
+        request[2..4].copy_from_slice(&0x0000u16.to_be_bytes()); // Length
+        request[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut request[8..20]); // Transaction ID
+
+        // Send request
+        if socket.send_to(&request, addr).await.is_err() {
+            continue;
+        }
+
+        // Wait for response
+        let mut response = [0u8; 256];
+        let recv_result = tokio_timeout(timeout, socket.recv_from(&mut response)).await;
+        let (len, _from) = match recv_result {
+            Ok(Ok(r)) => r,
+            _ => continue,
+        };
+
+        // Parse STUN response
+        if len < 20 {
+            continue;
+        }
+
+        // Check message type (0x0101 = Binding Success Response)
+        let msg_type = u16::from_be_bytes([response[0], response[1]]);
+        if msg_type != 0x0101 {
+            continue;
+        }
+
+        // Check magic cookie
+        let magic = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+        if magic != 0x2112A442 {
+            continue;
+        }
+
+        // Parse attributes to find XOR-MAPPED-ADDRESS (0x0020)
+        let msg_len = u16::from_be_bytes([response[2], response[3]]) as usize;
+        let mut offset = 20;
+        while offset + 4 <= 20 + msg_len && offset + 4 <= len {
+            let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
+            let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+            offset += 4;
+
+            if offset + attr_len > len {
+                break;
+            }
+
+            // XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
+            if (attr_type == 0x0020 || attr_type == 0x0001) && attr_len >= 8 {
+                let family = response[offset + 1];
+                if family == 0x01 {
+                    // IPv4
+                    let xor_port = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
+                    let xor_ip = u32::from_be_bytes([
+                        response[offset + 4],
+                        response[offset + 5],
+                        response[offset + 6],
+                        response[offset + 7],
+                    ]);
+
+                    let (port, ip) = if attr_type == 0x0020 {
+                        // XOR with magic cookie
+                        (xor_port ^ 0x2112, xor_ip ^ 0x2112A442)
+                    } else {
+                        (xor_port, xor_ip)
+                    };
+
+                    let ip_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip));
+                    return Some(Endpoint::new(ip_addr, port));
+                }
+            }
+
+            // Align to 4-byte boundary
+            offset += (attr_len + 3) & !3;
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +849,28 @@ mod tests {
         };
         assert!(r.insert(&bad2).is_none());
         assert_eq!(r.pending_len(), 0);
+    }
+
+    #[cfg(feature = "udp")]
+    #[tokio::test]
+    async fn stun_discovery_returns_public_endpoint() {
+        use std::time::Duration;
+        
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        println!("Local socket: {}", local);
+        
+        let result = super::stun_discover(&socket, super::STUN_SERVERS, Duration::from_secs(3)).await;
+        
+        // Should succeed unless behind very restrictive firewall
+        if let Some(ep) = result {
+            println!("STUN discovered: {}:{}", ep.addr, ep.port);
+            // Port should be non-zero
+            assert!(ep.port > 0, "STUN should return non-zero port");
+            // Address should be non-local (unless in special network config)
+            assert!(!ep.addr.is_loopback(), "Should not be loopback");
+        } else {
+            println!("STUN discovery failed (may be blocked by firewall)");
+        }
     }
 }

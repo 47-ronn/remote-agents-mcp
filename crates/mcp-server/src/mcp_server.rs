@@ -590,8 +590,12 @@ impl ServerHandler for McpHandler {
             if let Command::SendFileTo { ref dest_id, .. } = command {
                 // If no agent_id, the source is the local node
                 let source_id = agent_id.as_deref().unwrap_or("");
-                // Get local node ID for comparison
-                let local_id = self.state.blocking_read().config.id.clone();
+                // Get local node ID for comparison. NOTE: `self.state` is a
+                // tokio async RwLock and we are inside the async runtime, so we
+                // MUST use `.read().await` here — `.blocking_read()` panics with
+                // "Cannot block the current thread from within a runtime",
+                // crashing the worker and hanging the send_file call forever.
+                let local_id = self.state.read().await.config.id.clone();
                 let effective_source = if source_id.is_empty() { &local_id } else { source_id };
                 if effective_source == dest_id {
                     return Err(exec_error(

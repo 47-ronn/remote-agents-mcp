@@ -863,6 +863,60 @@ async fn oversized_message_is_rejected_and_connection_dropped() {
     assert!(dropped, "oversized frame must drop the connection");
 }
 
+/// `UpdateAgent` (sent by an agent after a mode change, see the set_mode fix)
+/// must NOT deadlock the relay. The handler held a `get_mut` write guard on the
+/// session's DashMap shard and then called `dedup_agents`/`broadcast_agents`,
+/// which iterate `room.agents` and re-lock every shard — including the held one,
+/// self-deadlocking the task while it owned the lock and wedging the whole relay
+/// (every later peer join / HTTP request parked at 0% CPU). Regression guard: an
+/// observer must receive the broadcast that follows the update, and the relay
+/// must keep accepting new connections afterwards.
+#[tokio::test]
+async fn update_agent_does_not_deadlock_relay() {
+    let port = start_relay().await;
+
+    // Observer connected first so it sees join + update traffic.
+    let mut mcp = connect(port, "dev").await;
+    auth(&mut mcp, None).await;
+
+    // Agent joins; observer is told it joined.
+    let mut agent = connect(port, "dev").await;
+    auth(&mut agent, Some(agent_info("a1", &["backend"]))).await;
+    let _ = recv(&mut agent).await; // initial (empty) AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => assert_eq!(agent.id, "a1"),
+        other => panic!("expected AgentJoined(a1), got {:?}", other),
+    }
+
+    // The agent updates its info (the path that triggers `get_mut` + re-lock).
+    let mut updated = agent_info("a1", &["frontend"]);
+    updated.mode = AgentMode::Edit;
+    send(
+        &mut agent,
+        &ClientMessage::UpdateAgent { agent_info: Box::new(updated) },
+    )
+    .await;
+
+    // Under the bug this broadcast never fires (the handler deadlocks at
+    // `dedup_agents` before reaching it) and this recv times out.
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => {
+            assert_eq!(agent.id, "a1");
+            assert!(agent.tags.contains(&"frontend".to_string()), "update applied");
+        }
+        other => panic!("expected AgentJoined update, got {:?}", other),
+    }
+
+    // And the relay is still alive: a fresh peer can join and the observer sees it.
+    let mut agent2 = connect(port, "dev").await;
+    auth(&mut agent2, Some(agent_info("a2", &[]))).await;
+    let _ = recv(&mut agent2).await; // its initial AgentList
+    match recv(&mut mcp).await {
+        ServerMessage::AgentJoined { agent } => assert_eq!(agent.id, "a2"),
+        other => panic!("relay wedged after UpdateAgent: {:?}", other),
+    }
+}
+
 // Two sockets sharing one agent-id collapse to one host whose `connections`
 // count is surfaced (so the panel can warn about duplicate/possibly-mis-keyed
 // sockets). Mirrors the worker's dedupAgents behaviour.

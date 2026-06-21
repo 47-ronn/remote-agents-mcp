@@ -232,10 +232,14 @@ fn handle_client_msg(
     agent_info: &Option<Box<AgentInfo>>,
     self_tx: &Tx,
 ) -> ControlFlow<()> {
+    debug!("Received raw message from {}: {} bytes", session_id, text.len());
     let msg = match ClientMessage::from_json(text) {
-        Ok(m) => m,
+        Ok(m) => {
+            debug!("Parsed message type: {:?}", std::mem::discriminant(&m));
+            m
+        }
         Err(e) => {
-            debug!("ignoring unparseable message: {}", e);
+            tracing::warn!("ignoring unparseable message from {}: {} - first 200 chars: {}", session_id, e, &text[..text.len().min(200)]);
             return ControlFlow::Continue(());
         }
     };
@@ -255,8 +259,11 @@ fn handle_client_msg(
             target,
             payload,
         } => {
+            info!("Received command {} from {} targeting {:?}", request_id, session_id, target);
             let targets = resolve_targets(room, &target);
+            info!("Resolved {} targets for command {}", targets.len(), request_id);
             if targets.is_empty() {
+                info!("No targets found for command {}, sending error", request_id);
                 send_to(
                     self_tx,
                     &ServerMessage::CommandError {
@@ -269,9 +276,10 @@ fn handle_client_msg(
                 // Remember who asked, so the result(s) route back to them only.
                 room.pending
                     .insert(request_id.clone(), session_id.to_string());
-                for (_, tx) in targets {
+                for (agent_name, tx) in &targets {
+                    info!("Sending command {} to agent {}", request_id, agent_name);
                     send_raw(
-                        &tx,
+                        tx,
                         &ServerMessage::Command {
                             request_id: request_id.clone(),
                             from_session: session_id.to_string(),
@@ -349,23 +357,32 @@ fn handle_client_msg(
 
         // Agent is updating its info (e.g. after mode change)
         ClientMessage::UpdateAgent { agent_info: new_info } => {
-            // Update the stored agent info for this session
-            if let Some(mut entry) = room.agents.get_mut(session_id) {
-                // Preserve session_id from the existing entry
-                let mut updated = (*new_info).clone();
-                updated.session_id = entry.info.session_id.clone();
-                entry.info = updated;
-                
-                // Broadcast the update to all peers (like AgentJoined but for updates)
-                let merged = dedup_agents(room)
-                    .into_iter()
-                    .find(|a| a.id == new_info.id)
-                    .unwrap_or_else(|| entry.info.clone());
-                let update_msg = ServerMessage::AgentJoined { agent: Box::new(merged) };
-                broadcast_mcp(room, &update_msg);
-                broadcast_agents(room, &update_msg, Some(&new_info.id));
-                debug!("agent updated: {} ({})", new_info.name, new_info.id);
-            }
+            // Update the stored agent info for this session, then DROP the write
+            // guard BEFORE re-reading the map. `get_mut` holds a write lock on the
+            // session's DashMap shard; `dedup_agents`/`broadcast_agents` below call
+            // `room.agents.iter()`, which tries to lock every shard — including the
+            // one still held here — and would self-deadlock the task (parked at 0%
+            // CPU while holding the lock), cascading into a full relay wedge.
+            let updated = {
+                let Some(mut entry) = room.agents.get_mut(session_id) else {
+                    return ControlFlow::Continue(());
+                };
+                // Preserve session_id from the existing entry.
+                let mut info = (*new_info).clone();
+                info.session_id = entry.info.session_id.clone();
+                entry.info = info.clone();
+                info
+            }; // RefMut released here, before any re-lock of room.agents.
+
+            // Broadcast the update to all peers (like AgentJoined but for updates).
+            let merged = dedup_agents(room)
+                .into_iter()
+                .find(|a| a.id == new_info.id)
+                .unwrap_or(updated);
+            let update_msg = ServerMessage::AgentJoined { agent: Box::new(merged) };
+            broadcast_mcp(room, &update_msg);
+            broadcast_agents(room, &update_msg, Some(&new_info.id));
+            debug!("agent updated: {} ({})", new_info.name, new_info.id);
         }
     }
 
@@ -396,7 +413,7 @@ fn route_to_origin(room: &Room, request_id: &str, msg: &ServerMessage) {
 fn send_raw(tx: &Tx, msg: &ServerMessage) {
     if let Ok(json) = msg.to_json() {
         if tx.try_send(json).is_err() {
-            debug!("dropping message to slow/closed consumer");
+            tracing::warn!("Dropping message to slow/closed consumer (channel full)");
         }
     }
 }

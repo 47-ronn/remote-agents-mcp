@@ -17,7 +17,10 @@ pub use types::*;
 pub use udp::{
     reflexive_endpoint, ChannelState, Endpoint, UdpAnswer, UdpChannelResult, UdpConfig, UdpFrame,
     UdpOffer, UdpPacketHeader, UdpPacketType, UDP_HEADER_SIZE, UDP_MAX_PACKET, UDP_MAX_PAYLOAD,
+    STUN_SERVERS,
 };
+#[cfg(feature = "udp")]
+pub use udp::stun_discover;
 
 #[cfg(feature = "udp")]
 pub use udp_channel::*;

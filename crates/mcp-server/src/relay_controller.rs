@@ -495,6 +495,12 @@ impl ConnectionPool {
                     envelope.len()
                 );
             }
+            info!("Sending command {} to target via WS (envelope {} bytes)", request_id, envelope.len());
+            // Debug: log to file
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
+                use std::io::Write;
+                let _ = writeln!(f, "[{}] Sending command {} via WS ({} bytes)", chrono::Utc::now(), request_id, envelope.len());
+            }
             if let Err(e) = conn
                 .tx
                 .send(ClientMessage::Command {
@@ -509,7 +515,19 @@ impl ConnectionPool {
             }
         }
 
+        info!("Waiting for replies to command {}, expected={}", request_id, expected);
+        // Debug: log to file
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] Waiting for replies to {}, expected={}", chrono::Utc::now(), request_id, expected);
+        }
         let collected = collect_replies(reply_rx, expected, single).await;
+        info!("Collected {} successes, {} errors for command {}", collected.0.len(), collected.1.len(), request_id);
+        // Debug: log to file
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] Collected {} successes, {} errors for {}", chrono::Utc::now(), collected.0.len(), collected.1.len(), request_id);
+        }
 
         // Single cleanup covering every exit path; late replies are then dropped.
         conn.pending.write().await.remove(&request_id);
@@ -922,7 +940,9 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
         // Incoming command from another peer — execute it locally if we have an
         // executor (peer model: this node is a full peer, not just a controller).
         ServerMessage::Command { request_id, payload, .. } => {
+            info!("Received incoming command {} ({} bytes)", request_id, payload.len());
             let Some(state) = &shared.executor_state else {
+                info!("No executor state, ignoring command {}", request_id);
                 return Ok(()); // no executor: we don't run others' commands
             };
             let reply = match Command::decrypt(&payload, &shared.cipher) {
