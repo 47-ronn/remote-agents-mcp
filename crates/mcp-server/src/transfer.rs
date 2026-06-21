@@ -10,12 +10,19 @@ use crate::config::SecurityConfig;
 use crate::safety;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
+use futures::stream::{FuturesUnordered, StreamExt};
 use remote_agents_shared::{Command, CommandResult, TransferState, TransferStatus};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::RwLock;
+
+/// How many transfer slices may be in flight at once. Stop-and-wait (window 1)
+/// caps throughput at slice/round-trip; a small window overlaps the per-slice
+/// round-trips for a large speedup without bursting so many UDP fragments that
+/// the socket buffers overflow. The final (eof) slice is always sent alone.
+const TRANSFER_WINDOW: usize = 4;
 
 /// In-memory registry of host↔host transfers this node initiated, polled via
 /// `TransferGet`. Cheap to clone (shared `Arc` in `AgentState`).
@@ -98,24 +105,24 @@ pub fn receive_chunk(
         bail!("transfer exceeds limit of {} bytes", sec.max_transfer_size);
     }
 
-    let mut f = if offset == 0 {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(dest_path)
-            .with_context(|| format!("create {dest_path}"))?
-    } else {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(dest_path)
-            .with_context(|| format!("open {dest_path}"))?
-    };
+    // Order-independent: pipelined transfers deliver slices out of order, so we
+    // create-without-truncate and seek to the slice's offset rather than relying
+    // on offset 0 arriving first. The final (eof) slice trims any stale tail with
+    // `set_len`, so a pre-existing larger file at `dest_path` is corrected.
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // explicit: out-of-order slices must not clobber each other
+        .open(dest_path)
+        .with_context(|| format!("open {dest_path}"))?;
     f.seek(SeekFrom::Start(offset))?;
     f.write_all(&bytes)?;
 
     if eof {
         f.flush()?;
+        // The eof slice is the last byte region, so `end` is the final file size:
+        // truncate to it to drop any leftover tail from a previous/larger file.
+        f.set_len(end)?;
         drop(f);
         if let Some(expected) = expected_sha256 {
             let actual = sha256_file(dest_path)?;
@@ -155,34 +162,67 @@ where
             .map_err(|e| anyhow::anyhow!("hash failed: {e}"))??
     };
     let chunk = chunk.max(1);
-    let mut offset = 0u64;
-    loop {
-        let want = chunk.min(size - offset);
-        let (data, _) = {
-            let (sp, sec2) = (src_path.to_string(), sec.clone());
+
+    // Read one slice off disk (off the async runtime).
+    let read_slice = |offset: u64, want: u64| {
+        let (sp, sec2) = (src_path.to_string(), sec.clone());
+        async move {
             tokio::task::spawn_blocking(move || crate::files::read_chunk(&sp, offset, want, &sec2))
                 .await
-                .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))??
-        };
-        let eof = offset + want >= size;
-        let cmd = Command::FileRecv {
-            transfer_id: transfer_id.to_string(),
-            dest_path: dest_path.to_string(),
-            offset,
-            bytes: data,
-            eof,
-            sha256: if eof { Some(sha.clone()) } else { None },
-        };
-        match send_chunk(cmd).await? {
-            CommandResult::Ok => {}
+                .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))?
+                .map(|(data, _)| data)
+        }
+    };
+    let mk_cmd = |offset: u64, bytes: String, eof: bool, sha: Option<String>| Command::FileRecv {
+        transfer_id: transfer_id.to_string(),
+        dest_path: dest_path.to_string(),
+        offset,
+        bytes,
+        eof,
+        sha256: sha,
+    };
+    let check = |res: Result<CommandResult>| -> Result<()> {
+        match res? {
+            CommandResult::Ok => Ok(()),
             other => bail!("destination rejected chunk: {other:?}"),
         }
+    };
+
+    // Pipeline every NON-final slice (bounded window), draining replies as they
+    // complete so up to TRANSFER_WINDOW are in flight at once. Slices are written
+    // by offset on the receiver, so out-of-order completion is fine.
+    let mut inflight = FuturesUnordered::new();
+    let mut sent = 0u64;
+    let mut offset = 0u64;
+    while offset < size {
+        let want = chunk.min(size - offset);
+        if offset + want >= size {
+            break; // the final slice is sent after the loop
+        }
+        let data = read_slice(offset, want).await?;
+        let fut = send_chunk(mk_cmd(offset, data, false, None));
+        inflight.push(async move { (want, fut.await) });
         offset += want;
-        store.progress(transfer_id, offset);
-        if eof {
-            break;
+        if inflight.len() >= TRANSFER_WINDOW {
+            let (w, res) = inflight.next().await.expect("window non-empty");
+            check(res)?;
+            sent += w;
+            store.progress(transfer_id, sent);
         }
     }
+    while let Some((w, res)) = inflight.next().await {
+        check(res)?;
+        sent += w;
+        store.progress(transfer_id, sent);
+    }
+
+    // Final (eof) slice: carries the whole-file SHA and is sent ONLY after every
+    // other slice is acked, so the receiver hashes a fully-written file.
+    let want = size - offset; // 0 for an empty file
+    let data = read_slice(offset, want).await?;
+    check(send_chunk(mk_cmd(offset, data, true, Some(sha))).await)?;
+    sent += want;
+    store.progress(transfer_id, sent);
     Ok(())
 }
 

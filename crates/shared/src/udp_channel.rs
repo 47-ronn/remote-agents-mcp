@@ -82,8 +82,20 @@ mod channel_impl {
             cipher: Cipher,
             config: UdpConfig,
         ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), UdpChannelError> {
-            // Bind to any available port
-            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            // Bind to any available port, with large socket buffers so a burst of
+            // reliable fragments (a 256 KiB slice is ~220 packets, and pipelined
+            // slices burst several at once) isn't dropped by an undersized kernel
+            // queue — the main cause of retransmit stalls. The kernel clamps to
+            // net.core.{r,w}mem_max; we request generously and ignore failures.
+            let socket = {
+                use socket2::{Domain, Socket, Type};
+                let s = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+                let _ = s.set_recv_buffer_size(8 * 1024 * 1024);
+                let _ = s.set_send_buffer_size(8 * 1024 * 1024);
+                s.set_nonblocking(true)?;
+                s.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
+                UdpSocket::from_std(s.into())?
+            };
             let socket = Arc::new(socket);
 
             let (recv_tx, recv_rx) = mpsc::channel(64);
