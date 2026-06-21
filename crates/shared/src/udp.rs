@@ -399,8 +399,12 @@ impl FragmentHeader {
 /// path ([`Command::encrypt`]/[`CommandResult::encrypt`]), so confidentiality is
 /// identical regardless of transport. The UDP path is an optimization; WS is the
 /// fallback when no channel is established.
+// Externally tagged (the serde default), NOT `#[serde(tag = "kind")]`: postcard
+// is a non-self-describing format and cannot encode internally-tagged enums
+// (it would need `deserialize_any`). Externally tagged encodes a compact variant
+// index, which is exactly what we want on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum UdpFrame {
     /// A command for the agent. `payload` is an encrypted [`crate::Command`].
     Command {
@@ -412,17 +416,36 @@ pub enum UdpFrame {
     Result { request_id: String, result: String },
     /// A command error (decrypt/exec failure) for `request_id`.
     Error { request_id: String, error: String },
+    /// A bulk file slice over the direct UDP channel. `data` is the RAW encrypted
+    /// slice (`Cipher::encrypt_bytes` — no base64, no inner JSON command wrapper),
+    /// so the file path carries zero encoding overhead.
+    FileData {
+        request_id: String,
+        transfer_id: String,
+        dest_path: String,
+        offset: u64,
+        eof: bool,
+        /// Lowercase-hex whole-file SHA-256, only on the final (`eof`) slice.
+        sha256: Option<String>,
+        data: Vec<u8>,
+    },
+    /// Ack for a `FileData` slice (success when `error` is `None`).
+    FileAck { request_id: String, error: Option<String> },
 }
 
 impl UdpFrame {
     /// Serialize to JSON bytes for transmission over a UDP channel.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
+        // Compact binary (postcard), not JSON: the FileData variant carries raw
+        // bytes which JSON would bloat into a number array, and binary avoids the
+        // per-frame JSON parse/alloc on the hot path. UDP frames are internal to
+        // the agent↔agent channel (never the relay), so both ends share this codec.
+        postcard::to_allocvec(self).unwrap_or_default()
     }
 
     /// Parse from bytes received over a UDP channel; `None` if malformed.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        serde_json::from_slice(bytes).ok()
+        postcard::from_bytes(bytes).ok()
     }
 }
 

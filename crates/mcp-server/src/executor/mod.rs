@@ -457,6 +457,38 @@ pub async fn recv_file_chunk(
     Ok(CommandResult::Ok)
 }
 
+/// Write a raw (already-decrypted, un-base64'd) file slice at `offset`. The
+/// binary counterpart to [`recv_file_chunk`] used by the direct-UDP file path,
+/// where slices arrive as raw bytes in a `UdpFrame::FileData`.
+pub async fn recv_file_chunk_raw(
+    state: &AgentState,
+    dest_path: &str,
+    offset: u64,
+    raw: Vec<u8>,
+    eof: bool,
+    sha256: Option<&str>,
+    over_udp: bool,
+) -> Result<CommandResult> {
+    if !state.config.accepts_commands {
+        bail!("This node does not accept remote commands (--no-agent)");
+    }
+    let mode = state.mode().await;
+    if !mode.allows_write() {
+        bail!("Receiving a file requires Edit/Bypass mode (got {:?})", mode);
+    }
+    let mut sec = state.config.security.clone();
+    if over_udp {
+        sec.max_transfer_size = 0; // direct p2p: no relay to protect → no cap
+    }
+    let (dest_path, sha) = (dest_path.to_string(), sha256.map(str::to_string));
+    tokio::task::spawn_blocking(move || {
+        crate::transfer::receive_chunk_raw(&dest_path, offset, &raw, eof, sha.as_deref(), &sec)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("receive chunk failed: {e}"))??;
+    Ok(CommandResult::Ok)
+}
+
 /// Run a MapReduce compute function: a shell command `func` fed `stdin_data` on
 /// standard input. Returns `(output, success, error)` so a single failing
 /// partition surfaces as a failed result rather than aborting the whole job.

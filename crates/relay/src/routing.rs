@@ -274,7 +274,7 @@ mod tests {
         session: &str,
         autonomous: bool,
         accepts: bool,
-    ) -> (AgentSession, tokio::sync::mpsc::Receiver<String>) {
+    ) -> (AgentSession, tokio::sync::mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(8);
         let mut s = agent(id, &[]);
         s.info.session_id = Some(session.to_string());
@@ -305,10 +305,10 @@ mod tests {
         // one — not fanned out to both (the bug that surfaced "not enabled").
         let t = resolve_targets(&r, &Target::Agent { id: "dup".into() });
         assert_eq!(t.len(), 1, "single most-capable socket per id");
-        t[0].1.try_send("X".to_string()).unwrap();
+        t[0].1.try_send(b"X".to_vec()).unwrap();
         assert_eq!(
             rx_auto.try_recv().unwrap(),
-            "X",
+            b"X",
             "command must reach the autonomous socket"
         );
 

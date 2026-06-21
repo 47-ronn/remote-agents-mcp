@@ -43,7 +43,7 @@ async fn connect(port: u16, room: &str) -> Ws {
 }
 
 async fn send(ws: &mut Ws, msg: &ClientMessage) {
-    ws.send(Message::Text(msg.to_json().unwrap())).await.unwrap();
+    ws.send(Message::Binary(msg.to_proto_bytes().unwrap())).await.unwrap();
 }
 
 async fn recv(ws: &mut Ws) -> ServerMessage {
@@ -52,8 +52,8 @@ async fn recv(ws: &mut Ws) -> ServerMessage {
             .await
             .expect("recv timeout")
         {
-            Some(Ok(Message::Text(t))) => {
-                let msg = ServerMessage::from_json(&t).unwrap();
+            Some(Ok(Message::Binary(b))) => {
+                let msg = ServerMessage::from_proto_bytes(&b).unwrap();
                 // YourEndpoint is connection-setup noise sent to every peer;
                 // skip it so tests can assert on the messages they care about.
                 if matches!(msg, ServerMessage::YourEndpoint { .. }) {
@@ -72,8 +72,8 @@ async fn recv(ws: &mut Ws) -> ServerMessage {
 async fn try_recv(ws: &mut Ws, ms: u64) -> Option<ServerMessage> {
     loop {
         match tokio::time::timeout(Duration::from_millis(ms), ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let msg = ServerMessage::from_json(&t).unwrap();
+            Ok(Some(Ok(Message::Binary(b)))) => {
+                let msg = ServerMessage::from_proto_bytes(&b).unwrap();
                 if matches!(msg, ServerMessage::YourEndpoint { .. }) {
                     continue;
                 }
@@ -154,7 +154,7 @@ async fn full_round_trip() {
         &ClientMessage::Command {
             request_id: "req-1".into(),
             target: Target::All,
-            payload: "ENCRYPTED_PAYLOAD".into(),
+            payload: "QUJDREVG".into(),
         },
     )
     .await;
@@ -163,7 +163,7 @@ async fn full_round_trip() {
             request_id, payload, ..
         } => {
             assert_eq!(request_id, "req-1");
-            assert_eq!(payload, "ENCRYPTED_PAYLOAD"); // forwarded opaquely
+            assert_eq!(payload, "QUJDREVG"); // forwarded opaquely
         }
         other => panic!("expected command, got {:?}", other),
     }
@@ -173,7 +173,7 @@ async fn full_round_trip() {
         &mut agent,
         &ClientMessage::CommandResult {
             request_id: "req-1".into(),
-            result: "ENCRYPTED_RESULT".into(),
+            result: "UkVTVUxU".into(),
         },
     )
     .await;
@@ -185,7 +185,7 @@ async fn full_round_trip() {
         } => {
             assert_eq!(request_id, "req-1");
             assert_eq!(agent_id, "a1");
-            assert_eq!(result, "ENCRYPTED_RESULT");
+            assert_eq!(result, "UkVTVUxU");
         }
         other => panic!("expected command_result, got {:?}", other),
     }
@@ -217,7 +217,7 @@ async fn full_round_trip() {
             target: Target::Tagged {
                 tags: vec!["frontend".into()],
             },
-            payload: "X".into(),
+            payload: "WA==".into(),
         },
     )
     .await;
@@ -340,11 +340,11 @@ async fn relay_reflects_your_endpoint() {
     // Read raw frames (don't use recv(), which filters YourEndpoint out).
     let mut saw = None;
     for _ in 0..5 {
-        if let Some(Ok(Message::Text(t))) = tokio::time::timeout(Duration::from_secs(2), agent.next())
+        if let Some(Ok(Message::Binary(b))) = tokio::time::timeout(Duration::from_secs(2), agent.next())
             .await
             .expect("timeout")
         {
-            if let ServerMessage::YourEndpoint { endpoint } = ServerMessage::from_json(&t).unwrap() {
+            if let ServerMessage::YourEndpoint { endpoint } = ServerMessage::from_proto_bytes(&b).unwrap() {
                 saw = Some(endpoint);
                 break;
             }
@@ -382,7 +382,7 @@ async fn relay_has_no_role_authorization() {
         &ClientMessage::Command {
             request_id: "x".into(),
             target: Target::Tagged { tags: vec!["nobody".into()] },
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -451,7 +451,7 @@ async fn result_routes_only_to_requesting_mcp() {
         &ClientMessage::Command {
             request_id: "req-x".into(),
             target: Target::Agent { id: "a1".into() },
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -463,7 +463,7 @@ async fn result_routes_only_to_requesting_mcp() {
         &mut agent,
         &ClientMessage::CommandResult {
             request_id: "req-x".into(),
-            result: "R".into(),
+            result: "Ug==".into(),
         },
     )
     .await;
@@ -472,7 +472,7 @@ async fn result_routes_only_to_requesting_mcp() {
     match recv(&mut mcp1).await {
         ServerMessage::CommandResult { request_id, result, .. } => {
             assert_eq!(request_id, "req-x");
-            assert_eq!(result, "R");
+            assert_eq!(result, "Ug==");
         }
         other => panic!("expected CommandResult at mcp1, got {:?}", other),
     }
@@ -516,7 +516,7 @@ async fn agent_peer_can_initiate_command() {
         &ClientMessage::Command {
             request_id: "p2p".into(),
             target: Target::Agent { id: "a1".into() },
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -528,7 +528,7 @@ async fn agent_peer_can_initiate_command() {
         &mut a1,
         &ClientMessage::CommandResult {
             request_id: "p2p".into(),
-            result: "R".into(),
+            result: "Ug==".into(),
         },
     )
     .await;
@@ -537,7 +537,7 @@ async fn agent_peer_can_initiate_command() {
     match recv(&mut a2).await {
         ServerMessage::CommandResult { request_id, result, .. } => {
             assert_eq!(request_id, "p2p");
-            assert_eq!(result, "R");
+            assert_eq!(result, "Ug==");
         }
         other => panic!("expected CommandResult at a2, got {:?}", other),
     }
@@ -585,7 +585,7 @@ async fn peer_visibility_and_anonymous_observer() {
         &ClientMessage::Command {
             request_id: "bc".into(),
             target: Target::All,
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -656,7 +656,7 @@ async fn duplicate_connection_disconnect_keeps_host_present() {
         &ClientMessage::Command {
             request_id: "to-live".into(),
             target: Target::Agent { id: "dup".into() },
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -721,7 +721,7 @@ async fn duplicate_connections_merge_capabilities_and_route_to_capable() {
         &ClientMessage::Command {
             request_id: "to-auto".into(),
             target: Target::Agent { id: "ojo".into() },
-            payload: "P".into(),
+            payload: "UA==".into(),
         },
     )
     .await;
@@ -833,13 +833,28 @@ async fn oversized_message_is_rejected_and_connection_dropped() {
     // be auth" rule. (A small Ping here would be answered with a Pong.)
     auth(&mut ws, Some(agent_info("big", &[]))).await;
 
-    // A ~2 MiB Ping frame — syntactically valid (unknown `pad` field is ignored
-    // by serde), so absent the size cap the server would parse it and reply
-    // Pong. With the cap, the frame is over the 1 MiB limit and the connection
-    // is dropped instead. The client happily sends it (its own limit is larger).
-    let huge = "x".repeat(2 * 1024 * 1024);
-    let oversized = format!("{{\"type\":\"ping\",\"pad\":\"{huge}\"}}");
-    ws.send(Message::Text(oversized)).await.unwrap();
+    // A ~2 MiB frame that is still a valid Ping: an appended unknown protobuf
+    // field (#15, length-delimited) is skipped on decode, so absent the size cap
+    // the server would parse it and reply Pong. With the cap, the frame is over
+    // the 1 MiB limit and the connection is dropped instead. (The client's own
+    // frame limit is larger, so it happily sends it.)
+    let mut oversized = ClientMessage::Ping.to_proto_bytes().unwrap();
+    oversized.push((15 << 3) | 2); // tag: field 15, wire type 2 (length-delimited)
+    let pad = 2 * 1024 * 1024usize;
+    let mut n = pad; // length as a protobuf varint
+    loop {
+        let mut byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            byte |= 0x80;
+        }
+        oversized.push(byte);
+        if n == 0 {
+            break;
+        }
+    }
+    oversized.extend(std::iter::repeat_n(b'x', pad));
+    ws.send(Message::Binary(oversized)).await.unwrap();
 
     // The server drops the connection: the client stream ends (None), yields a
     // Close, or errors. Crucially it must NOT answer the oversized Ping (which
@@ -848,9 +863,9 @@ async fn oversized_message_is_rejected_and_connection_dropped() {
         loop {
             match ws.next().await {
                 None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break true,
-                Some(Ok(Message::Text(t))) => {
+                Some(Ok(Message::Binary(b))) => {
                     assert!(
-                        !matches!(ServerMessage::from_json(&t), Ok(ServerMessage::Pong)),
+                        !matches!(ServerMessage::from_proto_bytes(&b), Ok(ServerMessage::Pong)),
                         "server answered the oversized Ping — the size cap is not enforced"
                     );
                     continue; // ignore setup noise (agent_list / your_endpoint)

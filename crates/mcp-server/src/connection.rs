@@ -5,6 +5,7 @@ use crate::executor;
 use crate::state::AgentState;
 use crate::udp_transport::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
     AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, UdpAnswer,
@@ -202,10 +203,10 @@ where
             .await
             .ok_or_else(|| anyhow::anyhow!("connection closed during auth"))?
             .map_err(|e| anyhow::anyhow!("websocket error during auth: {e}"))?;
-        let Message::Text(text) = frame else {
-            continue; // ignore Ping/Pong/Binary control frames pre-auth
+        let Message::Binary(bytes) = frame else {
+            continue; // ignore Ping/Pong/Text control frames pre-auth
         };
-        match ServerMessage::from_json(&text)? {
+        match ServerMessage::from_proto_bytes(&bytes)? {
             ServerMessage::AuthOk { session_id } => return Ok(session_id),
             ServerMessage::AuthFailed { reason } => bail!("Auth failed: {reason}"),
             other => debug!("Ignoring pre-auth frame: {:?}", other),
@@ -242,7 +243,7 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     };
 
     write
-        .send(Message::Text(auth_msg.to_json()?))
+        .send(Message::Binary(auth_msg.to_proto_bytes()?))
         .await
         .context("Failed to send auth")?;
 
@@ -319,11 +320,11 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
             msg = read.next() => {
                 alive = true;
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if matches!(ServerMessage::from_json(&text), Ok(ServerMessage::Command { .. })) {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if matches!(ServerMessage::from_proto_bytes(&bytes), Ok(ServerMessage::Command { .. })) {
                             commands_handled += 1;
                         }
-                        if let Err(e) = handle_server_message(&text, state, &tx, &udp_transport, &pending).await {
+                        if let Err(e) = handle_server_message(&bytes, state, &tx, &udp_transport, &pending).await {
                             error!("Error handling message: {}", e);
                         }
                     }
@@ -352,8 +353,8 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
             // Outgoing messages to relay (via dedicated writer)
             msg = rx.recv() => {
                 if let Some(msg) = msg {
-                    if let Ok(json) = msg.to_json() {
-                        let _ = ws_tx.send(Message::Text(json)).await;
+                    if let Ok(bytes) = msg.to_proto_bytes() {
+                        let _ = ws_tx.send(Message::Binary(bytes)).await;
                     }
                 }
             }
@@ -366,8 +367,8 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                         SignalMessage::Answer(answer) => ClientMessage::UdpAnswer(answer),
                         SignalMessage::Result(result) => ClientMessage::UdpResult(result),
                     };
-                    if let Ok(json) = msg.to_json() {
-                        let _ = ws_tx.send(Message::Text(json)).await;
+                    if let Ok(bytes) = msg.to_proto_bytes() {
+                        let _ = ws_tx.send(Message::Binary(bytes)).await;
                     }
                 }
             }
@@ -385,8 +386,8 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
             event = state.next_event() => {
                 if let Some(event) = event {
                     let msg = ClientMessage::Notify { event };
-                    if let Ok(json) = msg.to_json() {
-                        let _ = ws_tx.send(Message::Text(json)).await;
+                    if let Ok(bytes) = msg.to_proto_bytes() {
+                        let _ = ws_tx.send(Message::Binary(bytes)).await;
                     }
                 }
             }
@@ -397,8 +398,8 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                 let msg = ClientMessage::UpdateAgent {
                     agent_info: Box::new(updated_info),
                 };
-                if let Ok(json) = msg.to_json() {
-                    let _ = ws_tx.send(Message::Text(json)).await;
+                if let Ok(bytes) = msg.to_proto_bytes() {
+                    let _ = ws_tx.send(Message::Binary(bytes)).await;
                 }
                 debug!("Sent UpdateAgent to relay after mode change");
             }
@@ -422,13 +423,13 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
 }
 
 async fn handle_server_message(
-    text: &str,
+    bytes: &[u8],
     state: &AgentState,
     tx: &tokio::sync::mpsc::Sender<ClientMessage>,
     udp_transport: &Arc<UdpTransport>,
     pending: &ConnPending,
 ) -> Result<()> {
-    let msg: ServerMessage = ServerMessage::from_json(text)?;
+    let msg: ServerMessage = ServerMessage::from_proto_bytes(bytes)?;
 
     match msg {
         ServerMessage::Command {
@@ -722,36 +723,77 @@ async fn handle_udp_inbound(
                 let _ = otx.send(Err(error));
             }
         }
+        // Binary bulk file slice (raw encrypted bytes, no base64). Decrypt, write
+        // at offset, and ack over UDP. Arrived over UDP → p2p, no relay cap.
+        UdpFrame::FileData { request_id, transfer_id: _, dest_path, offset, eof, sha256, data } => {
+            let state = state.clone();
+            let udp_transport = udp_transport.clone();
+            let peer_session = peer_session.to_string();
+            let cipher = cipher.clone();
+            tokio::spawn(async move {
+                let error = match cipher.decrypt_bytes(&data) {
+                    Ok(raw) => executor::recv_file_chunk_raw(
+                        &state, &dest_path, offset, raw, eof, sha256.as_deref(), true,
+                    )
+                    .await
+                    .err()
+                    .map(|e| e.to_string()),
+                    Err(e) => Some(format!("decrypt slice: {e}")),
+                };
+                let frame = UdpFrame::FileAck { request_id, error };
+                let _ = udp_transport.send_via_udp(&peer_session, &frame.to_bytes()).await;
+            });
+        }
+        // Ack for a file slice WE sent — resolve the waiting send_file_slice.
+        UdpFrame::FileAck { request_id, error } => {
+            if let Some(otx) = pending.write().await.remove(&request_id) {
+                let _ = otx.send(match error {
+                    Some(e) => Err(e),
+                    None => Ok(CommandResult::Ok),
+                });
+            }
+        }
     }
 }
 
-/// Initiate a single-target command from the `run`-agent loop and await its
-/// reply (UDP-preferred with a WS fallback, correlated by request_id). Used by
-/// the host↔host transfer source to push each `FileRecv` slice.
-async fn send_peer_command(
+/// Send one file slice to a peer and await its ack. Over a direct UDP channel it
+/// goes as a binary `UdpFrame::FileData` carrying the RAW encrypted bytes (no
+/// base64, no inner JSON command); over the relay/WS fallback it goes as the
+/// base64 `FileRecv` command. Either ack (UDP `FileAck` or WS `CommandResult`)
+/// resolves the same pending entry.
+#[allow(clippy::too_many_arguments)]
+async fn send_file_slice(
     cipher: &Cipher,
     tx: &mpsc::Sender<ClientMessage>,
     udp: &Arc<UdpTransport>,
     pending: &ConnPending,
     dest_id: &str,
     dest_session: Option<&str>,
-    cmd: Command,
-) -> Result<CommandResult> {
+    transfer_id: &str,
+    dest_path: &str,
+    offset: u64,
+    raw: Vec<u8>,
+    eof: bool,
+    sha256: Option<String>,
+) -> Result<()> {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let envelope = cmd
-        .encrypt(cipher)
-        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
-
     let (otx, orx) = oneshot::channel::<ConnReply>();
     pending.write().await.insert(request_id.clone(), otx);
 
     let mut via_udp = false;
     if let Some(sess) = dest_session {
         if udp.has_udp_channel(sess).await {
-            let frame = UdpFrame::Command {
+            let data = cipher
+                .encrypt_bytes(&raw)
+                .map_err(|e| anyhow::anyhow!("encrypt slice: {e}"))?;
+            let frame = UdpFrame::FileData {
                 request_id: request_id.clone(),
-                from_session: String::new(),
-                payload: envelope.clone(),
+                transfer_id: transfer_id.to_string(),
+                dest_path: dest_path.to_string(),
+                offset,
+                eof,
+                sha256: sha256.clone(),
+                data,
             };
             if let Ok(true) = udp.send_via_udp(sess, &frame.to_bytes()).await {
                 via_udp = true;
@@ -759,25 +801,38 @@ async fn send_peer_command(
         }
     }
     if !via_udp {
-        if let Err(e) = tx
+        // Relay/WS fallback: base64 the slice into a FileRecv command.
+        let cmd = Command::FileRecv {
+            transfer_id: transfer_id.to_string(),
+            dest_path: dest_path.to_string(),
+            offset,
+            bytes: base64::engine::general_purpose::STANDARD.encode(&raw),
+            eof,
+            sha256,
+        };
+        let envelope = cmd
+            .encrypt(cipher)
+            .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
+        if tx
             .send(ClientMessage::Command {
                 request_id: request_id.clone(),
                 target: Target::Agent { id: dest_id.to_string() },
                 payload: envelope,
             })
             .await
+            .is_err()
         {
             pending.write().await.remove(&request_id);
-            return Err(anyhow::anyhow!("send command: {e}"));
+            bail!("send slice failed");
         }
     }
 
     match timeout(Duration::from_secs(60), orx).await {
-        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Ok(_))) => Ok(()),
         Ok(Ok(Err(e))) => bail!("{e}"),
         _ => {
             pending.write().await.remove(&request_id);
-            bail!("transfer chunk timed out")
+            bail!("transfer slice timed out")
         }
     }
 }
@@ -828,17 +883,21 @@ async fn begin_send_file(
         if punched {
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
-        let send = |cmd: Command| {
+        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
             let (cipher, tx3, udp3, pending3) =
                 (cipher.clone(), tx2.clone(), udp2.clone(), pending2.clone());
-            let (did, dsess) = (dest_id.clone(), dest_session.clone());
+            let (did, dsess, dp, tid2) =
+                (dest_id.clone(), dest_session.clone(), dest_path.clone(), tid.clone());
             async move {
-                send_peer_command(&cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), cmd).await
+                send_file_slice(
+                    &cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), &tid2, &dp, offset,
+                    raw, eof, sha,
+                )
+                .await
             }
         };
         let result =
-            crate::transfer::stream_file(&store, &src_path, &dest_path, &tid, &sec, chunk, size, send)
-                .await;
+            crate::transfer::stream_file(&store, &src_path, &tid, &sec, chunk, size, send).await;
         match result {
             Ok(()) => store.done(&tid),
             Err(e) => store.fail(&tid, e.to_string()),
@@ -940,7 +999,7 @@ mod tests {
     // --- await_auth_verdict (pre-auth frame tolerance, iter143) -------------
 
     fn text(msg: ServerMessage) -> std::result::Result<Message, std::io::Error> {
-        Ok(Message::Text(msg.to_json().unwrap()))
+        Ok(Message::Binary(msg.to_proto_bytes().unwrap()))
     }
 
     #[tokio::test]
@@ -1082,7 +1141,7 @@ mod tests {
             from_session: "mcp-1".to_string(),
             payload,
         };
-        let text = serde_json::to_string(&msg).unwrap();
+        let text = msg.to_proto_bytes().unwrap();
 
         handle_server_message(&text, &state, &tx, &udp, &empty_pending())
             .await
@@ -1114,7 +1173,7 @@ mod tests {
             from_session: "mcp-1".to_string(),
             payload,
         };
-        let text = serde_json::to_string(&msg).unwrap();
+        let text = msg.to_proto_bytes().unwrap();
 
         handle_server_message(&text, &state, &tx, &udp, &empty_pending())
             .await
@@ -1165,7 +1224,7 @@ mod tests {
         peer_a.platform.distro = Some("Ubuntu 22.04".into());
 
         let deliver = |state: &AgentState, msg: &ServerMessage| {
-            let text = serde_json::to_string(msg).unwrap();
+            let text = msg.to_proto_bytes().unwrap();
             let (state, udp, tx) = (state.clone(), udp.clone(), tx.clone());
             async move { handle_server_message(&text, &state, &tx, &udp, &empty_pending()).await.unwrap() }
         };
@@ -1240,7 +1299,7 @@ mod tests {
 
         let endpoint = remote_agents_shared::Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4500);
         let msg = ServerMessage::YourEndpoint { endpoint };
-        let text = serde_json::to_string(&msg).unwrap();
+        let text = msg.to_proto_bytes().unwrap();
         handle_server_message(&text, &state, &tx, &udp, &empty_pending()).await.unwrap();
 
         assert_eq!(udp.public_endpoint().await, Some(endpoint));
@@ -1322,7 +1381,7 @@ mod tests {
                 from_session: "mcp-1".to_string(),
                 payload,
             };
-            let text = serde_json::to_string(&msg).unwrap();
+            let text = msg.to_proto_bytes().unwrap();
             handle_server_message(&text, &state, &tx, &udp, &empty_pending())
                 .await
                 .unwrap();

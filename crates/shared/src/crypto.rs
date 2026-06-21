@@ -66,8 +66,10 @@ impl Cipher {
         Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key))
     }
 
-    /// Encrypt plaintext, returning a base64 string (`nonce || ciphertext`).
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, CryptoError> {
+    /// Encrypt plaintext, returning the raw envelope `nonce || ciphertext || tag`
+    /// (no base64). Use this on binary transports (direct UDP) to avoid the ~33%
+    /// base64 inflation + the allocation of a String.
+    pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -80,12 +82,11 @@ impl Cipher {
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        Ok(B64.encode(out))
+        Ok(out)
     }
 
-    /// Decrypt a base64 string produced by [`Cipher::encrypt`].
-    pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, CryptoError> {
-        let raw = B64.decode(encoded).map_err(|_| CryptoError::Encoding)?;
+    /// Decrypt a raw envelope produced by [`Cipher::encrypt_bytes`].
+    pub fn decrypt_bytes(&self, raw: &[u8]) -> Result<Vec<u8>, CryptoError> {
         // Reject anything too short to even hold a nonce + GCM tag *before*
         // slicing. `split_at` would panic on `raw.len() < NONCE_LEN`; and a
         // payload in `(NONCE_LEN, NONCE_LEN+TAG_LEN)` can't carry a valid tag, so
@@ -98,6 +99,19 @@ impl Cipher {
         self.aead()
             .decrypt(nonce, ciphertext)
             .map_err(|_| CryptoError::Decrypt)
+    }
+
+    /// Encrypt plaintext, returning a base64 string (`nonce || ciphertext`). The
+    /// text form for JSON/WebSocket transports; binary transports use
+    /// [`Cipher::encrypt_bytes`].
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, CryptoError> {
+        Ok(B64.encode(self.encrypt_bytes(plaintext)?))
+    }
+
+    /// Decrypt a base64 string produced by [`Cipher::encrypt`].
+    pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, CryptoError> {
+        let raw = B64.decode(encoded).map_err(|_| CryptoError::Encoding)?;
+        self.decrypt_bytes(&raw)
     }
 
     /// Convenience: encrypt a string.

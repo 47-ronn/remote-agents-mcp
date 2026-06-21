@@ -8,6 +8,17 @@ pub mod crypto;
 mod protocol;
 mod types;
 pub mod udp;
+
+/// Protobuf wire types generated from `proto/remote_agents.proto` (prost). The
+/// single source of truth for the on-wire protocol; the idiomatic domain types
+/// in [`protocol`]/[`types`] convert to/from these at the transport boundary
+/// (see [`proto_convert`]). TS (worker + panel) generate from the same `.proto`.
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/remote_agents.v1.rs"));
+}
+pub mod proto_convert;
+pub use proto_convert::{ConvertError, WireError};
 #[cfg(feature = "udp")]
 pub mod udp_channel;
 

@@ -56,7 +56,7 @@ pub fn stat(path: &str, sec: &SecurityConfig) -> Result<FileMeta> {
 /// Read a binary-safe slice `[offset, offset+len)` of a file as raw bytes.
 /// Returns `(bytes, eof)`. The whole-file size is bounded by `max_transfer_size`
 /// (0 = unlimited). Backs [`read_chunk`], which base64's the result.
-fn read_chunk_raw(
+pub(crate) fn read_chunk_raw(
     path: &str,
     offset: u64,
     len: u64,

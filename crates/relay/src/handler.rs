@@ -28,38 +28,28 @@ pub async fn handle_socket(
     let (mut sink, mut stream) = socket.split();
 
     // --- 1. Authenticate: the first frame must be an Auth message ----------
+    // The protocol is protobuf-over-binary; a text frame is an old (JSON) peer
+    // and is rejected by simply not matching here (clean disconnect).
     let first = match stream.next().await {
-        Some(Ok(Message::Text(t))) => t,
+        Some(Ok(Message::Binary(b))) => b,
         _ => return,
     };
-    let agent_info = match ClientMessage::from_json(&first) {
+    let agent_info = match ClientMessage::from_proto_bytes(&first) {
         Ok(ClientMessage::Auth {
             token, agent_info, ..
         }) => {
             if !auth_ok(&state, query_token.as_deref(), &token) {
-                let _ = sink
-                    .send(Message::Text(
-                        ServerMessage::AuthFailed {
-                            reason: "invalid token".to_string(),
-                        }
-                        .to_json()
-                        .unwrap_or_default(),
-                    ))
-                    .await;
+                let _ = sink.send(bin(&ServerMessage::AuthFailed {
+                    reason: "invalid token".to_string(),
+                })).await;
                 return;
             }
             agent_info
         }
         _ => {
-            let _ = sink
-                .send(Message::Text(
-                    ServerMessage::Error {
-                        message: "expected auth".to_string(),
-                    }
-                    .to_json()
-                    .unwrap_or_default(),
-                ))
-                .await;
+            let _ = sink.send(bin(&ServerMessage::Error {
+                message: "expected auth".to_string(),
+            })).await;
             return;
         }
     };
@@ -69,13 +59,9 @@ pub async fn handle_socket(
 
     // Send auth_ok before handing the sink to the writer task.
     if sink
-        .send(Message::Text(
-            ServerMessage::AuthOk {
-                session_id: session_id.clone(),
-            }
-            .to_json()
-            .unwrap_or_default(),
-        ))
+        .send(bin(&ServerMessage::AuthOk {
+            session_id: session_id.clone(),
+        }))
         .await
         .is_err()
     {
@@ -84,10 +70,10 @@ pub async fn handle_socket(
     }
 
     // --- 2. Outbound channel + writer task ---------------------------------
-    let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_CAP);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
     let mut writer = tokio::spawn(async move {
-        while let Some(json) = rx.recv().await {
-            if sink.send(Message::Text(json)).await.is_err() {
+        while let Some(bytes) = rx.recv().await {
+            if sink.send(Message::Binary(bytes)).await.is_err() {
                 break;
             }
         }
@@ -165,8 +151,8 @@ pub async fn handle_socket(
                         debug!("idle timeout, reaping session {}", session_id);
                         break;
                     }
-                    Ok(Some(Ok(Message::Text(text)))) => {
-                        if handle_client_msg(&text, &room, &session_id, &agent_info, &tx)
+                    Ok(Some(Ok(Message::Binary(bytes)))) => {
+                        if handle_client_msg(&bytes, &room, &session_id, &agent_info, &tx)
                             .is_break()
                         {
                             break;
@@ -174,7 +160,7 @@ pub async fn handle_socket(
                     }
                     Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
                     Ok(Some(Err(_))) => break,
-                    // Control frames (ping/pong/binary) are unused by our protocol.
+                    // Control frames (ping/pong) and stray text are unused now.
                     Ok(_) => {}
                 }
             }
@@ -226,20 +212,20 @@ fn auth_ok(state: &RelayState, query_token: Option<&str>, auth_token: &str) -> b
 
 /// Route one client message. Returns `Break` to close the connection.
 fn handle_client_msg(
-    text: &str,
+    bytes: &[u8],
     room: &Room,
     session_id: &str,
     agent_info: &Option<Box<AgentInfo>>,
     self_tx: &Tx,
 ) -> ControlFlow<()> {
-    debug!("Received raw message from {}: {} bytes", session_id, text.len());
-    let msg = match ClientMessage::from_json(text) {
+    debug!("Received raw message from {}: {} bytes", session_id, bytes.len());
+    let msg = match ClientMessage::from_proto_bytes(bytes) {
         Ok(m) => {
             debug!("Parsed message type: {:?}", std::mem::discriminant(&m));
             m
         }
         Err(e) => {
-            tracing::warn!("ignoring unparseable message from {}: {} - first 200 chars: {}", session_id, e, &text[..text.len().min(200)]);
+            tracing::warn!("ignoring unparseable message from {}: {}", session_id, e);
             return ControlFlow::Continue(());
         }
     };
@@ -419,12 +405,17 @@ fn route_to_origin(room: &Room, request_id: &str, msg: &ServerMessage) {
     broadcast_mcp(room, msg);
 }
 
+/// Encode a server message into a binary WS frame.
+fn bin(msg: &ServerMessage) -> Message {
+    Message::Binary(msg.to_proto_bytes().unwrap_or_default())
+}
+
 /// Non-blocking send to one connection. A full queue means a slow/stuck
 /// consumer; the message is dropped (the writer task / disconnect handles the
 /// dead connection).
 fn send_raw(tx: &Tx, msg: &ServerMessage) {
-    if let Ok(json) = msg.to_json() {
-        if tx.try_send(json).is_err() {
+    if let Ok(bytes) = msg.to_proto_bytes() {
+        if tx.try_send(bytes).is_err() {
             tracing::warn!("Dropping message to slow/closed consumer (channel full)");
         }
     }
@@ -435,9 +426,9 @@ fn send_to(tx: &Tx, msg: &ServerMessage) {
 }
 
 fn broadcast_mcp(room: &Room, msg: &ServerMessage) {
-    if let Ok(json) = msg.to_json() {
+    if let Ok(bytes) = msg.to_proto_bytes() {
         for entry in room.mcp.iter() {
-            let _ = entry.tx.try_send(json.clone());
+            let _ = entry.tx.try_send(bytes.clone());
         }
     }
 }
@@ -445,14 +436,14 @@ fn broadcast_mcp(room: &Room, msg: &ServerMessage) {
 /// Broadcast to all agents in the room, optionally skipping one id (e.g. the
 /// agent that triggered the event). Lets each host learn about its neighbours.
 fn broadcast_agents(room: &Room, msg: &ServerMessage, except_id: Option<&str>) {
-    if let Ok(json) = msg.to_json() {
+    if let Ok(bytes) = msg.to_proto_bytes() {
         for entry in room.agents.iter() {
             // Skip every connection of the excepted machine (agents are keyed by
             // session id now, so compare the agent id, not the map key).
             if Some(entry.value().info.id.as_str()) == except_id {
                 continue;
             }
-            let _ = entry.tx.try_send(json.clone());
+            let _ = entry.tx.try_send(bytes.clone());
         }
     }
 }
@@ -515,18 +506,18 @@ mod routing_tests {
         }
     }
 
-    fn chan() -> (Tx, Receiver<String>) {
+    fn chan() -> (Tx, Receiver<Vec<u8>>) {
         mpsc::channel(OUTBOUND_CAP)
     }
 
-    fn add_agent(room: &Room, session_id: &str, id: &str) -> Receiver<String> {
+    fn add_agent(room: &Room, session_id: &str, id: &str) -> Receiver<Vec<u8>> {
         let (tx, rx) = chan();
         room.agents
             .insert(session_id.into(), AgentSession { info: info(id, session_id), tx });
         rx
     }
 
-    fn add_mcp(room: &Room, session_id: &str) -> Receiver<String> {
+    fn add_mcp(room: &Room, session_id: &str) -> Receiver<Vec<u8>> {
         let (tx, rx) = chan();
         room.mcp
             .insert(session_id.into(), McpSession { id: session_id.into(), tx });
@@ -534,8 +525,8 @@ mod routing_tests {
     }
 
     /// Pop the next frame off a connection's outbound queue, parsed.
-    fn next(rx: &mut Receiver<String>) -> Option<ServerMessage> {
-        rx.try_recv().ok().and_then(|j| ServerMessage::from_json(&j).ok())
+    fn next(rx: &mut Receiver<Vec<u8>>) -> Option<ServerMessage> {
+        rx.try_recv().ok().and_then(|b| ServerMessage::from_proto_bytes(&b).ok())
     }
 
     fn dispatch(
@@ -545,7 +536,7 @@ mod routing_tests {
         self_tx: &Tx,
         msg: ClientMessage,
     ) -> ControlFlow<()> {
-        handle_client_msg(&msg.to_json().unwrap(), room, session_id, agent, self_tx)
+        handle_client_msg(&msg.to_proto_bytes().unwrap(), room, session_id, agent, self_tx)
     }
 
     #[test]
@@ -563,7 +554,8 @@ mod routing_tests {
             ClientMessage::Command {
                 request_id: "req1".into(),
                 target: Target::All,
-                payload: "ENC".into(),
+                // Valid base64 (the relay round-trips the payload through bytes).
+                payload: "RU5D".into(),
             },
         );
         assert!(flow.is_continue());
@@ -572,7 +564,7 @@ mod routing_tests {
             match next(rx) {
                 Some(ServerMessage::Command { request_id, payload, from_session }) => {
                     assert_eq!(request_id, "req1");
-                    assert_eq!(payload, "ENC");
+                    assert_eq!(payload, "RU5D");
                     assert_eq!(from_session, "origin-sess");
                 }
                 other => panic!("each agent should receive the Command, got {other:?}"),
@@ -598,7 +590,7 @@ mod routing_tests {
             ClientMessage::Command {
                 request_id: "req2".into(),
                 target: Target::Agent { id: "ghost".into() },
-                payload: "X".into(),
+                payload: "WA==".into(), // valid base64
             },
         );
 
@@ -627,14 +619,14 @@ mod routing_tests {
             "s-a1",
             &agent,
             &atx,
-            ClientMessage::CommandResult { request_id: "req3".into(), result: "RES".into() },
+            ClientMessage::CommandResult { request_id: "req3".into(), result: "UkVT".into() },
         );
 
         match next(&mut origin) {
             Some(ServerMessage::CommandResult { request_id, agent_id, result }) => {
                 assert_eq!(request_id, "req3");
                 assert_eq!(agent_id, "agentA");
-                assert_eq!(result, "RES");
+                assert_eq!(result, "UkVT");
             }
             other => panic!("origin should receive its result, got {other:?}"),
         }
@@ -718,7 +710,8 @@ mod routing_tests {
     fn unparseable_message_is_ignored_without_reply() {
         let room = Room::default();
         let (self_tx, mut rx) = chan();
-        let flow = handle_client_msg("{ not valid json", &room, "s", &None, &self_tx);
+        // Random bytes that are not a valid protobuf ClientMessage.
+        let flow = handle_client_msg(&[0xff, 0x00, 0x42, 0x13], &room, "s", &None, &self_tx);
         assert!(flow.is_continue());
         assert!(next(&mut rx).is_none());
     }
