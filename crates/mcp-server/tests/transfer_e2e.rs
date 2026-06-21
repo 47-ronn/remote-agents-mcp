@@ -61,6 +61,9 @@ fn agent_info(id: &str) -> AgentInfo {
 
 #[tokio::test]
 async fn host_to_host_transfer_round_trips_over_relay() {
+    // Hermetic: never hit external STUN servers (their latency under CI made this
+    // test flaky/time out). Endpoints fall back to the relay-reflected loopback.
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1");
     let port = start_relay().await;
     let relay_url = format!("ws://127.0.0.1:{port}");
 
@@ -170,6 +173,7 @@ async fn host_to_host_transfer_round_trips_over_relay() {
 /// sender, and the peer's `begin_send_file` handler streams to the destination.
 #[tokio::test]
 async fn local_host_to_agent_loopback_round_trips_over_relay() {
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1"); // hermetic: no live STUN
     let port = start_relay().await;
     let relay_url = format!("ws://127.0.0.1:{port}");
 

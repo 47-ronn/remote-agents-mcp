@@ -13,16 +13,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[tokio::test]
-// Like the in-module `two_transports_exchange_data_over_udp`, this exercises a
-// loopback hole-punch. Since `offer_channel`/`handle_offer` now run live STUN
-// discovery, on a host whose STUN succeeds and returns a public IP (e.g. behind
-// NAT) the two local transports advertise that public address and try to punch
-// to it — which can't be reached over loopback (hairpinning), so the channel
-// never connects. Ignored by default; run with `--ignored` where STUN is blocked
-// or returns loopback addresses. See ITERATION_LOG: local-candidate punch is the
-// proper fix (try local + public endpoints) to re-enable same-host/LAN punching.
-#[ignore = "requires STUN to fail or return loopback addresses"]
 async fn mcp_dials_agent_and_sends_command_over_udp() {
+    // Hermetic: skip live STUN so both transports advertise their (loopback)
+    // local/relay-reflected endpoints and can actually punch over loopback.
+    // Without this, live STUN returns a public IP that loopback can't reach
+    // (hairpinning), so the channel never connects. The proper production fix
+    // for same-host/LAN is local-candidate punching (try local + public).
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1");
     let cipher = Cipher::from_passphrase("interop-key");
     // Simulate YourEndpoint reflecting loopback so offers carry a reachable addr.
     let lo = Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
