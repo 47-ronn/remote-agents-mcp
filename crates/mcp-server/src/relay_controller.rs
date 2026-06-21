@@ -1006,17 +1006,28 @@ async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
         ServerMessage::UdpOffer { from_session, offer } => {
             debug!("Received UDP offer from {}", from_session);
             let offer = authenticated_offer(&from_session, offer);
-            if let Err(e) = shared.udp_transport.handle_offer(offer).await {
-                warn!("Failed to handle UDP offer: {}", e);
-            }
+            // Spawn: handle_offer runs STUN discovery (seconds when STUN is
+            // blocked/slow). Awaiting it inline stalls this message loop, so
+            // command replies (e.g. set_mode) can't be read until it returns —
+            // a CI-only "Command timeout". Mirror the agent-side connection loop.
+            let udp = shared.udp_transport.clone();
+            tokio::spawn(async move {
+                if let Err(e) = udp.handle_offer(offer).await {
+                    warn!("Failed to handle UDP offer: {}", e);
+                }
+            });
         }
 
         ServerMessage::UdpAnswer { from_session, answer } => {
             debug!("Received UDP answer from {}", from_session);
             let answer = authenticated_answer(&from_session, answer);
-            if let Err(e) = shared.udp_transport.handle_answer(answer).await {
-                warn!("Failed to handle UDP answer: {}", e);
-            }
+            // Spawn for the same reason as UdpOffer: handle_answer also runs STUN.
+            let udp = shared.udp_transport.clone();
+            tokio::spawn(async move {
+                if let Err(e) = udp.handle_answer(answer).await {
+                    warn!("Failed to handle UDP answer: {}", e);
+                }
+            });
         }
 
         ServerMessage::UdpResult { from_session, result } => {
