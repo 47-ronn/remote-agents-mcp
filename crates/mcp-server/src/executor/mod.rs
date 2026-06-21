@@ -422,6 +422,41 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
     }
 }
 
+/// Receive one host↔host transfer chunk, transport-aware. The size cap
+/// (`max_transfer_size`) exists to protect the shared RELAY from huge transfers;
+/// a direct UDP (p2p) channel doesn't touch the relay, so the cap is lifted when
+/// `over_udp` is set. The connection loops call this (they know the transport);
+/// the generic [`execute`] keeps the cap for the relay/WS path. Returns
+/// `CommandResult::Ok` once the slice is written (and verified on `eof`).
+pub async fn recv_file_chunk(
+    state: &AgentState,
+    dest_path: &str,
+    offset: u64,
+    bytes_b64: &str,
+    eof: bool,
+    sha256: Option<&str>,
+    over_udp: bool,
+) -> Result<CommandResult> {
+    if !state.config.accepts_commands {
+        bail!("This node does not accept remote commands (--no-agent)");
+    }
+    let mode = state.mode().await;
+    if !mode.allows_write() {
+        bail!("Receiving a file requires Edit/Bypass mode (got {:?})", mode);
+    }
+    let mut sec = state.config.security.clone();
+    if over_udp {
+        sec.max_transfer_size = 0; // direct p2p: no relay to protect → no cap
+    }
+    let (dest_path, bytes, sha) = (dest_path.to_string(), bytes_b64.to_string(), sha256.map(str::to_string));
+    tokio::task::spawn_blocking(move || {
+        crate::transfer::receive_chunk(&dest_path, offset, &bytes, eof, sha.as_deref(), &sec)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("receive chunk failed: {e}"))??;
+    Ok(CommandResult::Ok)
+}
+
 /// Run a MapReduce compute function: a shell command `func` fed `stdin_data` on
 /// standard input. Returns `(output, success, error)` so a single failing
 /// partition surfaces as a failed result rather than aborting the whole job.

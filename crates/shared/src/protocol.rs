@@ -875,6 +875,7 @@ mod tests {
             from_session: "a".into(),
             to_session: "b".into(),
             local_endpoint: Endpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1111),
+            local_candidates: Vec::new(),
             public_endpoint: None,
             nonce: [7u8; 16],
         };

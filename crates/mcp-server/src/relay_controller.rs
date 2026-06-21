@@ -172,7 +172,11 @@ impl ConnectionPool {
 
         // Create UDP signaling channel
         let (udp_signal_tx, mut udp_signal_rx) = mpsc::channel::<SignalMessage>(32);
-        let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx));
+        // Inbound application data over UDP channels (peer_session, bytes) — replies
+        // to our commands and commands addressed to us. Without draining this the
+        // controller is send-only and UDP replies/commands are silently dropped.
+        let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel::<(String, Vec<u8>)>(64);
+        let udp_transport = Arc::new(UdpTransport::new(cipher.clone(), udp_signal_tx, udp_inbound_tx));
 
         // Keep a copy of our identity to re-send on every reconnect.
         let agent_info_redial = agent_info.clone();
@@ -201,6 +205,29 @@ impl ConnectionPool {
         // Set session ID on UDP transport
         udp_transport.set_session_id(session_id.clone()).await;
         info!("UDP transport initialized");
+
+        // Drain inbound UDP frames: resolve replies to our commands and execute
+        // commands addressed to us that arrived over a direct UDP channel,
+        // replying back over the same channel. Without this the controller could
+        // only SEND over UDP, so any reply (e.g. a FileRecv ack from a peer it is
+        // streaming to) would be lost and the transfer would stall.
+        {
+            let pending_udp = pending.clone();
+            let cipher_udp = cipher.clone();
+            let agents_udp = agents.clone();
+            let udp_in = udp_transport.clone();
+            let executor_udp = executor_state.clone();
+            let mut rx_in = udp_inbound_rx;
+            tokio::spawn(async move {
+                while let Some((peer_session, data)) = rx_in.recv().await {
+                    handle_controller_udp_inbound(
+                        &peer_session, &data, &pending_udp, &cipher_udp, &agents_udp,
+                        &udp_in, &executor_udp,
+                    )
+                    .await;
+                }
+            });
+        }
 
         // Spawn message handler
         let agents_clone = agents.clone();
@@ -790,11 +817,21 @@ async fn begin_send_file(
     let tid = transfer_id.clone();
     let chunk = state.config.security.transfer_chunk_size;
     let punched = dest_session.is_some();
+    let dest_session_task = dest_session.clone();
     tokio::spawn(async move {
         // Give a freshly-offered channel a moment to hole-punch before the first
         // chunk decides UDP-vs-WS.
         if punched {
             tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        // Lift the relay size cap when a direct UDP channel to the dest is up:
+        // the transfer goes peer-to-peer and never loads the relay. Without one
+        // it streams over the relay, where `max_transfer_size` still applies.
+        let mut sec = sec.clone();
+        if let Some(session) = &dest_session_task {
+            if shared.udp_transport.has_udp_channel(session).await {
+                sec.max_transfer_size = 0;
+            }
         }
         // Each chunk is pushed to the destination over this connection's peer
         // dispatch (UDP-preferred, WS fallback).
@@ -813,6 +850,81 @@ async fn begin_send_file(
     });
 
     Ok(transfer_id)
+}
+
+/// Process one inbound UDP frame received by the controller over a direct
+/// channel: resolve a reply to a command we sent (Result/Error → pending), or
+/// execute a command addressed to us (Command) and reply back over the same
+/// channel. This makes the controller's UDP transport bidirectional — required
+/// because commands AND file chunks ride UDP, and their replies must return.
+async fn handle_controller_udp_inbound(
+    peer_session: &str,
+    data: &[u8],
+    pending: &PendingMap,
+    cipher: &Cipher,
+    agents: &Arc<RwLock<Vec<AgentInfo>>>,
+    udp: &Arc<UdpTransport>,
+    executor: &Option<Arc<crate::state::AgentState>>,
+) {
+    let Some(frame) = UdpFrame::from_bytes(data) else {
+        return;
+    };
+    // The replying peer's agent id (for the collector tuple); fall back to its
+    // session id if it isn't in our roster yet.
+    async fn agent_id_of(agents: &Arc<RwLock<Vec<AgentInfo>>>, session: &str) -> String {
+        agents
+            .read()
+            .await
+            .iter()
+            .find(|a| a.session_id.as_deref() == Some(session))
+            .map(|a| a.id.clone())
+            .unwrap_or_else(|| session.to_string())
+    }
+    match frame {
+        UdpFrame::Result { request_id, result } => {
+            let reply = CommandResult::decrypt(&result, cipher).map_err(|e| e.to_string());
+            let aid = agent_id_of(agents, peer_session).await;
+            if let Some(s) = pending.read().await.get(&request_id) {
+                let _ = s.send((aid, reply));
+            }
+        }
+        UdpFrame::Error { request_id, error } => {
+            let aid = agent_id_of(agents, peer_session).await;
+            if let Some(s) = pending.read().await.get(&request_id) {
+                let _ = s.send((aid, Err(error)));
+            }
+        }
+        UdpFrame::Command { request_id, payload, .. } => {
+            // A command addressed to us over UDP (we're the destination). Execute
+            // and reply over the same channel. We don't SOURCE transfers here.
+            let Some(state) = executor else {
+                return;
+            };
+            let outcome: Result<CommandResult> = match Command::decrypt(&payload, cipher) {
+                Ok(Command::SendFileTo { .. }) => {
+                    Err(anyhow::anyhow!("controller does not source transfers over UDP"))
+                }
+                Ok(Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. }) => {
+                    crate::executor::recv_file_chunk(
+                        state, &dest_path, offset, &bytes, eof, sha256.as_deref(), true,
+                    )
+                    .await
+                }
+                Ok(cmd) => crate::executor::execute(&cmd, state).await,
+                Err(e) => Err(anyhow::anyhow!("payload decryption failed: {e}")),
+            };
+            let reply = match &outcome {
+                Ok(r) => r
+                    .encrypt(cipher)
+                    .ok()
+                    .map(|env| UdpFrame::Result { request_id: request_id.clone(), result: env }),
+                Err(e) => Some(UdpFrame::Error { request_id: request_id.clone(), error: e.to_string() }),
+            };
+            if let Some(f) = reply {
+                let _ = udp.send_via_udp(peer_session, &f.to_bytes()).await;
+            }
+        }
+    }
 }
 
 /// Shared per-connection state handed to the message handler.
@@ -1228,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn has_channel_false_before_any_offer() {
         let (sig_tx, _rx) = mpsc::channel(4);
-        let udp = UdpTransport::new(Cipher::from_passphrase("k"), sig_tx);
+        let udp = UdpTransport::new(Cipher::from_passphrase("k"), sig_tx, mpsc::channel(8).0);
         assert!(!udp.has_channel("sess-x").await);
     }
 
@@ -1250,7 +1362,7 @@ mod tests {
             events_notify: Arc::new(Notify::new()),
             watched: watched.clone(),
             tx,
-            udp_transport: Arc::new(UdpTransport::new(cipher, sig_tx)),
+            udp_transport: Arc::new(UdpTransport::new(cipher, sig_tx, mpsc::channel(8).0)),
             executor_state: None,
         };
         (shared, rx, watched, events)
@@ -1342,7 +1454,7 @@ mod tests {
             events_notify: Arc::new(Notify::new()),
             watched: Arc::new(RwLock::new(HashMap::new())),
             tx,
-            udp_transport: Arc::new(UdpTransport::new(cipher.clone(), sig_tx)),
+            udp_transport: Arc::new(UdpTransport::new(cipher.clone(), sig_tx, mpsc::channel(8).0)),
             executor_state: Some(state),
         };
         (shared, rx, cipher)

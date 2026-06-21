@@ -319,6 +319,11 @@ fn handle_client_msg(
         // addressed by session id (mirrors the worker's findSocketBySession).
         ClientMessage::UdpOffer(offer) => {
             let to_session = offer.to_session.clone();
+            // Remember who offered this channel so the answer can route straight
+            // back to them (works whether the offerer is a full peer or an MCP
+            // observer), instead of broadcasting answers to MCP clients only.
+            room.udp_offers
+                .insert(offer.channel_id.clone(), session_id.to_string());
             if let Some(target_tx) = crate::routing::find_session_tx(room, &to_session) {
                 send_raw(&target_tx, &ServerMessage::UdpOffer {
                     from_session: session_id.to_string(),
@@ -329,15 +334,22 @@ fn handle_client_msg(
             }
         }
 
-        // UDP Signaling: forward answer back to offering session
+        // UDP Signaling: route the answer back to the peer that made the offer
+        // (looked up by channel id). Falls back to the legacy MCP broadcast if the
+        // offerer is unknown (e.g. the offer predates this relay instance).
         ClientMessage::UdpAnswer(answer) => {
-            // The answer goes back to the session that made the offer
-            // which is stored in answer.channel_id's origin, but we don't track that
-            // Instead, forward to MCP clients which track channels
-            broadcast_mcp(room, &ServerMessage::UdpAnswer {
+            let offerer = room
+                .udp_offers
+                .remove(&answer.channel_id)
+                .map(|(_, v)| v);
+            let msg = ServerMessage::UdpAnswer {
                 from_session: session_id.to_string(),
                 answer,
-            });
+            };
+            match offerer.and_then(|o| crate::routing::find_session_tx(room, &o)) {
+                Some(tx) => send_raw(&tx, &msg),
+                None => broadcast_mcp(room, &msg),
+            }
         }
 
         // UDP Signaling: forward channel result
