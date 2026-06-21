@@ -11,7 +11,19 @@ mod channel_impl {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
-    use tokio::sync::{mpsc, Mutex, RwLock};
+    use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+
+    // Congestion control / pacing bounds. The in-flight (unacked) packet count is
+    // held to `cwnd`, which grows additively per ack and halves on loss (AIMD) —
+    // so the sender never bursts more than the path + (small, non-root) receive
+    // buffer can absorb, which is the main throughput limiter without big buffers.
+    const MIN_CWND: usize = 4;
+    const INIT_CWND: usize = 16;
+    const MAX_CWND: usize = 256;
+    /// Acks this far past an unacked packet imply it was lost → fast-retransmit.
+    const DUPACK_THRESHOLD: u32 = 3;
+    const RTO_FLOOR_MS: f64 = 50.0;
+    const RTO_CEIL_MS: f64 = 4000.0;
 
     /// Error type for UDP channel operations.
     #[derive(Debug, thiserror::Error)]
@@ -39,6 +51,9 @@ mod channel_impl {
         sequence: u32,
         sent_at: Instant,
         retries: u32,
+        /// Set once we fast-retransmit this packet, so a burst of acks for later
+        /// packets doesn't trigger repeated fast-retransmits of the same one.
+        fast_rtx: bool,
     }
 
     /// A bidirectional UDP channel to a remote peer.
@@ -73,6 +88,13 @@ mod channel_impl {
         frag_msg_id: Mutex<u32>,
         /// Reassembly buffer for inbound `DataFragment` packets.
         reassembler: Mutex<FragmentReassembler>,
+        /// Congestion window: max unacked reliable packets in flight (AIMD).
+        cwnd: Mutex<usize>,
+        /// Woken whenever a DataAck frees window space, so a paced sender resumes.
+        acked: Notify,
+        /// Smoothed RTT / its variation (ms), for an adaptive RTO (RFC 6298).
+        srtt_ms: Mutex<Option<f64>>,
+        rttvar_ms: Mutex<f64>,
     }
 
     impl UdpChannel {
@@ -137,6 +159,10 @@ mod channel_impl {
                 remote_nonce: RwLock::new(None),
                 frag_msg_id: Mutex::new(0),
                 reassembler: Mutex::new(FragmentReassembler::new()),
+                cwnd: Mutex::new(INIT_CWND),
+                acked: Notify::new(),
+                srtt_ms: Mutex::new(None),
+                rttvar_ms: Mutex::new(0.0),
             };
 
             Ok((channel, recv_rx))
@@ -382,12 +408,58 @@ mod channel_impl {
 
         /// Build a reliable packet of `packet_type`, register it for
         /// retransmission, and send it. Caller supplies the full UDP payload.
+        /// Fold a fresh RTT sample into SRTT/RTTVAR (RFC 6298).
+        async fn update_rtt(&self, sample: std::time::Duration) {
+            let r = sample.as_secs_f64() * 1000.0;
+            let mut srtt = self.srtt_ms.lock().await;
+            let mut var = self.rttvar_ms.lock().await;
+            match *srtt {
+                None => {
+                    *srtt = Some(r);
+                    *var = r / 2.0;
+                }
+                Some(s) => {
+                    *var = 0.75 * *var + 0.25 * (s - r).abs();
+                    *srtt = Some(0.875 * s + 0.125 * r);
+                }
+            }
+        }
+
+        /// Current retransmission timeout from the RTT estimate, clamped. Falls
+        /// back to the static config value until we have a first sample.
+        async fn current_rto(&self) -> Duration {
+            match *self.srtt_ms.lock().await {
+                Some(s) => {
+                    let v = *self.rttvar_ms.lock().await;
+                    Duration::from_millis((s + 4.0 * v).clamp(RTO_FLOOR_MS, RTO_CEIL_MS) as u64)
+                }
+                None => Duration::from_millis(self.config.rto_ms),
+            }
+        }
+
         async fn send_reliable_packet(
             &self,
             packet_type: UdpPacketType,
             payload: &[u8],
             peer: SocketAddr,
         ) -> Result<(), UdpChannelError> {
+            // Flow control: don't put more than `cwnd` packets in flight. Wait for
+            // a DataAck to free a slot (or a short timer, in case acks were lost).
+            loop {
+                let inflight = self.pending.lock().await.len();
+                let cwnd = *self.cwnd.lock().await;
+                if inflight < cwnd {
+                    break;
+                }
+                if *self.state.read().await == ChannelState::Closed {
+                    return Err(UdpChannelError::Closed);
+                }
+                tokio::select! {
+                    _ = self.acked.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+
             let seq = {
                 let mut s = self.send_seq.lock().await;
                 let seq = *s;
@@ -413,6 +485,7 @@ mod channel_impl {
                         sequence: seq,
                         sent_at: Instant::now(),
                         retries: 0,
+                        fast_rtx: false,
                     },
                 );
             }
@@ -550,9 +623,50 @@ mod channel_impl {
                     }
 
                     UdpPacketType::DataAck => {
-                        // Remove from pending
-                        let mut pending = self.pending.lock().await;
-                        pending.remove(&header.sequence);
+                        let acked_seq = header.sequence;
+                        let mut rtt_sample = None;
+                        let mut fast: Vec<Vec<u8>> = Vec::new();
+                        {
+                            let mut pending = self.pending.lock().await;
+                            if let Some(pkt) = pending.remove(&acked_seq) {
+                                // Karn's algorithm: only sample RTT from packets we
+                                // never retransmitted (else the ack is ambiguous).
+                                if pkt.retries == 0 {
+                                    rtt_sample = Some(pkt.sent_at.elapsed());
+                                }
+                            }
+                            // Fast-retransmit: any still-pending packet whose seq is
+                            // well behind the one just acked has almost certainly
+                            // been lost — resend it now instead of waiting an RTO.
+                            for pkt in pending.values_mut() {
+                                if !pkt.fast_rtx
+                                    && pkt.sequence < acked_seq
+                                    && acked_seq - pkt.sequence > DUPACK_THRESHOLD
+                                {
+                                    pkt.fast_rtx = true;
+                                    pkt.retries += 1;
+                                    pkt.sent_at = Instant::now();
+                                    fast.push(pkt.data.clone());
+                                }
+                            }
+                        }
+                        if let Some(s) = rtt_sample {
+                            self.update_rtt(s).await;
+                        }
+                        // Additive increase on a good ack.
+                        {
+                            let mut c = self.cwnd.lock().await;
+                            *c = (*c + 1).min(MAX_CWND);
+                        }
+                        if !fast.is_empty() {
+                            for data in &fast {
+                                let _ = self.socket.send_to(data, from).await;
+                            }
+                            // Loss signal → multiplicative decrease (once).
+                            let mut c = self.cwnd.lock().await;
+                            *c = (*c / 2).max(MIN_CWND);
+                        }
+                        self.acked.notify_waiters();
                     }
 
                     UdpPacketType::Ping => {
@@ -578,10 +692,10 @@ mod channel_impl {
 
         /// Retransmission loop for reliable packets.
         pub async fn retransmit_loop(&self) -> Result<(), UdpChannelError> {
-            let rto = Duration::from_millis(self.config.rto_ms);
-
             loop {
-                tokio::time::sleep(rto).await;
+                // Fine-grained tick; each packet is judged against the current
+                // adaptive RTO rather than one fixed interval.
+                tokio::time::sleep(Duration::from_millis(25)).await;
 
                 let state = *self.state.read().await;
                 if state == ChannelState::Closed {
@@ -593,24 +707,36 @@ mod channel_impl {
                     None => continue,
                 };
 
-                let mut pending = self.pending.lock().await;
-                let mut to_remove = Vec::new();
-
-                for (seq, pkt) in pending.iter_mut() {
-                    if pkt.sent_at.elapsed() > rto {
-                        if pkt.retries >= self.config.max_retransmissions {
-                            to_remove.push(*seq);
-                        } else {
-                            let _ = self.socket.send_to(&pkt.data, peer).await;
-                            pkt.retries += 1;
-                            pkt.sent_at = Instant::now();
+                let rto = self.current_rto().await;
+                let mut had_loss = false;
+                {
+                    let mut pending = self.pending.lock().await;
+                    let mut to_remove = Vec::new();
+                    for (seq, pkt) in pending.iter_mut() {
+                        if pkt.sent_at.elapsed() > rto {
+                            if pkt.retries >= self.config.max_retransmissions {
+                                to_remove.push(*seq);
+                            } else {
+                                let _ = self.socket.send_to(&pkt.data, peer).await;
+                                pkt.retries += 1;
+                                pkt.sent_at = Instant::now();
+                                pkt.fast_rtx = false;
+                                had_loss = true;
+                            }
                         }
                     }
+                    for seq in to_remove {
+                        pending.remove(&seq);
+                    }
                 }
-
-                for seq in to_remove {
-                    pending.remove(&seq);
+                if had_loss {
+                    // Timeout is a strong congestion signal: back off (once/tick).
+                    let mut c = self.cwnd.lock().await;
+                    *c = (*c / 2).max(MIN_CWND);
                 }
+                // A retransmit may have abandoned packets (freeing window) — wake
+                // any paced sender so it re-evaluates.
+                self.acked.notify_waiters();
             }
         }
 

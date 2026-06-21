@@ -273,46 +273,27 @@ impl UdpTransport {
 
     /// Send data to a peer via UDP (if available).
     /// Returns true if sent via UDP, false if should use WS fallback.
-    /// Includes a 100ms timeout to avoid blocking if the socket is congested.
+    /// `send_reliable` is flow-controlled (cwnd pacing), so it legitimately takes
+    /// as long as the path needs — do NOT cap it with a short timeout (that would
+    /// spuriously fall back to the relay for any large/paced slice).
     pub async fn send_via_udp(&self, peer_session: &str, data: &[u8]) -> Result<bool> {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(peer_session) {
             if channel.state().await == ChannelState::Connected {
-                // Timeout to avoid blocking the caller if UDP is slow/congested
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    channel.send_reliable(data)
-                ).await {
-                    Ok(Ok(_)) => return Ok(true),
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => {
-                        // Timeout - UDP is too slow, fall back to WS
-                        tracing::debug!("UDP send timeout, falling back to WS");
-                        return Ok(false);
-                    }
-                }
+                channel.send_reliable(data).await?;
+                return Ok(true);
             }
         }
         Ok(false)
     }
 
     /// Send unreliable data via UDP.
-    /// Includes a 100ms timeout to avoid blocking if the socket is congested.
     pub async fn send_unreliable(&self, peer_session: &str, data: &[u8]) -> Result<bool> {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(peer_session) {
             if channel.state().await == ChannelState::Connected {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    channel.send_unreliable(data)
-                ).await {
-                    Ok(Ok(_)) => return Ok(true),
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => {
-                        tracing::debug!("UDP unreliable send timeout");
-                        return Ok(false);
-                    }
-                }
+                channel.send_unreliable(data).await?;
+                return Ok(true);
             }
         }
         Ok(false)
