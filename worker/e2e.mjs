@@ -3,6 +3,11 @@
 // real protocol over WebSocket: auth ordering, peer-awareness, platform
 // targeting, and agent_left fan-out to both MCP and peer agents.
 //
+// ⚠️ STALE: the wire protocol is now binary protobuf (see src/wire.ts), but this
+// script still sends/parses JSON text frames. It will NOT work against the
+// current worker until rewritten to encode/decode the generated proto types.
+// Kept for reference; the worker is not deployed yet (proto migration Pass 3).
+//
 // Usage:
 //   node worker/e2e.mjs <wss://your-worker-host> [room] [token]
 // Pass your deployed worker URL as the first arg. Exits 0 on success, 1 on first failure.

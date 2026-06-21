@@ -134,6 +134,8 @@ export interface UdpOffer {
   from_session: string;
   to_session: string;
   local_endpoint: Endpoint;
+  /** All local-interface endpoints (multi-homed hosts); forwarded as-is. */
+  local_candidates?: Endpoint[];
   public_endpoint?: Endpoint;
   nonce: number[];
 }
@@ -142,6 +144,7 @@ export interface UdpAnswer {
   channel_id: string;
   from_session: string;
   local_endpoint: Endpoint;
+  local_candidates?: Endpoint[];
   public_endpoint?: Endpoint;
   nonce: number[];
   accepted: boolean;

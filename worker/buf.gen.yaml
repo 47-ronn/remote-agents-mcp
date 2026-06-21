@@ -1,0 +1,16 @@
+# Generates TypeScript wire types from ../../proto via ts-proto.
+# buf bundles its own proto compiler, so no system `protoc` is needed.
+# Run: npm run codegen   (see package.json). Output: src/gen/remote_agents.ts
+# The same generated file is copied into fleet-chat (see scripts in package.json).
+version: v2
+plugins:
+  - local: ../node_modules/.bin/protoc-gen-ts_proto
+    out: src/gen
+    opt:
+      - esModuleInterop=true
+      - forceLong=number
+      - oneof=unions
+      - outputServices=none
+      - useExactTypes=false
+inputs:
+  - directory: ../proto
