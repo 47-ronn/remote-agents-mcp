@@ -10,8 +10,9 @@ use remote_agents_shared::AgentInfo;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Outbound channel to a single connection (carries serialized JSON frames).
-pub type Tx = mpsc::Sender<String>;
+/// Outbound channel to a single connection (carries encoded protobuf frames,
+/// sent on the wire as binary WS messages).
+pub type Tx = mpsc::Sender<Vec<u8>>;
 
 /// Bound on a connection's outbound queue; a consumer that can't keep up is
 /// disconnected rather than allowed to grow memory unbounded.

@@ -11,7 +11,7 @@ use crate::safety;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use futures::stream::{FuturesUnordered, StreamExt};
-use remote_agents_shared::{Command, CommandResult, TransferState, TransferStatus};
+use remote_agents_shared::{TransferState, TransferStatus};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -89,10 +89,23 @@ pub fn receive_chunk(
     expected_sha256: Option<&str>,
     sec: &SecurityConfig,
 ) -> Result<()> {
-    safety::check_path_allowed(dest_path, sec)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(bytes_b64)
         .context("decode transfer chunk")?;
+    receive_chunk_raw(dest_path, offset, &bytes, eof, expected_sha256, sec)
+}
+
+/// Like [`receive_chunk`] but takes the slice bytes RAW (already decrypted, no
+/// base64) — used by the binary UDP file path. Blocking — call from spawn_blocking.
+pub fn receive_chunk_raw(
+    dest_path: &str,
+    offset: u64,
+    bytes: &[u8],
+    eof: bool,
+    expected_sha256: Option<&str>,
+    sec: &SecurityConfig,
+) -> Result<()> {
+    safety::check_path_allowed(dest_path, sec)?;
 
     // `offset` is peer-supplied; compute the end with checked arithmetic so a
     // near-`u64::MAX` offset can't wrap PAST the size guard and then `seek` to a
@@ -116,7 +129,7 @@ pub fn receive_chunk(
         .open(dest_path)
         .with_context(|| format!("open {dest_path}"))?;
     f.seek(SeekFrom::Start(offset))?;
-    f.write_all(&bytes)?;
+    f.write_all(bytes)?;
 
     if eof {
         f.flush()?;
@@ -144,16 +157,18 @@ pub fn receive_chunk(
 pub async fn stream_file<F, Fut>(
     store: &TransferStore,
     src_path: &str,
-    dest_path: &str,
     transfer_id: &str,
     sec: &SecurityConfig,
     chunk: u64,
     size: u64,
-    send_chunk: F,
+    send_slice: F,
 ) -> Result<()>
 where
-    F: Fn(Command) -> Fut,
-    Fut: Future<Output = Result<CommandResult>>,
+    // (offset, raw slice bytes, eof, whole-file sha on eof) -> Ok once the peer
+    // acked it. The closure picks the transport encoding: raw bytes over a direct
+    // UDP channel (no base64), base64 in a FileRecv command over the WS relay.
+    F: Fn(u64, Vec<u8>, bool, Option<String>) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     let sha = {
         let sp = src_path.to_string();
@@ -163,28 +178,15 @@ where
     };
     let chunk = chunk.max(1);
 
-    // Read one slice off disk (off the async runtime).
+    // Read one RAW slice off disk (off the async runtime) — no base64; the
+    // transport closure encodes as needed.
     let read_slice = |offset: u64, want: u64| {
         let (sp, sec2) = (src_path.to_string(), sec.clone());
         async move {
-            tokio::task::spawn_blocking(move || crate::files::read_chunk(&sp, offset, want, &sec2))
+            tokio::task::spawn_blocking(move || crate::files::read_chunk_raw(&sp, offset, want, &sec2))
                 .await
                 .map_err(|e| anyhow::anyhow!("read chunk failed: {e}"))?
                 .map(|(data, _)| data)
-        }
-    };
-    let mk_cmd = |offset: u64, bytes: String, eof: bool, sha: Option<String>| Command::FileRecv {
-        transfer_id: transfer_id.to_string(),
-        dest_path: dest_path.to_string(),
-        offset,
-        bytes,
-        eof,
-        sha256: sha,
-    };
-    let check = |res: Result<CommandResult>| -> Result<()> {
-        match res? {
-            CommandResult::Ok => Ok(()),
-            other => bail!("destination rejected chunk: {other:?}"),
         }
     };
 
@@ -200,18 +202,18 @@ where
             break; // the final slice is sent after the loop
         }
         let data = read_slice(offset, want).await?;
-        let fut = send_chunk(mk_cmd(offset, data, false, None));
+        let fut = send_slice(offset, data, false, None);
         inflight.push(async move { (want, fut.await) });
         offset += want;
         if inflight.len() >= TRANSFER_WINDOW {
             let (w, res) = inflight.next().await.expect("window non-empty");
-            check(res)?;
+            res?;
             sent += w;
             store.progress(transfer_id, sent);
         }
     }
     while let Some((w, res)) = inflight.next().await {
-        check(res)?;
+        res?;
         sent += w;
         store.progress(transfer_id, sent);
     }
@@ -220,7 +222,7 @@ where
     // other slice is acked, so the receiver hashes a fully-written file.
     let want = size - offset; // 0 for an empty file
     let data = read_slice(offset, want).await?;
-    check(send_chunk(mk_cmd(offset, data, true, Some(sha))).await)?;
+    send_slice(offset, data, true, Some(sha)).await?;
     sent += want;
     store.progress(transfer_id, sent);
     Ok(())
@@ -351,27 +353,22 @@ mod tests {
         let store = TransferStore::default();
         store.start("t", data.len() as u64);
 
-        // The closure applies each FileRecv to its own dest_path (set by
-        // stream_file), so it only needs the security config.
+        // The closure writes each raw slice straight to the dest (stands in for
+        // the binary UDP path), so it only needs the dest path + security config.
+        let dst_s = dst.to_string_lossy().to_string();
         let cfg_recv = cfg.clone();
-        let send = move |cmd: Command| {
-            let cfg = cfg_recv.clone();
+        let dst_recv = dst_s.clone();
+        let send = move |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let (cfg, dst) = (cfg_recv.clone(), dst_recv.clone());
             async move {
-                match cmd {
-                    Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. } => {
-                        receive_chunk(&dest_path, offset, &bytes, eof, sha256.as_deref(), &cfg)?;
-                        Ok(CommandResult::Ok)
-                    }
-                    other => anyhow::bail!("unexpected command {other:?}"),
-                }
+                receive_chunk_raw(&dst, offset, &raw, eof, sha.as_deref(), &cfg)?;
+                Ok(())
             }
         };
 
-        let dst_s = dst.to_string_lossy().to_string();
         stream_file(
             &store,
             &src.to_string_lossy(),
-            &dst_s,
             "t",
             &cfg,
             chunk,

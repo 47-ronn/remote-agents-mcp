@@ -21,6 +21,16 @@ tokio = { workspace = true, optional = true }
 ruzstd = "0.8.3"
 if-addrs = "0.15"
 socket2 = "0.5"
+postcard = { version = "1", features = ["use-std"] }
+
+# Protobuf wire types, generated from proto/remote_agents.proto at build time.
+prost = "0.13"
+
+[build-dependencies]
+# Pure-Rust .proto compiler (no system `protoc` needed — works in CI and the
+# `cross` musl container) feeding prost's code generator.
+protox = "0.7"
+prost-build = "0.13"
 
 [features]
 default = []

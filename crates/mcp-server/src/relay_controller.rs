@@ -3,6 +3,7 @@
 use crate::connection::{authenticated_answer, authenticated_offer};
 use crate::relay_udp::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
     AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, Command,
@@ -55,10 +56,10 @@ async fn redial(
         token: token.to_string(),
         agent_info,
     };
-    write.send(Message::Text(auth.to_json().ok()?)).await.ok()?;
+    write.send(Message::Binary(auth.to_proto_bytes().ok()?)).await.ok()?;
     let resp = timeout(Duration::from_secs(10), read.next()).await.ok()??.ok()?;
-    if let Message::Text(t) = resp {
-        if let Ok(ServerMessage::AuthOk { session_id }) = ServerMessage::from_json(&t) {
+    if let Message::Binary(b) = resp {
+        if let Ok(ServerMessage::AuthOk { session_id }) = ServerMessage::from_proto_bytes(&b) {
             return Some((write, read, session_id));
         }
     }
@@ -189,7 +190,7 @@ impl ConnectionPool {
         };
 
         write
-            .send(Message::Text(auth_msg.to_json()?))
+            .send(Message::Binary(auth_msg.to_proto_bytes()?))
             .await
             .context("Failed to send auth")?;
 
@@ -298,8 +299,8 @@ impl ConnectionPool {
                     tokio::select! {
                         msg = read.next() => {
                             match msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    if let Err(e) = handle_message(&text, &shared).await {
+                                Some(Ok(Message::Binary(bytes))) => {
+                                    if let Err(e) = handle_message(&bytes, &shared).await {
                                         error!("Error handling message: {}", e);
                                     }
                                 }
@@ -319,8 +320,8 @@ impl ConnectionPool {
                         }
                         msg = rx.recv() => {
                             if let Some(msg) = msg {
-                                if let Ok(json) = msg.to_json() {
-                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                if let Ok(bytes) = msg.to_proto_bytes() {
+                                    if let Err(e) = write.send(Message::Binary(bytes)).await {
                                         error!("Failed to send message: {}", e);
                                         break;
                                     }
@@ -334,8 +335,8 @@ impl ConnectionPool {
                                     SignalMessage::Answer(answer) => ClientMessage::UdpAnswer(answer),
                                     SignalMessage::Result(result) => ClientMessage::UdpResult(result),
                                 };
-                                if let Ok(json) = msg.to_json() {
-                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                if let Ok(bytes) = msg.to_proto_bytes() {
+                                    if let Err(e) = write.send(Message::Binary(bytes)).await {
                                         error!("Failed to send UDP signal: {}", e);
                                     }
                                 }
@@ -708,21 +709,22 @@ fn encrypt_result(cipher: &Cipher, request_id: String, result: CommandResult) ->
 /// await its reply. Mirrors `ConnectionPool::dispatch` (UDP-preferred with a WS
 /// fallback, correlated by request_id) but works off `HandlerShared` — used by
 /// the host↔host transfer sender to push each file slice to the destination.
-async fn send_peer_command(
+/// Push one file slice to the destination and await its ack. Raw encrypted
+/// bytes in a `UdpFrame::FileData` over a direct UDP channel (no base64);
+/// otherwise base64 in a `FileRecv` command over the relay.
+#[allow(clippy::too_many_arguments)]
+async fn send_file_slice(
     shared: &HandlerShared,
-    target: Target,
-    payload: Command,
-) -> Result<CommandResult> {
+    dest_id: &str,
+    dest_session: Option<&str>,
+    transfer_id: &str,
+    dest_path: &str,
+    offset: u64,
+    raw: Vec<u8>,
+    eof: bool,
+    sha256: Option<String>,
+) -> Result<()> {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let envelope = payload
-        .encrypt(&shared.cipher)
-        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
-
-    let udp_session = {
-        let agents = shared.agents.read().await;
-        udp_session_for(&agents, &target)
-    };
-
     let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
     shared
         .pending
@@ -730,29 +732,53 @@ async fn send_peer_command(
         .await
         .insert(request_id.clone(), reply_tx);
 
-    let mut sent_via_udp = false;
-    if let Some(session) = &udp_session {
-        if shared.udp_transport.has_udp_channel(session).await {
-            let frame = UdpFrame::Command {
-                request_id: request_id.clone(),
-                from_session: String::new(),
-                payload: envelope.clone(),
-            };
-            if let Ok(true) = shared
-                .udp_transport
-                .send_via_udp(session, &frame.to_bytes())
-                .await
-            {
-                sent_via_udp = true;
+    let mut via_udp = false;
+    if let Some(sess) = dest_session {
+        if shared.udp_transport.has_udp_channel(sess).await {
+            match shared.cipher.encrypt_bytes(&raw) {
+                Ok(data) => {
+                    let frame = UdpFrame::FileData {
+                        request_id: request_id.clone(),
+                        transfer_id: transfer_id.to_string(),
+                        dest_path: dest_path.to_string(),
+                        offset,
+                        eof,
+                        sha256: sha256.clone(),
+                        data,
+                    };
+                    if let Ok(true) = shared
+                        .udp_transport
+                        .send_via_udp(sess, &frame.to_bytes())
+                        .await
+                    {
+                        via_udp = true;
+                    }
+                }
+                Err(e) => {
+                    shared.pending.write().await.remove(&request_id);
+                    bail!("encrypt slice: {e}");
+                }
             }
         }
     }
-    if !sent_via_udp {
+    if !via_udp {
+        // Relay/WS fallback: base64 the slice into a FileRecv command.
+        let cmd = Command::FileRecv {
+            transfer_id: transfer_id.to_string(),
+            dest_path: dest_path.to_string(),
+            offset,
+            bytes: base64::engine::general_purpose::STANDARD.encode(&raw),
+            eof,
+            sha256,
+        };
+        let envelope = cmd
+            .encrypt(&shared.cipher)
+            .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
         if let Err(e) = shared
             .tx
             .send(ClientMessage::Command {
                 request_id: request_id.clone(),
-                target,
+                target: Target::Agent { id: dest_id.to_string() },
                 payload: envelope,
             })
             .await
@@ -764,13 +790,13 @@ async fn send_peer_command(
 
     let (mut ok, mut err) = collect_replies(reply_rx, 1, true).await;
     shared.pending.write().await.remove(&request_id);
-    if let Some((_, result)) = ok.drain(..).next() {
-        return Ok(result);
+    if ok.drain(..).next().is_some() {
+        return Ok(());
     }
     if let Some((_, e)) = err.drain(..).next() {
         bail!("{e}");
     }
-    bail!("transfer chunk timed out")
+    bail!("transfer slice timed out")
 }
 
 /// Start a host↔host file transfer: register progress, best-effort open a direct
@@ -833,16 +859,30 @@ async fn begin_send_file(
                 sec.max_transfer_size = 0;
             }
         }
-        // Each chunk is pushed to the destination over this connection's peer
-        // dispatch (UDP-preferred, WS fallback).
-        let send = |cmd: Command| {
+        // Each slice is pushed to the destination as raw bytes over a direct UDP
+        // channel (no base64), or base64'd into a FileRecv command over the relay.
+        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
             let shared = shared.clone();
             let dest_id = dest_id.clone();
-            async move { send_peer_command(&shared, Target::Agent { id: dest_id }, cmd).await }
+            let dest_session = dest_session_task.clone();
+            let dest_path = dest_path.clone();
+            let tid = tid.clone();
+            async move {
+                send_file_slice(
+                    &shared,
+                    &dest_id,
+                    dest_session.as_deref(),
+                    &tid,
+                    &dest_path,
+                    offset,
+                    raw,
+                    eof,
+                    sha,
+                )
+                .await
+            }
         };
-        let result =
-            crate::transfer::stream_file(&store, &src_path, &dest_path, &tid, &sec, chunk, size, send)
-                .await;
+        let result = crate::transfer::stream_file(&store, &src_path, &tid, &sec, chunk, size, send).await;
         match result {
             Ok(()) => store.done(&tid),
             Err(e) => store.fail(&tid, e.to_string()),
@@ -892,6 +932,37 @@ async fn handle_controller_udp_inbound(
             let aid = agent_id_of(agents, peer_session).await;
             if let Some(s) = pending.read().await.get(&request_id) {
                 let _ = s.send((aid, Err(error)));
+            }
+        }
+        // Binary bulk file slice addressed to us (we're the destination). Decrypt
+        // raw bytes, write at offset, ack over the same channel.
+        UdpFrame::FileData { request_id, transfer_id: _, dest_path, offset, eof, sha256, data } => {
+            let Some(state) = executor else {
+                return;
+            };
+            let error = match cipher.decrypt_bytes(&data) {
+                Ok(raw) => crate::executor::recv_file_chunk_raw(
+                    state, &dest_path, offset, raw, eof, sha256.as_deref(), true,
+                )
+                .await
+                .err()
+                .map(|e| e.to_string()),
+                Err(e) => Some(format!("decrypt slice: {e}")),
+            };
+            let frame = UdpFrame::FileAck { request_id, error };
+            let _ = udp.send_via_udp(peer_session, &frame.to_bytes()).await;
+        }
+        // Ack for a slice WE sourced — resolve the waiting send_file_slice.
+        UdpFrame::FileAck { request_id, error } => {
+            let aid = agent_id_of(agents, peer_session).await;
+            if let Some(s) = pending.read().await.get(&request_id) {
+                let _ = s.send((
+                    aid,
+                    match error {
+                        Some(e) => Err(e),
+                        None => Ok(CommandResult::Ok),
+                    },
+                ));
             }
         }
         UdpFrame::Command { request_id, payload, .. } => {
@@ -971,8 +1042,8 @@ async fn spawn_udp_dial(udp: &Arc<UdpTransport>, session: String, name: String) 
     });
 }
 
-async fn handle_message(text: &str, shared: &HandlerShared) -> Result<()> {
-    let msg: ServerMessage = ServerMessage::from_json(text)?;
+async fn handle_message(bytes: &[u8], shared: &HandlerShared) -> Result<()> {
+    let msg: ServerMessage = ServerMessage::from_proto_bytes(bytes)?;
 
     match msg {
         ServerMessage::AgentList { agents: new_agents } => {
@@ -1460,13 +1531,14 @@ mod tests {
         (shared, rx, cipher)
     }
 
-    fn command_msg(cipher: &Cipher, request_id: &str) -> String {
+    fn command_msg(cipher: &Cipher, request_id: &str) -> Vec<u8> {
         let payload = Command::GetInfo.encrypt(cipher).unwrap();
-        serde_json::to_string(&ServerMessage::Command {
+        ServerMessage::Command {
             request_id: request_id.to_string(),
             from_session: "peer".to_string(),
             payload,
-        })
+        }
+        .to_proto_bytes()
         .unwrap()
     }
 
@@ -1490,13 +1562,13 @@ mod tests {
         let (shared, _rx, _w, _e) = handler_shared();
 
         let a = agent("x", Some("s1")); // id = "id-x"
-        let text = serde_json::to_string(&ServerMessage::AgentJoined { agent: Box::new(a) }).unwrap();
+        let text = ServerMessage::AgentJoined { agent: Box::new(a) }.to_proto_bytes().unwrap();
         handle_message(&text, &shared).await.unwrap();
 
         // A re-announce / second connection with the SAME id must not duplicate.
         let mut a2 = agent("x", Some("s2"));
         a2.name = "x-renamed".into();
-        let text2 = serde_json::to_string(&ServerMessage::AgentJoined { agent: Box::new(a2) }).unwrap();
+        let text2 = ServerMessage::AgentJoined { agent: Box::new(a2) }.to_proto_bytes().unwrap();
         handle_message(&text2, &shared).await.unwrap();
 
         let list = shared.agents.read().await;

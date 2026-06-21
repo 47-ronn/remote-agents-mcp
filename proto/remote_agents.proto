@@ -1,0 +1,559 @@
+syntax = "proto3";
+
+// Single source of truth for the remote-agents wire protocol. Rust types are
+// generated via prost (see crates/shared/build.rs); the worker + fleet-chat
+// panel generate from this same file via ts-proto. This file replaces the three
+// hand-mirrored copies that used to drift (Rust serde / worker TS / panel TS).
+//
+// Transport: this schema is encoded with protobuf binary on both relays' WS
+// frames and on the UDP control path. End-to-end-encrypted command/result
+// payloads and bulk file slices ride as opaque `bytes` (the relay forwards them
+// blind); only routing metadata travels in the clear.
+package remote_agents.v1;
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+// Agent operation mode — what the host will execute. Wire values match the
+// domain `AgentMode` order so conversion is a 1:1 cast.
+enum AgentMode {
+  AGENT_MODE_PLAN = 0;     // read-only (default)
+  AGENT_MODE_EDIT = 1;     // writes with automatic backup
+  AGENT_MODE_BYPASS = 2;   // unrestricted
+  AGENT_MODE_DISABLED = 3; // no operations allowed
+}
+
+enum SearchKind {
+  SEARCH_KIND_NAME = 0;
+  SEARCH_KIND_CONTENT = 1;
+  SEARCH_KIND_IMAGE = 2;
+}
+
+enum TransferState {
+  TRANSFER_STATE_QUEUED = 0;
+  TRANSFER_STATE_RUNNING = 1;
+  TRANSFER_STATE_DONE = 2;
+  TRANSFER_STATE_FAILED = 3;
+}
+
+enum TaskStatus {
+  TASK_STATUS_QUEUED = 0;
+  TASK_STATUS_RUNNING = 1;
+  TASK_STATUS_DONE = 2;
+  TASK_STATUS_FAILED = 3;
+}
+
+// ============================================================================
+// Supporting structs
+// ============================================================================
+
+message PlatformInfo {
+  string family = 1;
+  string arch = 2;
+  optional string distro = 3;
+  optional string kernel = 4;
+  optional string shell = 5;
+}
+
+message AgentInfo {
+  string id = 1;
+  string name = 2;
+  AgentMode mode = 3;
+  string os = 4;
+  string arch = 5;
+  string hostname = 6;
+  repeated string tags = 7;
+  PlatformInfo platform = 8;
+  bool autonomous = 9;
+  bool accepts_commands = 10;
+  uint64 connected_at = 11;
+  string version = 12;
+  optional string session_id = 13;
+  optional string update_available = 14;
+  optional uint32 connections = 15;
+}
+
+message SessionMeta {
+  string provider = 1;
+  string id = 2;
+  string title = 3;
+  uint64 updated = 4;
+  optional string cwd = 5;
+  bool resumable = 6;
+}
+
+message SessionMessage {
+  string role = 1;
+  string text = 2;
+  optional uint64 ts = 3;
+}
+
+message FileMeta {
+  string path = 1;
+  uint64 size = 2;
+  optional uint64 modified = 3;
+  string mime = 4;
+  bool is_image = 5;
+}
+
+message TransferStatus {
+  string id = 1;
+  TransferState state = 2;
+  uint64 bytes = 3;
+  uint64 total = 4;
+  optional string error = 5;
+}
+
+message TunnelInfo {
+  string id = 1;
+  string target = 2;
+  string public_url = 3;
+  string status = 4;
+}
+
+message AutonomousTask {
+  string id = 1;
+  optional string initiator = 2;
+  string prompt = 3;
+  TaskStatus status = 4;
+  optional string result = 5;
+  optional string error = 6;
+  uint64 created_at = 7;
+  optional uint64 started_at = 8;
+  optional uint64 finished_at = 9;
+  optional int32 exit_code = 10;
+}
+
+message DirEntry {
+  string name = 1;
+  bool is_dir = 2;
+  uint64 size = 3;
+  optional uint64 modified = 4;
+}
+
+message ScheduledTask {
+  string name = 1;
+  string cron = 2;
+  string command = 3;
+  optional uint64 last_run = 4;
+  uint64 run_count = 5;
+}
+
+message GitStatus {
+  string branch = 1;
+  bool clean = 2;
+  uint32 ahead = 3;
+  uint32 behind = 4;
+  repeated string staged = 5;
+  repeated string modified = 6;
+  repeated string untracked = 7;
+}
+
+// Command routing target.
+message Target {
+  message Agent { string id = 1; }
+  message All {}
+  message Tagged { repeated string tags = 1; }
+  message Platform { string family = 1; }
+  oneof kind {
+    Agent agent = 1;
+    All all = 2;
+    Tagged tagged = 3;
+    Platform platform = 4;
+  }
+}
+
+// Unsolicited event pushed from an agent to observers.
+message AgentEvent {
+  message TaskCompleted {
+    string task_id = 1;
+    TaskStatus status = 2;
+  }
+  oneof kind {
+    TaskCompleted task_completed = 1;
+  }
+}
+
+// ============================================================================
+// UDP signaling
+// ============================================================================
+
+message Endpoint {
+  // IP rendered as a string (IPv4 or IPv6); matches the domain `IpAddr`.
+  string addr = 1;
+  uint32 port = 2; // u16 on the domain side
+}
+
+message UdpOffer {
+  string channel_id = 1;
+  string from_session = 2;
+  string to_session = 3;
+  Endpoint local_endpoint = 4;
+  repeated Endpoint local_candidates = 5;
+  optional Endpoint public_endpoint = 6;
+  bytes nonce = 7; // 16 bytes
+}
+
+message UdpAnswer {
+  string channel_id = 1;
+  string from_session = 2;
+  Endpoint local_endpoint = 3;
+  repeated Endpoint local_candidates = 4;
+  optional Endpoint public_endpoint = 5;
+  bytes nonce = 6; // 16 bytes
+  bool accepted = 7;
+}
+
+message UdpChannelResult {
+  string channel_id = 1;
+  bool success = 2;
+  optional string error = 3;
+}
+
+// ============================================================================
+// Command (encrypted payload body — opaque `bytes` on the envelope)
+// ============================================================================
+
+message Command {
+  message Exec {
+    string command = 1;
+    optional uint64 timeout_ms = 2;
+    optional string cwd = 3;
+  }
+  message ReadFile { string path = 1; }
+  message WriteFile {
+    string path = 1;
+    string content = 2;
+    bool create_backup = 3; // domain default: true
+  }
+  message ListDir {
+    string path = 1;
+    optional string pattern = 2;
+  }
+  message GitStatusCmd { string repo = 1; }
+  message GitPull {
+    string repo = 1;
+    string remote = 2; // domain default: "origin"
+    optional string branch = 3;
+  }
+  message GitCommit {
+    string repo = 1;
+    string message = 2;
+    repeated string files = 3;
+  }
+  message GitPush {
+    string repo = 1;
+    string remote = 2; // domain default: "origin"
+    optional string branch = 3;
+  }
+  message ScheduleAdd {
+    string name = 1;
+    string cron = 2;
+    string command = 3;
+  }
+  message ScheduleRemove { string name = 1; }
+  message ScheduleList {}
+  message TaskDispatch {
+    string prompt = 1;
+    optional string initiator = 2;
+  }
+  message TaskGet { string id = 1; }
+  message TaskList {}
+  message SessionList {}
+  message SessionGet {
+    string provider = 1;
+    string id = 2;
+  }
+  message SessionResume {
+    string provider = 1;
+    string id = 2;
+    string prompt = 3;
+  }
+  message SessionTerminate { string id = 1; }
+  message FileStat { string path = 1; }
+  message FileChunk {
+    string path = 1;
+    uint64 offset = 2;
+    uint64 len = 3;
+  }
+  message FileThumb {
+    string path = 1;
+    uint32 max_px = 2;
+  }
+  message FileSearch {
+    repeated string roots = 1;
+    string query = 2;
+    SearchKind kind = 3;
+  }
+  message SendFileTo {
+    string src_path = 1;
+    string dest_id = 2;
+    string dest_path = 3;
+  }
+  message FileRecv {
+    string transfer_id = 1;
+    string dest_path = 2;
+    uint64 offset = 3;
+    bytes bytes = 4; // raw slice bytes (no base64 on the binary path)
+    bool eof = 5;
+    optional string sha256 = 6;
+  }
+  message TransferGet { string id = 1; }
+  message TunnelStart { string target = 1; }
+  message TunnelList {}
+  message TunnelStop { string id = 1; }
+  message SetMode { AgentMode mode = 1; }
+  message GetInfo {}
+  message MapTask {
+    string job_id = 1;
+    uint32 partition_id = 2;
+    string map_fn = 3;
+    string data = 4;
+  }
+  message ReduceTask {
+    string job_id = 1;
+    string reduce_fn = 2;
+    repeated string inputs = 3;
+  }
+
+  oneof kind {
+    Exec exec = 1;
+    ReadFile read_file = 2;
+    WriteFile write_file = 3;
+    ListDir list_dir = 4;
+    GitStatusCmd git_status = 5;
+    GitPull git_pull = 6;
+    GitCommit git_commit = 7;
+    GitPush git_push = 8;
+    ScheduleAdd schedule_add = 9;
+    ScheduleRemove schedule_remove = 10;
+    ScheduleList schedule_list = 11;
+    TaskDispatch task_dispatch = 12;
+    TaskGet task_get = 13;
+    TaskList task_list = 14;
+    SessionList session_list = 15;
+    SessionGet session_get = 16;
+    SessionResume session_resume = 17;
+    SessionTerminate session_terminate = 18;
+    FileStat file_stat = 19;
+    FileChunk file_chunk = 20;
+    FileThumb file_thumb = 21;
+    FileSearch file_search = 22;
+    SendFileTo send_file_to = 23;
+    FileRecv file_recv = 24;
+    TransferGet transfer_get = 25;
+    TunnelStart tunnel_start = 26;
+    TunnelList tunnel_list = 27;
+    TunnelStop tunnel_stop = 28;
+    SetMode set_mode = 29;
+    GetInfo get_info = 30;
+    MapTask map_task = 31;
+    ReduceTask reduce_task = 32;
+  }
+}
+
+// ============================================================================
+// CommandResult (encrypted payload body — opaque `bytes` on the envelope)
+// ============================================================================
+
+message CommandResult {
+  message Exec {
+    string stdout = 1;
+    string stderr = 2;
+    int32 exit_code = 3;
+    optional uint64 duration_ms = 4;
+    optional bool timed_out = 5;
+  }
+  message File {
+    string content = 1;
+    uint64 size = 2;
+  }
+  message Dir { repeated DirEntry entries = 1; }
+  message GitStatusResult { GitStatus status = 1; }
+  message Git {
+    string output = 1;
+    bool success = 2;
+  }
+  message Info { AgentInfo info = 1; }
+  message Mode { AgentMode mode = 1; }
+  message Schedule { repeated ScheduledTask tasks = 1; }
+  message TaskQueued { string id = 1; }
+  message Task { AutonomousTask task = 1; }
+  message TaskListResult { repeated AutonomousTask tasks = 1; }
+  message FileMetaResult { FileMeta meta = 1; }
+  message FileChunk {
+    bytes data = 1; // raw slice bytes
+    bool eof = 2;
+  }
+  message FileThumb {
+    bytes data = 1; // raw JPEG bytes
+    uint32 w = 2;
+    uint32 h = 3;
+  }
+  message FileSearchResult { repeated FileMeta hits = 1; }
+  message TransferQueued { string id = 1; }
+  message Transfer { TransferStatus status = 1; }
+  message TunnelStarted { TunnelInfo tunnel = 1; }
+  message TunnelListResult { repeated TunnelInfo tunnels = 1; }
+  message SessionListResult {
+    repeated SessionMeta sessions = 1;
+    repeated string active = 2;
+  }
+  message SessionTranscript { repeated SessionMessage messages = 1; }
+  message MapResult {
+    string job_id = 1;
+    uint32 partition_id = 2;
+    string output = 3;
+    bool success = 4;
+    optional string error = 5;
+  }
+  message ReduceResult {
+    string job_id = 1;
+    string output = 2;
+    bool success = 3;
+    optional string error = 4;
+  }
+  message Ok {}
+
+  oneof kind {
+    Exec exec = 1;
+    File file = 2;
+    Dir dir = 3;
+    GitStatusResult git_status = 4;
+    Git git = 5;
+    Info info = 6;
+    Mode mode = 7;
+    Schedule schedule = 8;
+    TaskQueued task_queued = 9;
+    Task task = 10;
+    TaskListResult task_list = 11;
+    FileMetaResult file_meta = 12;
+    FileChunk file_chunk = 13;
+    FileThumb file_thumb = 14;
+    FileSearchResult file_search = 15;
+    TransferQueued transfer_queued = 16;
+    Transfer transfer = 17;
+    TunnelStarted tunnel_started = 18;
+    TunnelListResult tunnel_list = 19;
+    SessionListResult session_list = 20;
+    SessionTranscript session_transcript = 21;
+    MapResult map_result = 22;
+    ReduceResult reduce_result = 23;
+    Ok ok = 24;
+  }
+}
+
+// ============================================================================
+// Client -> Relay envelope
+// ============================================================================
+
+message ClientMessage {
+  message Auth {
+    string room = 1;
+    string token = 2;
+    optional AgentInfo agent_info = 3;
+  }
+  message ListAgents {}
+  message Command {
+    string request_id = 1;
+    Target target = 2;
+    bytes payload = 3; // encrypted Command envelope (opaque to relay)
+  }
+  message CommandResult {
+    string request_id = 1;
+    bytes result = 2; // encrypted CommandResult envelope
+  }
+  message CommandError {
+    string request_id = 1;
+    string error = 2;
+  }
+  message Notify { AgentEvent event = 1; }
+  message Ping {}
+  message Close {}
+  message UpdateAgent { AgentInfo agent_info = 1; }
+
+  oneof kind {
+    Auth auth = 1;
+    ListAgents list_agents = 2;
+    Command command = 3;
+    CommandResult command_result = 4;
+    CommandError command_error = 5;
+    Notify notify = 6;
+    UdpOffer udp_offer = 7;
+    UdpAnswer udp_answer = 8;
+    UdpChannelResult udp_result = 9;
+    Ping ping = 10;
+    Close close = 11;
+    UpdateAgent update_agent = 12;
+  }
+}
+
+// ============================================================================
+// Relay -> Client envelope
+// ============================================================================
+
+message ServerMessage {
+  message AuthOk { string session_id = 1; }
+  message AuthFailed { string reason = 1; }
+  message AgentList { repeated AgentInfo agents = 1; }
+  message AgentJoined { AgentInfo agent = 1; }
+  message AgentLeft { string agent_id = 1; }
+  message AgentModeChanged {
+    string agent_id = 1;
+    AgentMode mode = 2;
+  }
+  message Command {
+    string request_id = 1;
+    string from_session = 2;
+    bytes payload = 3; // encrypted Command envelope
+  }
+  message CommandResult {
+    string request_id = 1;
+    string agent_id = 2;
+    bytes result = 3; // encrypted CommandResult envelope
+  }
+  message CommandError {
+    string request_id = 1;
+    string agent_id = 2;
+    string error = 3;
+  }
+  message Event {
+    string agent_id = 1;
+    AgentEvent event = 2;
+  }
+  message UdpOffer {
+    string from_session = 1;
+    remote_agents.v1.UdpOffer offer = 2;
+  }
+  message UdpAnswer {
+    string from_session = 1;
+    remote_agents.v1.UdpAnswer answer = 2;
+  }
+  message UdpResult {
+    string from_session = 1;
+    UdpChannelResult result = 2;
+  }
+  message YourEndpoint { Endpoint endpoint = 1; }
+  message Pong {}
+  message Error { string message = 1; }
+
+  oneof kind {
+    AuthOk auth_ok = 1;
+    AuthFailed auth_failed = 2;
+    AgentList agent_list = 3;
+    AgentJoined agent_joined = 4;
+    AgentLeft agent_left = 5;
+    AgentModeChanged agent_mode_changed = 6;
+    Command command = 7;
+    CommandResult command_result = 8;
+    CommandError command_error = 9;
+    Event event = 10;
+    UdpOffer udp_offer = 11;
+    UdpAnswer udp_answer = 12;
+    UdpResult udp_result = 13;
+    YourEndpoint your_endpoint = 14;
+    Pong pong = 15;
+    Error error = 16;
+  }
+}
