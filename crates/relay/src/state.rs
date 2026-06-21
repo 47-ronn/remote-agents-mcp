@@ -15,7 +15,8 @@ pub type Tx = mpsc::Sender<String>;
 
 /// Bound on a connection's outbound queue; a consumer that can't keep up is
 /// disconnected rather than allowed to grow memory unbounded.
-pub const OUTBOUND_CAP: usize = 64;
+/// Increased from 64 to 256 to handle bursts (e.g. multiple UDP offers).
+pub const OUTBOUND_CAP: usize = 256;
 
 pub struct AgentSession {
     pub info: AgentInfo,

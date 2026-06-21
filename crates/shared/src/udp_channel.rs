@@ -111,6 +111,19 @@ mod channel_impl {
             Ok(self.socket.local_addr()?.into())
         }
 
+        /// Discover our public endpoint via STUN.
+        ///
+        /// This should be called before sending an offer to determine our
+        /// public IP and port for NAT traversal.
+        pub async fn discover_public_endpoint(&self) -> Option<Endpoint> {
+            crate::udp::stun_discover(
+                &self.socket,
+                crate::udp::STUN_SERVERS,
+                Duration::from_secs(2),
+            )
+            .await
+        }
+
         /// Get the local nonce for this channel.
         pub fn local_nonce(&self) -> [u8; 16] {
             self.local_nonce
