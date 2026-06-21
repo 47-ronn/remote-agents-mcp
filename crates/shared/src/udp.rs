@@ -538,6 +538,13 @@ pub async fn stun_discover(
 ) -> Option<Endpoint> {
     use tokio::time::timeout as tokio_timeout;
 
+    // Escape hatch: skip live STUN entirely. Used by tests (so they never depend
+    // on external STUN servers — a source of CI flakiness/timeouts) and by
+    // same-LAN deployments where the relay-reflected endpoint is preferred.
+    if std::env::var_os("REMOTE_AGENTS_NO_STUN").is_some() {
+        return None;
+    }
+
     for server in servers {
         // Resolve server address
         let addr: std::net::SocketAddr = match tokio::net::lookup_host(server).await {

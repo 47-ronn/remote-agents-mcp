@@ -462,16 +462,11 @@ mod tests {
     /// (iter42) and the inbound recv wiring (iter39) end-to-end. Loopback is
     /// made reachable by simulating YourEndpoint reflecting 127.0.0.1.
     #[tokio::test]
-    // This test requires a network environment where STUN either fails (timeout)
-    // or returns loopback-reachable addresses. When STUN succeeds and returns
-    // a public IP (e.g. behind NAT), hole-punching between two local transports
-    // fails because they try to reach each other via the public IP which doesn't
-    // work for loopback connections (NAT hairpinning issue).
-    // 
-    // The test is ignored by default; run with `cargo test -- --ignored` on a
-    // machine where STUN is blocked or returns loopback IPs.
-    #[ignore = "requires STUN to fail or return loopback addresses"]
     async fn two_transports_exchange_data_over_udp() {
+        // Hermetic: skip live STUN so both ends advertise loopback-reachable
+        // endpoints. With live STUN a public IP would be advertised that can't
+        // be reached over loopback (hairpinning), and the punch would never land.
+        std::env::set_var("REMOTE_AGENTS_NO_STUN", "1");
         let cipher = Cipher::from_passphrase("udp-integ-key");
         let (a_sig, mut a_sig_rx) = mpsc::channel(16);
         let (a_in, _a_in_rx) = mpsc::channel(16);
