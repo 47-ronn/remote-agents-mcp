@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    reflexive_endpoint, ChannelState, Cipher, Endpoint, UdpAnswer, UdpChannel, UdpChannelResult,
+    candidate_addrs, reflexive_endpoint, ChannelState, Cipher, Endpoint, UdpAnswer, UdpChannel, UdpChannelResult,
     UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
@@ -178,12 +178,15 @@ impl UdpTransport {
             }
         };
 
-        // Set peer endpoint - prefer public if available
-        let peer_endpoint = offer
-            .public_endpoint
-            .unwrap_or(offer.local_endpoint)
-            .to_socket_addr();
-        channel.set_peer(peer_endpoint, offer.nonce).await;
+        // Provide BOTH candidate endpoints (local + public); punch_hole probes
+        // each and locks onto the reachable one (local for same-host/LAN peers,
+        // public across NATs) instead of guessing public-only.
+        channel
+            .set_peer_candidates(
+                candidate_addrs(offer.local_endpoint, offer.public_endpoint),
+                offer.nonce,
+            )
+            .await;
 
         let answer = UdpAnswer {
             channel_id: offer.channel_id.clone(),
@@ -234,11 +237,12 @@ impl UdpTransport {
             .ok_or_else(|| anyhow::anyhow!("No channel for peer {}", answer.from_session))?;
 
         // Set peer endpoint
-        let peer_endpoint = answer
-            .public_endpoint
-            .unwrap_or(answer.local_endpoint)
-            .to_socket_addr();
-        channel.set_peer(peer_endpoint, answer.nonce).await;
+        channel
+            .set_peer_candidates(
+                candidate_addrs(answer.local_endpoint, answer.public_endpoint),
+                answer.nonce,
+            )
+            .await;
 
         // Hole-punch, then start recv/retransmit loops only on success (see
         // handle_offer — avoids racing punch_hole for probe packets).

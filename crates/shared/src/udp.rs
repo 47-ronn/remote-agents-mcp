@@ -68,6 +68,21 @@ pub fn reflexive_endpoint(reflected: Option<Endpoint>, local: Endpoint) -> Optio
     reflected.map(|r| Endpoint::new(r.addr, local.port))
 }
 
+/// Ordered, de-duplicated hole-punch candidate addresses from a peer's signaled
+/// endpoints: the local (private) address first — reachable for same-host/LAN
+/// peers — then the public (reflexive) address for peers behind a different NAT.
+/// `punch_hole` probes every candidate and locks onto whichever answers.
+pub fn candidate_addrs(local: Endpoint, public: Option<Endpoint>) -> Vec<SocketAddr> {
+    let mut v = vec![local.to_socket_addr()];
+    if let Some(p) = public {
+        let pa = p.to_socket_addr();
+        if !v.contains(&pa) {
+            v.push(pa);
+        }
+    }
+    v
+}
+
 impl From<SocketAddr> for Endpoint {
     fn from(addr: SocketAddr) -> Self {
         Self {
