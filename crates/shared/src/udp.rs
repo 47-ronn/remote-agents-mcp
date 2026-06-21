@@ -406,14 +406,16 @@ impl FragmentHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UdpFrame {
-    /// A command for the agent. `payload` is an encrypted [`crate::Command`].
+    /// A command for the agent. `payload` is an encrypted [`crate::Command`]
+    /// envelope (raw bytes, no base64).
     Command {
         request_id: String,
         from_session: String,
-        payload: String,
+        payload: Vec<u8>,
     },
-    /// A command result. `result` is an encrypted [`crate::CommandResult`].
-    Result { request_id: String, result: String },
+    /// A command result. `result` is an encrypted [`crate::CommandResult`]
+    /// envelope (raw bytes, no base64).
+    Result { request_id: String, result: Vec<u8> },
     /// A command error (decrypt/exec failure) for `request_id`.
     Error { request_id: String, error: String },
     /// A bulk file slice over the direct UDP channel. `data` is the RAW encrypted

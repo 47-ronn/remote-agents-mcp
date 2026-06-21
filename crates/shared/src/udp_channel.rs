@@ -18,8 +18,13 @@ mod channel_impl {
     // so the sender never bursts more than the path + (small, non-root) receive
     // buffer can absorb, which is the main throughput limiter without big buffers.
     const MIN_CWND: usize = 4;
-    const INIT_CWND: usize = 16;
-    const MAX_CWND: usize = 256;
+    const INIT_CWND: usize = 32;
+    // Sender-side cap on in-flight packets. 4096 * ~1.2 KB ≈ 5 MB, which fits the
+    // 8 MiB SO_RCVBUF the receiver requests (honored when root/CAP_NET_ADMIN or on
+    // Windows). On a high-BDP WAN (e.g. 70 MB/s × 85 ms ≈ 6 MB) the old 256 cap
+    // (~307 KB) throttled to ~3.6 MB/s regardless of link speed; AIMD still halves
+    // on loss, so a non-root receiver with a small buffer self-limits below this.
+    const MAX_CWND: usize = 4096;
     /// Acks this far past an unacked packet imply it was lost → fast-retransmit.
     const DUPACK_THRESHOLD: u32 = 3;
     const RTO_FLOOR_MS: f64 = 50.0;
@@ -374,12 +379,13 @@ mod channel_impl {
                 .await
                 .ok_or(UdpChannelError::Closed)?;
 
-            // Encrypt payload
+            // Encrypt payload as raw bytes — no base64 on the wire (saves ~33%
+            // inflation + the per-packet base64 alloc/CPU on the data hot path).
             let encrypted = self
                 .cipher
-                .encrypt(data)
+                .encrypt_bytes(data)
                 .map_err(|_| UdpChannelError::Crypto)?;
-            let encrypted_bytes = encrypted.as_bytes();
+            let encrypted_bytes = encrypted.as_slice();
 
             // Small payloads go as a single Data packet (the common case).
             if encrypted_bytes.len() <= UDP_MAX_PAYLOAD {
@@ -506,12 +512,13 @@ mod channel_impl {
                 .await
                 .ok_or(UdpChannelError::Closed)?;
 
-            // Encrypt payload
+            // Encrypt payload as raw bytes — no base64 on the wire (saves ~33%
+            // inflation + the per-packet base64 alloc/CPU on the data hot path).
             let encrypted = self
                 .cipher
-                .encrypt(data)
+                .encrypt_bytes(data)
                 .map_err(|_| UdpChannelError::Crypto)?;
-            let encrypted_bytes = encrypted.as_bytes();
+            let encrypted_bytes = encrypted.as_slice();
 
             if encrypted_bytes.len() > UDP_MAX_PAYLOAD {
                 return Err(UdpChannelError::InvalidPacket);
@@ -572,11 +579,11 @@ mod channel_impl {
                         ack.write(&mut ack_buf);
                         let _ = self.socket.send_to(&ack_buf, from).await;
 
-                        // Decrypt and deliver
+                        // Decrypt and deliver (raw bytes; no base64).
                         if len > UDP_HEADER_SIZE {
-                            let encrypted =
-                                String::from_utf8_lossy(&buf[UDP_HEADER_SIZE..len]).to_string();
-                            if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                            if let Ok(decrypted) =
+                                self.cipher.decrypt_bytes(&buf[UDP_HEADER_SIZE..len])
+                            {
                                 self.adopt_peer(from).await;
                                 let _ = self.recv_tx.send(decrypted).await;
                             }
@@ -601,8 +608,7 @@ mod channel_impl {
                                 r.insert(&buf[UDP_HEADER_SIZE..len])
                             };
                             if let Some(body) = completed {
-                                let encrypted = String::from_utf8_lossy(&body).to_string();
-                                if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                                if let Ok(decrypted) = self.cipher.decrypt_bytes(&body) {
                                     self.adopt_peer(from).await;
                                     let _ = self.recv_tx.send(decrypted).await;
                                 }
@@ -611,11 +617,11 @@ mod channel_impl {
                     }
 
                     UdpPacketType::DataUnreliable => {
-                        // Decrypt and deliver
+                        // Decrypt and deliver (raw bytes; no base64).
                         if len > UDP_HEADER_SIZE {
-                            let encrypted =
-                                String::from_utf8_lossy(&buf[UDP_HEADER_SIZE..len]).to_string();
-                            if let Ok(decrypted) = self.cipher.decrypt(&encrypted) {
+                            if let Ok(decrypted) =
+                                self.cipher.decrypt_bytes(&buf[UDP_HEADER_SIZE..len])
+                            {
                                 self.adopt_peer(from).await;
                                 let _ = self.recv_tx.send(decrypted).await;
                             }

@@ -555,7 +555,7 @@ mod routing_tests {
                 request_id: "req1".into(),
                 target: Target::All,
                 // Valid base64 (the relay round-trips the payload through bytes).
-                payload: "RU5D".into(),
+                payload: b"ENC".to_vec(),
             },
         );
         assert!(flow.is_continue());
@@ -564,7 +564,7 @@ mod routing_tests {
             match next(rx) {
                 Some(ServerMessage::Command { request_id, payload, from_session }) => {
                     assert_eq!(request_id, "req1");
-                    assert_eq!(payload, "RU5D");
+                    assert_eq!(payload, b"ENC");
                     assert_eq!(from_session, "origin-sess");
                 }
                 other => panic!("each agent should receive the Command, got {other:?}"),
@@ -590,7 +590,7 @@ mod routing_tests {
             ClientMessage::Command {
                 request_id: "req2".into(),
                 target: Target::Agent { id: "ghost".into() },
-                payload: "WA==".into(), // valid base64
+                payload: b"X".to_vec(),
             },
         );
 
@@ -619,14 +619,14 @@ mod routing_tests {
             "s-a1",
             &agent,
             &atx,
-            ClientMessage::CommandResult { request_id: "req3".into(), result: "UkVT".into() },
+            ClientMessage::CommandResult { request_id: "req3".into(), result: b"RES".to_vec() },
         );
 
         match next(&mut origin) {
             Some(ServerMessage::CommandResult { request_id, agent_id, result }) => {
                 assert_eq!(request_id, "req3");
                 assert_eq!(agent_id, "agentA");
-                assert_eq!(result, "UkVT");
+                assert_eq!(result, b"RES");
             }
             other => panic!("origin should receive its result, got {other:?}"),
         }

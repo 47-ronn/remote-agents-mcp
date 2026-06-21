@@ -976,11 +976,11 @@ impl TryFrom<crate::ClientMessage> for proto::ClientMessage {
             D::Command { request_id, target, payload } => K::Command(p::Command {
                 request_id,
                 target: Some(target.into()),
-                payload: b64_decode(&payload)?,
+                payload,
             }),
             D::CommandResult { request_id, result } => K::CommandResult(p::CommandResult {
                 request_id,
-                result: b64_decode(&result)?,
+                result,
             }),
             D::CommandError { request_id, error } => {
                 K::CommandError(p::CommandError { request_id, error })
@@ -1016,11 +1016,11 @@ impl TryFrom<proto::ClientMessage> for crate::ClientMessage {
                     .target
                     .ok_or(ConvertError::MissingField("ClientMessage.Command.target"))?
                     .try_into()?,
-                payload: b64_encode(&c.payload),
+                payload: c.payload,
             },
             K::CommandResult(c) => D::CommandResult {
                 request_id: c.request_id,
-                result: b64_encode(&c.result),
+                result: c.result,
             },
             K::CommandError(c) => D::CommandError { request_id: c.request_id, error: c.error },
             K::Notify(n) => D::Notify {
@@ -1072,13 +1072,13 @@ impl TryFrom<crate::ServerMessage> for proto::ServerMessage {
             D::Command { request_id, from_session, payload } => K::Command(p::Command {
                 request_id,
                 from_session,
-                payload: b64_decode(&payload)?,
+                payload,
             }),
             D::CommandResult { request_id, agent_id, result } => {
                 K::CommandResult(p::CommandResult {
                     request_id,
                     agent_id,
-                    result: b64_decode(&result)?,
+                    result,
                 })
             }
             D::CommandError { request_id, agent_id, error } => {
@@ -1130,12 +1130,12 @@ impl TryFrom<proto::ServerMessage> for crate::ServerMessage {
             K::Command(e) => D::Command {
                 request_id: e.request_id,
                 from_session: e.from_session,
-                payload: b64_encode(&e.payload),
+                payload: e.payload,
             },
             K::CommandResult(e) => D::CommandResult {
                 request_id: e.request_id,
                 agent_id: e.agent_id,
-                result: b64_encode(&e.result),
+                result: e.result,
             },
             K::CommandError(e) => {
                 D::CommandError { request_id: e.request_id, agent_id: e.agent_id, error: e.error }
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn client_message_all_variants_roundtrip() {
-        let payload = b64_encode(&[10u8, 20, 30]);
+        let payload = vec![10u8, 20, 30];
         let offer = UdpOffer {
             channel_id: "c".into(),
             from_session: "a".into(),
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn server_message_all_variants_roundtrip() {
-        let payload = b64_encode(&[1u8, 2, 3]);
+        let payload = vec![1u8, 2, 3];
         let offer = UdpOffer {
             channel_id: "c".into(),
             from_session: "a".into(),
@@ -1441,8 +1441,16 @@ mod tests {
             nonce: vec![0u8; 4],
         };
         assert_eq!(crate::UdpOffer::try_from(bad).unwrap_err(), ConvertError::BadNonce(4));
-        // bad base64 in an encrypted payload (domain -> proto)
-        let m = ClientMessage::Command { request_id: "r".into(), target: Target::All, payload: "!!!not base64!!!".into() };
-        assert_eq!(proto::ClientMessage::try_from(m).unwrap_err(), ConvertError::BadBase64);
+        // bad base64 in a FileRecv slice (still base64 in the domain; the
+        // command/result ENVELOPE is now raw bytes, no base64 there).
+        let cmd = Command::FileRecv {
+            transfer_id: "t".into(),
+            dest_path: "/d".into(),
+            offset: 0,
+            bytes: "!!!not base64!!!".into(),
+            eof: false,
+            sha256: None,
+        };
+        assert_eq!(proto::Command::try_from(cmd).unwrap_err(), ConvertError::BadBase64);
     }
 }

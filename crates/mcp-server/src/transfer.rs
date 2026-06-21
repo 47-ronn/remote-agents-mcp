@@ -22,7 +22,7 @@ use std::sync::RwLock;
 /// caps throughput at slice/round-trip; a small window overlaps the per-slice
 /// round-trips for a large speedup without bursting so many UDP fragments that
 /// the socket buffers overflow. The final (eof) slice is always sent alone.
-const TRANSFER_WINDOW: usize = 4;
+const TRANSFER_WINDOW: usize = 32;
 
 /// In-memory registry of host↔host transfers this node initiated, polled via
 /// `TransferGet`. Cheap to clone (shared `Arc` in `AgentState`).
