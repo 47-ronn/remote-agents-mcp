@@ -1,4 +1,5 @@
 import type { AgentInfo, ClientMessage, ServerMessage, Target, UdpOffer, UdpAnswer, UdpChannelResult } from './types';
+import { decodeClientMessage, encodeServerMessage } from './wire';
 
 /** Reap a socket after this long with no inbound frame. Agents ping every 30s
  * (PING_INTERVAL in connection.rs), so 90s = three missed pings — a socket
@@ -194,13 +195,14 @@ export class Room implements DurableObject {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
     // Any inbound frame (including the 30s ping) proves the socket is alive.
     this.patchAtt(ws, { lastSeen: Date.now() });
-    if (typeof message !== 'string') {
-      this.sendError(ws, 'Binary messages not supported');
+    // The protocol is protobuf-over-binary; a text frame is an old (JSON) peer.
+    if (typeof message === 'string') {
+      this.sendError(ws, 'Text frames not supported (protocol is binary protobuf)');
       return;
     }
     let msg: ClientMessage;
     try {
-      msg = JSON.parse(message);
+      msg = decodeClientMessage(new Uint8Array(message));
     } catch (e) {
       this.sendError(ws, `Invalid message: ${e}`);
       return;
@@ -520,7 +522,7 @@ export class Room implements DurableObject {
 
   private send(ws: WebSocket, msg: ServerMessage) {
     try {
-      ws.send(JSON.stringify(msg));
+      ws.send(encodeServerMessage(msg));
     } catch (e) {
       console.error('Failed to send message:', e);
     }

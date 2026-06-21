@@ -6,12 +6,20 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "codegen": "buf generate",
+    "codegen:copy": "cp src/gen/remote_agents.ts ../../fleet-chat/src/lib/gen/remote_agents.ts"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.71.0",
     "@cloudflare/workers-types": "^4.20241205.0",
+    "ts-proto": "^2.11.8",
     "typescript": "^5.5.0",
     "vitest": "^4.1.9",
     "wrangler": "^3.99.0"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0"
   }
 }
