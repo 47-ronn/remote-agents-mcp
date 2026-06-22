@@ -256,7 +256,9 @@ pub enum TransferState {
     Failed,
 }
 
-/// Progress of one host↔host file transfer, polled via `TransferGet`.
+/// Progress of one host↔host file transfer, polled via `TransferGet`. The same
+/// status backs a folder sync (`SyncDirTo`), where the file counters track
+/// progress across the changed files and `total`/`bytes` aggregate their sizes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferStatus {
     pub id: String,
@@ -265,8 +267,30 @@ pub struct TransferStatus {
     pub bytes: u64,
     /// Total bytes to transfer.
     pub total: u64,
+    /// Files transferred so far (folder sync); 0 for a single-file transfer.
+    #[serde(default)]
+    pub files_done: u32,
+    /// Total files to transfer (folder sync); 0 for a single-file transfer.
+    #[serde(default)]
+    pub files_total: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One file in a directory manifest, used to diff a source tree against a
+/// destination during a folder sync (`DirManifest` / `SyncDirTo`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// Path relative to the manifest root, with `/` separators.
+    pub rel_path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Last-modified timestamp (Unix ms); 0 if unavailable.
+    pub mtime_ms: u64,
+    /// Lowercase-hex SHA-256, present only when the manifest was built with
+    /// `with_hash` (the `checksum` sync mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// A Cloudflare quick tunnel exposing one of this host's local addresses at a

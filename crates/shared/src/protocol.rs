@@ -278,6 +278,42 @@ pub enum Command {
         id: String,
     },
 
+    /// List every file under a directory (relative paths + size/mtime, plus
+    /// SHA-256 when `with_hash`) for a folder-sync diff. Read-only; the source
+    /// sends this to the destination to learn its current state.
+    DirManifest {
+        path: String,
+        #[serde(default)]
+        with_hash: bool,
+    },
+
+    /// Sync a local directory tree to another host: diff against the
+    /// destination's manifest and transfer only changed/new files. Returns
+    /// immediately with a transfer id; poll progress with `TransferGet`.
+    SyncDirTo {
+        src_path: String,
+        /// Destination peer's agent id.
+        dest_id: String,
+        /// Absolute directory to mirror into on the destination.
+        dest_path: String,
+        /// Delete destination files that are absent from the source.
+        #[serde(default)]
+        delete: bool,
+        /// Compare by SHA-256 instead of the size+mtime quick check.
+        #[serde(default)]
+        checksum: bool,
+        /// Report what would change without transferring anything.
+        #[serde(default)]
+        dry_run: bool,
+    },
+
+    /// Delete the given absolute paths (and prune now-empty parent dirs) on the
+    /// receiver — the destination side of a `SyncDirTo` with `delete`. Requires
+    /// write mode + path allow-list.
+    DeletePaths {
+        paths: Vec<String>,
+    },
+
     // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
     /// Start a Cloudflare quick tunnel to a local address (e.g.
     /// `http://localhost:3000`, or a bare port). Downloads `cloudflared` on
@@ -536,6 +572,13 @@ pub enum CommandResult {
     /// Progress/status of a host↔host transfer (response to `TransferGet`).
     Transfer {
         status: TransferStatus,
+    },
+
+    /// A directory manifest (response to `DirManifest`). `root_exists` is false
+    /// when the path doesn't exist yet (→ the source copies everything).
+    DirManifest {
+        entries: Vec<ManifestEntry>,
+        root_exists: bool,
     },
 
     /// A Cloudflare quick tunnel was started (carries its public URL).
