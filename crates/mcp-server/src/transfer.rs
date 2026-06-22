@@ -41,6 +41,8 @@ impl TransferStore {
                 state: TransferState::Queued,
                 bytes: 0,
                 total,
+                files_done: 0,
+                files_total: 0,
                 error: None,
             },
         );
@@ -51,6 +53,25 @@ impl TransferStore {
         if let Some(t) = self.inner.write().unwrap().get_mut(id) {
             t.state = TransferState::Running;
             t.bytes = bytes;
+        }
+    }
+
+    /// Set the aggregate totals once a folder sync has diffed and knows how many
+    /// files (and bytes) it will transfer.
+    pub fn set_totals(&self, id: &str, total_bytes: u64, files_total: u32) {
+        if let Some(t) = self.inner.write().unwrap().get_mut(id) {
+            t.total = total_bytes;
+            t.files_total = files_total;
+        }
+    }
+
+    /// Mark one file of a folder sync complete and accumulate its bytes (so the
+    /// byte counter keeps climbing across files rather than resetting per file).
+    pub fn file_done(&self, id: &str, file_bytes: u64) {
+        if let Some(t) = self.inner.write().unwrap().get_mut(id) {
+            t.state = TransferState::Running;
+            t.files_done += 1;
+            t.bytes = t.bytes.saturating_add(file_bytes);
         }
     }
 
@@ -116,6 +137,15 @@ pub fn receive_chunk_raw(
         .ok_or_else(|| anyhow::anyhow!("transfer chunk offset overflow ({offset} + {})", bytes.len()))?;
     if sec.max_transfer_size > 0 && end > sec.max_transfer_size {
         bail!("transfer exceeds limit of {} bytes", sec.max_transfer_size);
+    }
+
+    // Create any missing parent directories so nested destination paths work
+    // (folder sync writes whole subtrees; `send_file` to a new nested path too).
+    if let Some(parent) = std::path::Path::new(dest_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dirs for {dest_path}"))?;
+        }
     }
 
     // Order-independent: pipelined transfers deliver slices out of order, so we
@@ -278,6 +308,31 @@ mod tests {
         assert_eq!(d.bytes, 100);
         s.fail("t1", "boom");
         assert_eq!(s.get("t1").unwrap().state, TransferState::Failed);
+    }
+
+    #[test]
+    fn receive_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested destination whose parent dirs don't exist yet (folder sync).
+        let dest = dir.path().join("a/b/c/file.bin");
+        let dest_s = dest.to_string_lossy().into_owned();
+        let data = b"nested write";
+        receive_chunk_raw(&dest_s, 0, data, true, None, &sec()).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[test]
+    fn file_done_accumulates_across_files() {
+        let s = TransferStore::default();
+        s.start("sync", 0);
+        s.set_totals("sync", 300, 3);
+        s.file_done("sync", 100);
+        s.file_done("sync", 100);
+        let p = s.get("sync").unwrap();
+        assert_eq!(p.files_done, 2);
+        assert_eq!(p.files_total, 3);
+        assert_eq!(p.bytes, 200);
+        assert_eq!(p.state, TransferState::Running);
     }
 
     #[test]

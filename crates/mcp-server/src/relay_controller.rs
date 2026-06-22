@@ -7,7 +7,7 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
     AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, Command,
-    CommandResult, ServerMessage, Target, TaskStatus, UdpFrame,
+    CommandResult, ManifestEntry, ServerMessage, Target, TaskStatus, UdpFrame,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -911,6 +911,209 @@ async fn begin_send_file(
     Ok(transfer_id)
 }
 
+/// Send one command to a peer agent over the relay and await its single reply.
+/// Used by the folder-sync source for its small control messages (the manifest
+/// query and the delete batch); the file bytes themselves still take the UDP
+/// fast path via [`send_file_slice`].
+async fn send_peer_command(
+    shared: &HandlerShared,
+    dest_id: &str,
+    cmd: Command,
+) -> Result<CommandResult> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
+    shared.pending.write().await.insert(request_id.clone(), reply_tx);
+
+    let envelope = cmd
+        .encrypt(&shared.cipher)
+        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
+    if let Err(e) = shared
+        .tx
+        .send(ClientMessage::Command {
+            request_id: request_id.clone(),
+            target: Target::Agent { id: dest_id.to_string() },
+            payload: envelope,
+        })
+        .await
+    {
+        shared.pending.write().await.remove(&request_id);
+        return Err(e.into());
+    }
+
+    let (mut ok, mut err) = collect_replies(reply_rx, 1, true).await;
+    shared.pending.write().await.remove(&request_id);
+    if let Some((_, result)) = ok.drain(..).next() {
+        return Ok(result);
+    }
+    if let Some((_, e)) = err.drain(..).next() {
+        bail!("{e}");
+    }
+    bail!("peer command timed out")
+}
+
+/// Join a destination root with a manifest-relative path (which uses `/`).
+fn join_dest(base: &str, rel: &str) -> String {
+    std::path::Path::new(base).join(rel).to_string_lossy().into_owned()
+}
+
+/// Start a host→host folder sync: walk the source tree, then spawn a task that
+/// diffs it against the destination and streams only the changed files (reusing
+/// the per-file transfer engine on one shared UDP channel). Returns the transfer
+/// id immediately; progress is polled with `TransferGet`. Mirrors
+/// [`begin_send_file`].
+#[allow(clippy::too_many_arguments)]
+async fn begin_sync_dir(
+    shared: &HandlerShared,
+    state: &Arc<crate::state::AgentState>,
+    src_path: String,
+    dest_id: String,
+    dest_path: String,
+    delete: bool,
+    checksum: bool,
+    dry_run: bool,
+) -> Result<String> {
+    let sec = state.config.security.clone();
+
+    // Walk + validate the source up front (off the runtime). Errors here (not a
+    // dir, not allowed) surface synchronously to the caller.
+    let src_manifest = {
+        let (sp, sec2) = (src_path.clone(), sec.clone());
+        tokio::task::spawn_blocking(move || crate::files::walk_dir(&sp, checksum, &sec2))
+            .await
+            .map_err(|e| anyhow::anyhow!("walk failed: {e}"))??
+    };
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let store = state.transfers();
+    store.start(&transfer_id, 0);
+
+    // Best-effort: open a direct UDP channel before streaming so files take the
+    // fast path. Failure is fine — slices fall back to the relay.
+    let dest_session = {
+        let agents = shared.agents.read().await;
+        agents
+            .iter()
+            .find(|a| a.id == dest_id)
+            .and_then(|a| a.session_id.clone())
+    };
+    if let Some(session) = &dest_session {
+        if !shared.udp_transport.has_udp_channel(session).await {
+            let _ = shared.udp_transport.offer_channel(session.clone()).await;
+        }
+    }
+
+    let shared = shared.clone();
+    let tid = transfer_id.clone();
+    tokio::spawn(async move {
+        // Give a freshly-offered channel a moment to hole-punch.
+        if dest_session.is_some() {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        let result = run_sync(
+            &shared, &store, &tid, src_path, src_manifest, &dest_id, dest_session, dest_path,
+            delete, checksum, dry_run, sec,
+        )
+        .await;
+        match result {
+            Ok(()) => store.done(&tid),
+            Err(e) => store.fail(&tid, e.to_string()),
+        }
+    });
+
+    Ok(transfer_id)
+}
+
+/// The folder-sync body: query the destination manifest, diff, then stream the
+/// changed files and (optionally) delete the extras. Each file reuses
+/// [`crate::transfer::stream_file`] with a throwaway per-file id, so its internal
+/// byte progress doesn't disturb the folder-level status — we bump that with
+/// `file_done` after each file completes.
+#[allow(clippy::too_many_arguments)]
+async fn run_sync(
+    shared: &HandlerShared,
+    store: &crate::transfer::TransferStore,
+    transfer_id: &str,
+    src_path: String,
+    src_manifest: Vec<ManifestEntry>,
+    dest_id: &str,
+    dest_session: Option<String>,
+    dest_path: String,
+    delete: bool,
+    checksum: bool,
+    dry_run: bool,
+    mut sec: crate::config::SecurityConfig,
+) -> Result<()> {
+    // 1. Ask the destination for its current manifest.
+    let (dest_entries, dest_root_exists) = match send_peer_command(
+        shared,
+        dest_id,
+        Command::DirManifest { path: dest_path.clone(), with_hash: checksum },
+    )
+    .await?
+    {
+        CommandResult::DirManifest { entries, root_exists } => (entries, root_exists),
+        _ => bail!("destination returned an unexpected reply to the manifest request"),
+    };
+
+    // 2. Diff.
+    let opts = crate::sync::SyncOpts { delete, checksum };
+    let plan = crate::sync::diff_manifests(&src_manifest, &dest_entries, dest_root_exists, &opts);
+    let total_bytes: u64 = plan.to_transfer.iter().map(|e| e.size).sum();
+    store.set_totals(transfer_id, total_bytes, plan.to_transfer.len() as u32);
+
+    if dry_run {
+        return Ok(());
+    }
+
+    // 3. Lift the relay size cap when a direct channel is up (peer-to-peer).
+    if let Some(session) = &dest_session {
+        if shared.udp_transport.has_udp_channel(session).await {
+            sec.max_transfer_size = 0;
+        }
+    }
+    let chunk = sec.transfer_chunk_size;
+
+    // 4. Stream each changed file on the shared channel.
+    for entry in &plan.to_transfer {
+        let src_file = join_dest(&src_path, &entry.rel_path);
+        let dest_file = join_dest(&dest_path, &entry.rel_path);
+        let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway: keeps stream_file's progress() a no-op on the folder status
+        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let shared = shared.clone();
+            let dest_session = dest_session.clone();
+            let dest_file = dest_file.clone();
+            let tid = file_tid.clone();
+            async move {
+                send_file_slice(
+                    &shared,
+                    dest_id,
+                    dest_session.as_deref(),
+                    &tid,
+                    &dest_file,
+                    offset,
+                    raw,
+                    eof,
+                    sha,
+                )
+                .await
+            }
+        };
+        crate::transfer::stream_file(store, &src_file, &file_tid, &sec, chunk, entry.size, send)
+            .await
+            .with_context(|| format!("sync file {}", entry.rel_path))?;
+        store.file_done(transfer_id, entry.size);
+    }
+
+    // 5. Delete destination extras (additive default → only when requested).
+    if delete && !plan.to_delete.is_empty() {
+        let paths: Vec<String> =
+            plan.to_delete.iter().map(|rel| join_dest(&dest_path, rel)).collect();
+        send_peer_command(shared, dest_id, Command::DeletePaths { paths }).await?;
+    }
+
+    Ok(())
+}
+
 /// Process one inbound UDP frame received by the controller over a direct
 /// channel: resolve a reply to a command we sent (Result/Error → pending), or
 /// execute a command addressed to us (Command) and reply back over the same
@@ -991,7 +1194,7 @@ async fn handle_controller_udp_inbound(
                 return;
             };
             let outcome: Result<CommandResult> = match Command::decrypt(&payload, cipher) {
-                Ok(Command::SendFileTo { .. }) => {
+                Ok(Command::SendFileTo { .. }) | Ok(Command::SyncDirTo { .. }) => {
                     Err(anyhow::anyhow!("controller does not source transfers over UDP"))
                 }
                 Ok(Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. }) => {
@@ -1153,6 +1356,24 @@ async fn handle_message(bytes: &[u8], shared: &HandlerShared) -> Result<()> {
                 // transfer and reply immediately with its id.
                 Ok(Command::SendFileTo { src_path, dest_path, dest_id }) => {
                     match begin_send_file(shared, state, src_path, dest_id, dest_path).await {
+                        Ok(id) => {
+                            encrypt_result(&shared.cipher, request_id, CommandResult::TransferQueued { id })
+                        }
+                        Err(e) => ClientMessage::CommandError {
+                            request_id,
+                            error: e.to_string(),
+                        },
+                    }
+                }
+                // SyncDirTo, like SendFileTo, sources a transfer and needs the
+                // connection's peer-send primitives — handle it here, returning a
+                // transfer id to poll while the folder syncs in the background.
+                Ok(Command::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run }) => {
+                    match begin_sync_dir(
+                        shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run,
+                    )
+                    .await
+                    {
                         Ok(id) => {
                             encrypt_result(&shared.cipher, request_id, CommandResult::TransferQueued { id })
                         }

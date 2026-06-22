@@ -452,6 +452,8 @@ impl From<crate::TransferStatus> for proto::TransferStatus {
             bytes: t.bytes,
             total: t.total,
             error: t.error,
+            files_done: t.files_done,
+            files_total: t.files_total,
         }
     }
 }
@@ -464,7 +466,30 @@ impl From<proto::TransferStatus> for crate::TransferStatus {
                 .into(),
             bytes: t.bytes,
             total: t.total,
+            files_done: t.files_done,
+            files_total: t.files_total,
             error: t.error,
+        }
+    }
+}
+
+impl From<crate::ManifestEntry> for proto::ManifestEntry {
+    fn from(e: crate::ManifestEntry) -> Self {
+        proto::ManifestEntry {
+            rel_path: e.rel_path,
+            size: e.size,
+            mtime_ms: e.mtime_ms,
+            sha256: e.sha256,
+        }
+    }
+}
+impl From<proto::ManifestEntry> for crate::ManifestEntry {
+    fn from(e: proto::ManifestEntry) -> Self {
+        crate::ManifestEntry {
+            rel_path: e.rel_path,
+            size: e.size,
+            mtime_ms: e.mtime_ms,
+            sha256: e.sha256,
         }
     }
 }
@@ -713,6 +738,20 @@ impl TryFrom<crate::Command> for proto::Command {
                 })
             }
             D::TransferGet { id } => K::TransferGet(p::TransferGet { id }),
+            D::DirManifest { path, with_hash } => {
+                K::DirManifest(p::DirManifest { path, with_hash })
+            }
+            D::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run } => {
+                K::SyncDirTo(p::SyncDirTo {
+                    src_path,
+                    dest_id,
+                    dest_path,
+                    delete,
+                    checksum,
+                    dry_run,
+                })
+            }
+            D::DeletePaths { paths } => K::DeletePaths(p::DeletePaths { paths }),
             D::TunnelStart { target } => K::TunnelStart(p::TunnelStart { target }),
             D::TunnelList => K::TunnelList(p::TunnelList {}),
             D::TunnelStop { id } => K::TunnelStop(p::TunnelStop { id }),
@@ -778,6 +817,16 @@ impl TryFrom<proto::Command> for crate::Command {
                 sha256: e.sha256,
             },
             K::TransferGet(e) => D::TransferGet { id: e.id },
+            K::DirManifest(e) => D::DirManifest { path: e.path, with_hash: e.with_hash },
+            K::SyncDirTo(e) => D::SyncDirTo {
+                src_path: e.src_path,
+                dest_id: e.dest_id,
+                dest_path: e.dest_path,
+                delete: e.delete,
+                checksum: e.checksum,
+                dry_run: e.dry_run,
+            },
+            K::DeletePaths(e) => D::DeletePaths { paths: e.paths },
             K::TunnelStart(e) => D::TunnelStart { target: e.target },
             K::TunnelList(_) => D::TunnelList,
             K::TunnelStop(e) => D::TunnelStop { id: e.id },
@@ -840,6 +889,12 @@ impl TryFrom<crate::CommandResult> for proto::CommandResult {
             }),
             D::TransferQueued { id } => K::TransferQueued(p::TransferQueued { id }),
             D::Transfer { status } => K::Transfer(p::Transfer { status: Some(status.into()) }),
+            D::DirManifest { entries, root_exists } => {
+                K::DirManifest(p::DirManifestResult {
+                    entries: entries.into_iter().map(Into::into).collect(),
+                    root_exists,
+                })
+            }
             D::TunnelStarted { tunnel } => {
                 K::TunnelStarted(p::TunnelStarted { tunnel: Some(tunnel.into()) })
             }
@@ -921,6 +976,10 @@ impl TryFrom<proto::CommandResult> for crate::CommandResult {
                     .status
                     .ok_or(ConvertError::MissingField("CommandResult.Transfer.status"))?
                     .into(),
+            },
+            K::DirManifest(e) => D::DirManifest {
+                entries: e.entries.into_iter().map(Into::into).collect(),
+                root_exists: e.root_exists,
             },
             K::TunnelStarted(e) => D::TunnelStarted {
                 tunnel: e
@@ -1268,6 +1327,16 @@ mod tests {
                 sha256: Some("abc".into()),
             },
             Command::TransferGet { id: "t".into() },
+            Command::DirManifest { path: "/d".into(), with_hash: true },
+            Command::SyncDirTo {
+                src_path: "/s".into(),
+                dest_id: "d".into(),
+                dest_path: "/d".into(),
+                delete: true,
+                checksum: true,
+                dry_run: false,
+            },
+            Command::DeletePaths { paths: vec!["/d/a".into(), "/d/b".into()] },
             Command::TunnelStart { target: "http://localhost:3000".into() },
             Command::TunnelList,
             Command::TunnelStop { id: "t".into() },
@@ -1300,7 +1369,8 @@ mod tests {
             CommandResult::FileThumb { data: b64_encode(&[1u8, 2]), w: 64, h: 48 },
             CommandResult::FileSearch { hits: vec![] },
             CommandResult::TransferQueued { id: "t".into() },
-            CommandResult::Transfer { status: TransferStatus { id: "t".into(), state: TransferState::Running, bytes: 10, total: 100, error: None } },
+            CommandResult::Transfer { status: TransferStatus { id: "t".into(), state: TransferState::Running, bytes: 10, total: 100, files_done: 2, files_total: 5, error: None } },
+            CommandResult::DirManifest { entries: vec![ManifestEntry { rel_path: "a/b.txt".into(), size: 9, mtime_ms: 123, sha256: Some("deadbeef".into()) }], root_exists: true },
             CommandResult::TunnelStarted { tunnel: TunnelInfo { id: "t".into(), target: "x".into(), public_url: "u".into(), status: "running".into() } },
             CommandResult::TunnelList { tunnels: vec![] },
             CommandResult::SessionList { sessions: vec![SessionMeta { provider: "claude".into(), id: "s".into(), title: "t".into(), updated: 1, cwd: None, resumable: true }], active: vec!["s".into()] },

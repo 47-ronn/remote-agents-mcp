@@ -23,6 +23,7 @@ pub mod relay_udp;
 pub mod safety;
 pub mod scheduler;
 pub mod sessions;
+pub mod sync;
 pub mod transfer;
 pub mod tunnel;
 pub mod state;

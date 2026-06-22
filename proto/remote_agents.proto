@@ -103,6 +103,15 @@ message TransferStatus {
   uint64 bytes = 3;
   uint64 total = 4;
   optional string error = 5;
+  uint32 files_done = 6;
+  uint32 files_total = 7;
+}
+
+message ManifestEntry {
+  string rel_path = 1;
+  uint64 size = 2;
+  uint64 mtime_ms = 3;
+  optional string sha256 = 4;
 }
 
 message TunnelInfo {
@@ -300,6 +309,19 @@ message Command {
     optional string sha256 = 6;
   }
   message TransferGet { string id = 1; }
+  message DirManifest {
+    string path = 1;
+    bool with_hash = 2;
+  }
+  message SyncDirTo {
+    string src_path = 1;
+    string dest_id = 2;
+    string dest_path = 3;
+    bool delete = 4;
+    bool checksum = 5;
+    bool dry_run = 6;
+  }
+  message DeletePaths { repeated string paths = 1; }
   message TunnelStart { string target = 1; }
   message TunnelList {}
   message TunnelStop { string id = 1; }
@@ -350,6 +372,9 @@ message Command {
     GetInfo get_info = 30;
     MapTask map_task = 31;
     ReduceTask reduce_task = 32;
+    DirManifest dir_manifest = 33;
+    SyncDirTo sync_dir_to = 34;
+    DeletePaths delete_paths = 35;
   }
 }
 
@@ -394,6 +419,10 @@ message CommandResult {
   message FileSearchResult { repeated FileMeta hits = 1; }
   message TransferQueued { string id = 1; }
   message Transfer { TransferStatus status = 1; }
+  message DirManifestResult {
+    repeated ManifestEntry entries = 1;
+    bool root_exists = 2;
+  }
   message TunnelStarted { TunnelInfo tunnel = 1; }
   message TunnelListResult { repeated TunnelInfo tunnels = 1; }
   message SessionListResult {
@@ -441,6 +470,7 @@ message CommandResult {
     MapResult map_result = 22;
     ReduceResult reduce_result = 23;
     Ok ok = 24;
+    DirManifestResult dir_manifest = 25;
   }
 }
 

@@ -347,6 +347,39 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             bail!("send_file must be issued to a connected peer node")
         }
 
+        // SyncDirTo is likewise intercepted by the relay handler (it sources a
+        // transfer); reaching the executor means no outbound connection.
+        Command::SyncDirTo { .. } => {
+            bail!("sync_dir must be issued to a connected peer node")
+        }
+
+        // Read-only directory manifest for a folder-sync diff (the destination
+        // side of a `SyncDirTo`). A missing root reports `root_exists: false`.
+        Command::DirManifest { path, with_hash } => {
+            let (path, with_hash) = (path.clone(), *with_hash);
+            if !std::path::Path::new(&path).is_dir() {
+                return Ok(CommandResult::DirManifest { entries: vec![], root_exists: false });
+            }
+            let sec = state.config.security.clone();
+            let entries =
+                tokio::task::spawn_blocking(move || crate::files::walk_dir(&path, with_hash, &sec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("dir manifest failed: {e}"))??;
+            Ok(CommandResult::DirManifest { entries, root_exists: true })
+        }
+
+        // Receiver side of a folder-sync `--delete`: remove the given paths.
+        Command::DeletePaths { paths } => {
+            if !mode.allows_write() {
+                bail!("Deleting files requires Edit/Bypass mode (got {:?})", mode);
+            }
+            let (paths, sec) = (paths.clone(), state.config.security.clone());
+            tokio::task::spawn_blocking(move || crate::files::delete_paths(&paths, &sec))
+                .await
+                .map_err(|e| anyhow::anyhow!("delete paths failed: {e}"))??;
+            Ok(CommandResult::Ok)
+        }
+
         // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
         // Starting/stopping exposes a local service to the internet, so require
         // a write-capable mode. Listing is read-only. The work (download +

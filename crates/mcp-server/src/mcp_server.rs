@@ -230,12 +230,26 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
         ),
         make_tool(
             "transfer_get",
-            "Get the progress/status of a host↔host file transfer by id (set agent_id to the source host that initiated it).",
+            "Get the progress/status of a host↔host file transfer by id (set agent_id to the source host that initiated it). For a folder sync this also reports files_done/files_total.",
             json!({
-                "id": {"type": "string", "description": "Transfer id returned by send_file"},
+                "id": {"type": "string", "description": "Transfer id returned by send_file or sync_dir"},
                 "agent_id": {"type": "string", "description": AGENT_ID_DESC}
             }),
             vec!["id"],
+        ),
+        make_tool(
+            "sync_dir",
+            "Sync a directory TREE from one host to another (rsync-like): only changed/new files are transferred over the direct UDP channel (relay fallback), SHA-256 verified. Set agent_id to the SOURCE host where the folder lives; the destination must be in edit/bypass mode. By default it only adds/updates — pass delete:true to also remove destination files absent from the source. checksum:true compares by SHA-256 instead of size+mtime; dry_run:true reports the plan without transferring. Returns a transfer id (poll with transfer_get on the source host; files_done/files_total show progress).",
+            json!({
+                "src_path": {"type": "string", "description": "Source directory on the source host"},
+                "dest_id": {"type": "string", "description": "Agent id of the destination host"},
+                "dest_path": {"type": "string", "description": "Absolute destination directory to mirror into"},
+                "delete": {"type": "boolean", "description": "Delete destination files absent from the source (default false)"},
+                "checksum": {"type": "boolean", "description": "Compare by SHA-256 instead of size+mtime (default false)"},
+                "dry_run": {"type": "boolean", "description": "Report what would change without transferring (default false)"},
+                "agent_id": {"type": "string", "description": "Source host agent id (where the folder lives)"}
+            }),
+            vec!["src_path", "dest_id", "dest_path"],
         ),
 
         // === Cloudflare quick tunnels (expose a local dev port publicly) ===
@@ -585,9 +599,14 @@ impl ServerHandler for McpHandler {
         // Build the command
         let command = self.build_command(tool_name, &args)?;
 
-        // Validate send_file: source (agent_id) must differ from dest_id
-        if tool_name == "send_file" {
-            if let Command::SendFileTo { ref dest_id, .. } = command {
+        // Validate send_file / sync_dir: source (agent_id) must differ from dest_id
+        if tool_name == "send_file" || tool_name == "sync_dir" {
+            let dest = match &command {
+                Command::SendFileTo { dest_id, .. } => Some(dest_id),
+                Command::SyncDirTo { dest_id, .. } => Some(dest_id),
+                _ => None,
+            };
+            if let Some(dest_id) = dest {
                 // If no agent_id, the source is the local node
                 let source_id = agent_id.as_deref().unwrap_or("");
                 // Get local node ID for comparison. NOTE: `self.state` is a
@@ -609,15 +628,15 @@ impl ServerHandler for McpHandler {
         let result = if let Some(ref aid) = agent_id {
             debug!("Routing {} to remote agent {}", tool_name, aid);
             self.remote_command(aid, command).await?
-        } else if tool_name == "send_file" && self.has_relay() {
+        } else if (tool_name == "send_file" || tool_name == "sync_dir") && self.has_relay() {
             // local host → agent: the local executor has no peer-send primitives
-            // (it would bail), so route SendFileTo to our OWN node id. The relay
-            // delivers Target::Agent{self} back to this peer's socket, where the
-            // relay-controller handler runs begin_send_file. Both relays resolve
-            // Agent-targets without excluding the sender, so no relay change is
-            // needed. See docs/ITERATION_LOG.md iter141.
+            // (it would bail), so route SendFileTo/SyncDirTo to our OWN node id.
+            // The relay delivers Target::Agent{self} back to this peer's socket,
+            // where the relay-controller handler runs begin_send_file/begin_sync_dir.
+            // Both relays resolve Agent-targets without excluding the sender, so no
+            // relay change is needed. See docs/ITERATION_LOG.md iter141.
             let own_id = self.state.read().await.config.id.clone();
-            debug!("Routing send_file to own node {} (local host → agent)", own_id);
+            debug!("Routing {} to own node {} (local host → agent)", tool_name, own_id);
             self.remote_command(&own_id, command).await?
         } else {
             debug!("Executing {} locally", tool_name);
@@ -698,6 +717,14 @@ impl McpHandler {
             },
             "transfer_get" => Command::TransferGet {
                 id: get_str_required("id")?,
+            },
+            "sync_dir" => Command::SyncDirTo {
+                src_path: get_str_required("src_path")?,
+                dest_id: get_str_required("dest_id")?,
+                dest_path: get_str_required("dest_path")?,
+                delete: get_bool("delete", false),
+                checksum: get_bool("checksum", false),
+                dry_run: get_bool("dry_run", false),
             },
             "tunnel_start" => Command::TunnelStart {
                 target: get_str_required("target")?,
@@ -1217,6 +1244,9 @@ fn format_result(result: &CommandResult) -> String {
         CommandResult::Transfer { status } => {
             serde_json::to_string_pretty(status).unwrap_or_else(|_| format!("{:?}", status))
         }
+        CommandResult::DirManifest { entries, root_exists } => {
+            format!("{} file(s) (root_exists={})", entries.len(), root_exists)
+        }
         CommandResult::TunnelStarted { tunnel } => format!(
             "Tunnel {} → {}\n{}",
             tunnel.id, tunnel.target, tunnel.public_url
@@ -1512,7 +1542,7 @@ mod tests {
         // Core tools are always present.
         for core in [
             "exec", "read_file", "write_file", "list_dir", "get_info", "set_mode",
-            "file_search", "file_stat", "send_file", "transfer_get",
+            "file_search", "file_stat", "send_file", "transfer_get", "sync_dir",
         ] {
             assert!(local.contains(&core.to_string()), "missing core tool {core}");
         }

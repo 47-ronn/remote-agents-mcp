@@ -25,27 +25,40 @@ over end-to-end-encrypted channels.
   credentials (token-saving orchestration).
 - **Two interchangeable relays** — Cloudflare Workers (Durable Objects) or a
   self-hosted Rust WebSocket relay; switch by changing `relay_url`.
-- **Direct UDP data channel** with hole-punching and WebSocket fallback.
+- **Direct UDP data channel** (QUIC) with hole-punching and WebSocket fallback.
+- **File & folder transfer** host→host over that channel — single files
+  (`send_file`) or rsync-like directory sync (`sync_dir`), SHA-256 verified.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  opencode / Claude Desktop                   │
-│   remote-agent mcp  (Rust binary, MCP stdio server)          │
+│  Any MCP client — Claude Code / Desktop, Cursor, Cline, Roo,   │
+│  Kilo, Windsurf, Zed, opencode, Continue, Goose                │
+│   remote-agent mcp  (Rust binary, MCP stdio server)            │
 └───────────────────────────────┬──────────────────────────────┘
-                                 │ wss:// (CF Worker or self-hosted relay)
+                                 │ wss:// (control + UDP signaling)
                                  ▼
               ┌───────────────────────────────────┐
               │   Relay  (rooms route by token)   │
+              │   CF Worker or self-hosted Rust    │
               └───────────────────────────────────┘
                  ▲              ▲              ▲
                  │ wss          │ wss          │ wss
           ┌──────┴─────┐ ┌──────┴─────┐ ┌──────┴─────┐
           │   Agent    │ │   Agent    │ │   Agent    │
           │ (daemon)   │ │ (daemon)   │ │ (daemon)   │
-          └────────────┘ └────────────┘ └────────────┘
+          └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+                 └─────────────┐│┌─────────────┘
+                          direct UDP / QUIC data channel
+                  (hole-punched peer-to-peer; bulk file & folder
+                   transfer; automatic relay fallback behind NAT)
 ```
+
+Two planes: **control** (commands + results) and UDP **signaling** always go
+through the relay over `wss://` (the relay sees only ciphertext); **bulk data**
+(`send_file` / `sync_dir`) rides a **direct UDP/QUIC channel** hole-punched
+between the two peers, falling back to the relay when NAT blocks the punch.
 
 ## Workspace layout
 
@@ -156,7 +169,7 @@ CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
 # → wss://<your-worker-subdomain>.workers.dev
 ```
 
-### 3. Install as an MCP server for Claude Desktop / opencode
+### 3. Install as an MCP server (Claude, Cursor, Cline, Zed, opencode, …)
 
 After `npm install -g remote-agents`, point your AI host at the same binary in
 `mcp` mode (stdio). The machine joins the room as a full peer (executes commands
@@ -236,6 +249,7 @@ the registered entry.
 | `list_agents` | List agents connected to the relay room |
 | `fleet_exec` / `fleet_read` / `fleet_write` / `fleet_git` / `fleet_search` | Run an operation across the fleet — `target = all \| tag1,tag2 \| os:<family>` |
 | `file_search` / `file_stat` / `send_file` / `transfer_get` | Find files on a host, and move a file host→host (UDP, SHA-256 verified) |
+| `sync_dir` | Sync a directory tree host→host (rsync-like): only changed/new files are sent, with optional `delete`, `checksum`, and `dry_run` |
 | `tunnel_start` / `tunnel_list` / `tunnel_stop` | Expose a host's local port at a public `*.trycloudflare.com` URL via a Cloudflare quick tunnel (`cloudflared` auto-downloaded; Edit/Bypass) |
 | `mapreduce` | Distributed map/reduce over the fleet (shell map/reduce functions) |
 
@@ -259,6 +273,13 @@ channel:
   over the **direct UDP data channel** (a channel is opened on demand, with
   automatic relay fallback), verified end-to-end with SHA-256. Receiving writes
   to disk and requires Edit/Bypass mode on the destination.
+- **Folder sync** (rsync-like): `sync_dir` mirrors a directory tree host→host,
+  transferring **only changed or new files** (size+mtime quick check, or
+  `checksum` for SHA-256 comparison) over the same channel — unchanged files are
+  never re-read or re-sent. Additive by default; pass `delete` to also remove
+  destination files absent from the source, or `dry_run` to preview the plan.
+  Progress (`files_done`/`files_total`) is polled with `transfer_get`. Requires
+  Edit/Bypass on the destination.
 
 The browser panel (`fleet-chat`) exposes all of this: a 📁 Files view to search,
 preview photos in chat, download, and move files between hosts with live

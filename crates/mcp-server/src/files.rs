@@ -9,7 +9,7 @@ use crate::config::SecurityConfig;
 use crate::safety;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use remote_agents_shared::{FileMeta, SearchKind};
+use remote_agents_shared::{FileMeta, ManifestEntry, SearchKind};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -97,6 +97,78 @@ pub fn read_chunk(
     let (buf, eof) = read_chunk_raw(path, offset, len, sec)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok((data, eof))
+}
+
+/// Recursively list every regular file under `root`, relative to `root`, for a
+/// directory manifest (folder sync). Symlinks are not followed (avoids directory
+/// cycles and copying link targets as files). When `with_hash` is set each entry
+/// carries its SHA-256. The root must be an existing directory; path access is
+/// gated like every file op. Blocking — call from `spawn_blocking`.
+pub fn walk_dir(root: &str, with_hash: bool, sec: &SecurityConfig) -> Result<Vec<ManifestEntry>> {
+    safety::check_path_allowed(root, sec)?;
+    let root_path = std::path::Path::new(root);
+    if !root_path.is_dir() {
+        bail!("{root} is not a directory");
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root_path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).with_context(|| format!("read dir {}", dir.display()))?;
+        for entry in rd {
+            let path = entry?.path();
+            // `symlink_metadata` so a symlink is classified as a link (skipped),
+            // not as whatever it points at.
+            let md = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("stat {}", path.display()))?;
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.is_dir() {
+                stack.push(path);
+            } else if md.is_file() {
+                let rel = path
+                    .strip_prefix(root_path)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let sha256 = if with_hash {
+                    Some(crate::transfer::sha256_file(&path.to_string_lossy())?)
+                } else {
+                    None
+                };
+                out.push(ManifestEntry {
+                    rel_path: rel,
+                    size: md.len(),
+                    mtime_ms: modified_ms(&md).unwrap_or(0),
+                    sha256,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the given paths — the destination side of a folder-sync `--delete`.
+/// Each path is access-gated; a missing path is ignored (idempotent). Only files
+/// (and symlinks) are removed — directories are skipped, since the manifest
+/// tracks files. Returns how many were actually removed. Blocking.
+pub fn delete_paths(paths: &[String], sec: &SecurityConfig) -> Result<usize> {
+    let mut removed = 0;
+    for p in paths {
+        safety::check_path_allowed(p, sec)?;
+        match std::fs::symlink_metadata(p) {
+            Ok(md) if md.is_file() || md.file_type().is_symlink() => {
+                std::fs::remove_file(p).with_context(|| format!("remove {p}"))?;
+                removed += 1;
+            }
+            // A directory isn't a manifest entry — leave it alone.
+            Ok(_) => {}
+            // Already gone — nothing to do.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("stat {p}"))),
+        }
+    }
+    Ok(removed)
 }
 
 /// Produce a downscaled JPEG preview of an image (longest side ≤ `max_px`),
@@ -291,6 +363,63 @@ mod tests {
 
     fn sec() -> SecurityConfig {
         SecurityConfig::default()
+    }
+
+    #[test]
+    fn walk_dir_lists_files_relative_with_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        std::fs::write(dir.path().join("sub/b.txt"), b"hi").unwrap();
+        std::fs::write(dir.path().join("sub/deep/c.bin"), b"xyz!").unwrap();
+
+        let mut entries = walk_dir(&dir.path().to_string_lossy(), false, &sec()).unwrap();
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["a.txt", "sub/b.txt", "sub/deep/c.bin"]);
+        assert_eq!(entries[0].size, 5);
+        assert!(entries.iter().all(|e| e.sha256.is_none())); // no hashing requested
+    }
+
+    #[test]
+    fn walk_dir_with_hash_sets_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let entries = walk_dir(&dir.path().to_string_lossy(), true, &sec()).unwrap();
+        // SHA-256("hello")
+        assert_eq!(
+            entries[0].sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+    }
+
+    #[test]
+    fn walk_dir_errors_on_missing_or_nondir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        assert!(walk_dir(&missing.to_string_lossy(), false, &sec()).is_err());
+    }
+
+    #[test]
+    fn delete_paths_removes_files_and_ignores_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        let gone = dir.path().join("already-gone.txt");
+
+        let removed = delete_paths(
+            &[
+                a.to_string_lossy().into_owned(),
+                gone.to_string_lossy().into_owned(),
+            ],
+            &sec(),
+        )
+        .unwrap();
+        assert_eq!(removed, 1); // only `a` existed
+        assert!(!a.exists());
+        assert!(b.exists()); // untouched
     }
 
     #[test]
