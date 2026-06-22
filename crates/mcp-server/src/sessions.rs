@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Cap per provider so a huge history doesn't blow up the list.
-const MAX_PER_PROVIDER: usize = 60;
+const MAX_PER_PROVIDER: usize = 200;
 /// Re-scan no more often than this (the list is polled by the panel).
 const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Bound on a provider CLI call.
@@ -295,9 +295,13 @@ fn claude_transcript(id: &str) -> Result<Vec<SessionMessage>> {
 // --- opencode (CLI) ---------------------------------------------------------
 
 fn opencode_sessions() -> Vec<SessionMeta> {
-    let Some(out) = run_cli(
+    // `opencode session list` is scoped to the CWD's project, so run it from
+    // HOME to get the global session list (the agent's own working directory
+    // would otherwise expose only that one project's handful of sessions).
+    let limit = MAX_PER_PROVIDER.to_string();
+    let Some(out) = run_cli_home(
         "opencode",
-        &["session", "list", "--format", "json", "-n", "60"],
+        &["session", "list", "--format", "json", "-n", &limit],
     ) else {
         return vec![];
     };
@@ -327,7 +331,7 @@ fn opencode_sessions() -> Vec<SessionMeta> {
 }
 
 fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
-    let out = run_cli("opencode", &["export", id]).context("opencode export failed")?;
+    let out = run_cli_home("opencode", &["export", id]).context("opencode export failed")?;
     let v: serde_json::Value = serde_json::from_str(&out)?;
     let msgs = v.get("messages").and_then(|m| m.as_array());
     Ok(msgs
@@ -752,10 +756,23 @@ fn pid_for_session(id: &str, _ps: &str) -> Option<u32> {
 /// wouldn't load. A regular file gets the complete output every time, and also
 /// avoids the pipe-buffer deadlock (a child blocking mid-write while we wait).
 fn run_cli(program: &str, args: &[&str]) -> Option<String> {
-    run_cli_with_timeout(program, args, CLI_TIMEOUT)
+    run_cli_in(program, args, CLI_TIMEOUT, None)
 }
 
+/// Run a CLI from the user's HOME. Directory-scoped tools — notably
+/// `opencode session list`, which returns only the CWD project's sessions —
+/// then yield their GLOBAL view instead of whatever project directory the agent
+/// happens to be running in (which otherwise hid most sessions).
+fn run_cli_home(program: &str, args: &[&str]) -> Option<String> {
+    run_cli_in(program, args, CLI_TIMEOUT, dirs::home_dir().as_deref())
+}
+
+#[cfg(test)]
 fn run_cli_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    run_cli_in(program, args, timeout, None)
+}
+
+fn run_cli_in(program: &str, args: &[&str], timeout: Duration, cwd: Option<&Path>) -> Option<String> {
     let tmp = std::env::temp_dir().join(format!("ra-cli-{}.out", uuid::Uuid::new_v4()));
     let status = (|| {
         let file = std::fs::File::create(&tmp).ok()?;
@@ -763,6 +780,9 @@ fn run_cli_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Opti
         cmd.args(args)
             .stdout(file)
             .stderr(std::process::Stdio::null());
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
         // Own process group so a timeout SIGKILLs the whole subtree, not just
         // the leader: provider CLIs fork heavy children (`opencode` on Bun,
         // `claude` on node + MCP servers) that would otherwise reparent to init
