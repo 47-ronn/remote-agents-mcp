@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, ChannelState, Cipher, Endpoint,
+    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, Cipher, Endpoint,
     UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
@@ -224,7 +224,7 @@ impl UdpTransport {
         // Hole-punch, then start the recv/retransmit loops — but only AFTER the
         // punch succeeds, so they don't race punch_hole for probe packets on the
         // shared socket (recv_loop would otherwise swallow ProbeAcks).
-        spawn_punch_then_loops(channel, offer.channel_id.clone(), self.signal_tx.clone());
+        spawn_punch_then_loops(channel, offer.channel_id.clone(), self.signal_tx.clone(), true);
 
         Ok(())
     }
@@ -256,7 +256,7 @@ impl UdpTransport {
 
         // Hole-punch, then start recv/retransmit loops only on success (see
         // handle_offer — avoids racing punch_hole for probe packets).
-        spawn_punch_then_loops(channel.clone(), answer.channel_id.clone(), self.signal_tx.clone());
+        spawn_punch_then_loops(channel.clone(), answer.channel_id.clone(), self.signal_tx.clone(), false);
 
         Ok(())
     }
@@ -265,7 +265,7 @@ impl UdpTransport {
     pub async fn has_udp_channel(&self, peer_session: &str) -> bool {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(peer_session) {
-            channel.state().await == ChannelState::Connected
+            channel.is_ready().await
         } else {
             false
         }
@@ -279,7 +279,7 @@ impl UdpTransport {
     pub async fn send_via_udp(&self, peer_session: &str, data: &[u8]) -> Result<bool> {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(peer_session) {
-            if channel.state().await == ChannelState::Connected {
+            if channel.is_ready().await {
                 channel.send_reliable(data).await?;
                 return Ok(true);
             }
@@ -291,7 +291,7 @@ impl UdpTransport {
     pub async fn send_unreliable(&self, peer_session: &str, data: &[u8]) -> Result<bool> {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(peer_session) {
-            if channel.state().await == ChannelState::Connected {
+            if channel.is_ready().await {
                 channel.send_unreliable(data).await?;
                 return Ok(true);
             }
@@ -326,23 +326,32 @@ fn spawn_punch_then_loops(
     channel: Arc<UdpChannel>,
     channel_id: String,
     signal_tx: mpsc::Sender<SignalMessage>,
+    is_server: bool,
 ) {
     tokio::spawn(async move {
         match channel.punch_hole().await {
             Ok(()) => {
                 info!("UDP channel {} established", channel_id);
-                let recv_ch = channel.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = recv_ch.recv_loop().await {
-                        debug!("UDP recv loop ended: {}", e);
+                // Prefer QUIC (quinn over the punched socket); fall back to the
+                // userspace ARQ loops if the QUIC handshake fails.
+                match channel.start_quic(is_server).await {
+                    Ok(()) => info!("UDP channel {} using QUIC", channel_id),
+                    Err(e) => {
+                        warn!("QUIC setup failed for {} ({}); using ARQ", channel_id, e);
+                        let recv_ch = channel.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = recv_ch.recv_loop().await {
+                                debug!("UDP recv loop ended: {}", e);
+                            }
+                        });
+                        let retrans_ch = channel.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = retrans_ch.retransmit_loop().await {
+                                debug!("UDP retransmit loop ended: {}", e);
+                            }
+                        });
                     }
-                });
-                let retrans_ch = channel.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = retrans_ch.retransmit_loop().await {
-                        debug!("UDP retransmit loop ended: {}", e);
-                    }
-                });
+                }
                 let _ = signal_tx
                     .send(SignalMessage::Result(UdpChannelResult {
                         channel_id,
