@@ -97,6 +97,15 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     t.stream_receive_window((128u32 * 1024 * 1024).into());
     t.receive_window((256u32 * 1024 * 1024).into());
     t.send_window(256 * 1024 * 1024);
+    // BBR instead of the default Cubic: on a real WAN path with sporadic loss
+    // Cubic collapses cwnd and crawls (~0.3 MB/s observed vs flying on loopback);
+    // BBR probes bandwidth and ignores non-congestive loss, the standard fix.
+    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Pin a path-safe MTU and skip upward PMTUD probing: probe packets that the
+    // NAT/path drops would otherwise be misread as loss on the hole-punched link.
+    t.initial_mtu(1200);
+    t.min_mtu(1200);
+    t.mtu_discovery_config(None);
     // Keep the NAT mapping warm and detect death.
     t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     t.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
