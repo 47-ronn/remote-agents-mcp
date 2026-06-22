@@ -100,6 +100,15 @@ mod channel_impl {
         /// Smoothed RTT / its variation (ms), for an adaptive RTO (RFC 6298).
         srtt_ms: Mutex<Option<f64>>,
         rttvar_ms: Mutex<f64>,
+        /// QUIC data path (quinn over the punched socket). When `quic_active`,
+        /// `send_reliable`/`send_unreliable` write length-delimited frames to
+        /// `quic_send` and a reader task feeds `recv_tx` — replacing the
+        /// hand-rolled ARQ. Set the moment we commit to QUIC so the ARQ path is
+        /// never used for this channel (the peer is on QUIC too). `quic_conn` is
+        /// held only to keep the connection + endpoint alive.
+        quic_active: std::sync::atomic::AtomicBool,
+        quic_send: Mutex<Option<quinn::SendStream>>,
+        quic_conn: Mutex<Option<crate::quic::QuicConn>>,
     }
 
     impl UdpChannel {
@@ -168,6 +177,9 @@ mod channel_impl {
                 acked: Notify::new(),
                 srtt_ms: Mutex::new(None),
                 rttvar_ms: Mutex::new(0.0),
+                quic_active: std::sync::atomic::AtomicBool::new(false),
+                quic_send: Mutex::new(None),
+                quic_conn: Mutex::new(None),
             };
 
             Ok((channel, recv_rx))
@@ -367,8 +379,118 @@ mod channel_impl {
             }
         }
 
-        /// Send reliable data (will be retransmitted until ACKed).
+        /// Establish QUIC (quinn) over the already-hole-punched socket and route
+        /// data through it instead of the userspace ARQ. `is_server` accepts the
+        /// connection; otherwise connects to the confirmed peer. On success
+        /// `is_ready()` becomes true; on error the channel is left free to fall
+        /// back to the ARQ loops. Call after `punch_hole`, before any reader is
+        /// spawned (so quinn has the socket to itself).
+        pub async fn start_quic(self: &Arc<Self>, is_server: bool) -> Result<(), UdpChannelError> {
+            use std::sync::atomic::Ordering;
+            let peer = (*self.peer_endpoint.read().await)
+                .ok_or_else(|| UdpChannelError::HolePunchFailed("no peer for QUIC".into()))?;
+
+            // Dup the punched socket's fd so quinn owns a handle on the SAME port
+            // / NAT mapping (cross-platform via socket2). No ARQ reader is running
+            // yet, so there's no concurrent reader to steal quinn's packets.
+            let std_sock: std::net::UdpSocket = socket2::SockRef::from(&*self.socket)
+                .try_clone()
+                .map_err(UdpChannelError::Io)?
+                .into();
+            std_sock.set_nonblocking(true).map_err(UdpChannelError::Io)?;
+
+            // Commit to QUIC: from here the ARQ path is never used for this channel.
+            self.quic_active.store(true, Ordering::SeqCst);
+            let unwind = |me: &Arc<Self>| me.quic_active.store(false, Ordering::SeqCst);
+
+            // Bounded so a peer still on the old ARQ build (which never speaks
+            // QUIC) makes us fall back quickly instead of waiting out the idle
+            // timeout. One bidi stream carries length-delimited (encrypted) frames
+            // both ways; the client opens it, the server accepts. A bidi stream is
+            // only observed after the first write, so the client primes it.
+            let setup = async {
+                let conn = if is_server {
+                    crate::quic::QuicConn::accept(std_sock).await
+                } else {
+                    crate::quic::QuicConn::connect(std_sock, peer).await
+                }?;
+                let (send, recv) = if is_server {
+                    conn.conn.accept_bi().await
+                } else {
+                    conn.conn.open_bi().await
+                }
+                .map_err(crate::quic::QuicError::Connection)?;
+                Ok::<_, crate::quic::QuicError>((conn, send, recv))
+            };
+            let (conn, mut send, recv) = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                setup,
+            )
+            .await
+            {
+                Ok(Ok(x)) => x,
+                Ok(Err(e)) => {
+                    unwind(self);
+                    return Err(UdpChannelError::HolePunchFailed(format!("quic: {e}")));
+                }
+                Err(_) => {
+                    unwind(self);
+                    return Err(UdpChannelError::HolePunchFailed("quic handshake timeout".into()));
+                }
+            };
+            if !is_server {
+                let _ = crate::quic::write_msg(&mut send, &[]).await; // prime the stream
+            }
+
+            *self.quic_send.lock().await = Some(send);
+            *self.quic_conn.lock().await = Some(conn);
+            *self.state.write().await = ChannelState::Connected;
+
+            // Reader: decode framed messages, decrypt, deliver to recv_tx — the
+            // same delivery the ARQ recv_loop did. Empty/undecryptable frames
+            // (e.g. the priming frame) are skipped.
+            let me = self.clone();
+            tokio::spawn(async move {
+                let mut recv = recv;
+                // Ends on clean stream finish (Ok(None)) or a connection error.
+                while let Ok(Some(buf)) = crate::quic::read_msg(&mut recv).await {
+                    if let Ok(pt) = me.cipher.decrypt_bytes(&buf) {
+                        if me.recv_tx.send(pt).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                *me.state.write().await = ChannelState::Disconnected;
+            });
+            Ok(())
+        }
+
+        /// Whether the channel is ready to carry data: a live QUIC stream when in
+        /// QUIC mode, otherwise the ARQ `Connected` state. Used to gate
+        /// `send_via_udp` so a half-open QUIC handshake doesn't drop into the ARQ.
+        pub async fn is_ready(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            if self.quic_active.load(Ordering::SeqCst) {
+                *self.state.read().await == ChannelState::Connected
+                    && self.quic_send.lock().await.is_some()
+            } else {
+                *self.state.read().await == ChannelState::Connected
+            }
+        }
+
+        /// Send reliable data (QUIC stream when active; else the ARQ — retransmit
+        /// until ACKed).
         pub async fn send_reliable(&self, data: &[u8]) -> Result<(), UdpChannelError> {
+            use std::sync::atomic::Ordering;
+            if self.quic_active.load(Ordering::SeqCst) {
+                let enc = self.cipher.encrypt_bytes(data).map_err(|_| UdpChannelError::Crypto)?;
+                let mut guard = self.quic_send.lock().await;
+                let send = guard.as_mut().ok_or(UdpChannelError::Closed)?;
+                crate::quic::write_msg(send, &enc)
+                    .await
+                    .map_err(|e| UdpChannelError::HolePunchFailed(format!("quic write: {e}")))?;
+                return Ok(());
+            }
             if *self.state.read().await != ChannelState::Connected {
                 return Err(UdpChannelError::Closed);
             }
@@ -500,8 +622,12 @@ mod channel_impl {
             Ok(())
         }
 
-        /// Send unreliable data (fire and forget).
+        /// Send unreliable data (fire and forget). Over QUIC there's no separate
+        /// unreliable path — it rides the reliable stream (still fast, ordered).
         pub async fn send_unreliable(&self, data: &[u8]) -> Result<(), UdpChannelError> {
+            if self.quic_active.load(std::sync::atomic::Ordering::SeqCst) {
+                return self.send_reliable(data).await;
+            }
             if *self.state.read().await != ChannelState::Connected {
                 return Err(UdpChannelError::Closed);
             }
