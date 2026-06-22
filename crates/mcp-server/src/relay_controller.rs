@@ -165,6 +165,25 @@ impl ConnectionPool {
 
         // Create channels
         let (tx, mut rx) = mpsc::channel::<ClientMessage>(32);
+
+        // Keepalive: the relay reaps a connection idle past its timeout (90s).
+        // Unlike the run-agent, the controller had no proactive ping — so its WS
+        // was reset every ~90s, dropping the MCP session and disrupting any
+        // transfer that ran longer. Ping every 30s (survives reconnects: the tx
+        // is stable, drained by whichever connection is live).
+        {
+            let ping_tx = tx.clone();
+            tokio::spawn(async move {
+                let mut ping = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    ping.tick().await;
+                    if ping_tx.send(ClientMessage::Ping).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         let agents = Arc::new(RwLock::new(Vec::new()));
         let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
         let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
