@@ -312,6 +312,7 @@ message Command {
   message DirManifest {
     string path = 1;
     bool with_hash = 2;
+    repeated string exclude = 3;
   }
   message SyncDirTo {
     string src_path = 1;
@@ -320,6 +321,7 @@ message Command {
     bool delete = 4;
     bool checksum = 5;
     bool dry_run = 6;
+    repeated string exclude = 7;
   }
   message DeletePaths { repeated string paths = 1; }
   message TunnelStart { string target = 1; }

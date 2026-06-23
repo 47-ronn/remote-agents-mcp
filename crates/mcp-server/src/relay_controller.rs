@@ -971,14 +971,16 @@ async fn begin_sync_dir(
     delete: bool,
     checksum: bool,
     dry_run: bool,
+    exclude: Vec<String>,
 ) -> Result<String> {
     let sec = state.config.security.clone();
 
     // Walk + validate the source up front (off the runtime). Errors here (not a
-    // dir, not allowed) surface synchronously to the caller.
+    // dir, not allowed) surface synchronously to the caller. Excluded files/dirs
+    // are pruned here, so they're never offered to the destination.
     let src_manifest = {
-        let (sp, sec2) = (src_path.clone(), sec.clone());
-        tokio::task::spawn_blocking(move || crate::files::walk_dir(&sp, checksum, &sec2))
+        let (sp, sec2, ex) = (src_path.clone(), sec.clone(), exclude.clone());
+        tokio::task::spawn_blocking(move || crate::files::walk_dir(&sp, checksum, &ex, &sec2))
             .await
             .map_err(|e| anyhow::anyhow!("walk failed: {e}"))??
     };
@@ -1011,7 +1013,7 @@ async fn begin_sync_dir(
         }
         let result = run_sync(
             &shared, &store, &tid, src_path, src_manifest, &dest_id, dest_session, dest_path,
-            delete, checksum, dry_run, sec,
+            delete, checksum, dry_run, exclude, sec,
         )
         .await;
         match result {
@@ -1041,13 +1043,16 @@ async fn run_sync(
     delete: bool,
     checksum: bool,
     dry_run: bool,
+    exclude: Vec<String>,
     mut sec: crate::config::SecurityConfig,
 ) -> Result<()> {
-    // 1. Ask the destination for its current manifest.
+    // 1. Ask the destination for its current manifest. Pass the excludes so the
+    //    destination's manifest omits them too — otherwise a `delete` sync would
+    //    see an excluded dest file as "absent from source" and remove it.
     let (dest_entries, dest_root_exists) = match send_peer_command(
         shared,
         dest_id,
-        Command::DirManifest { path: dest_path.clone(), with_hash: checksum },
+        Command::DirManifest { path: dest_path.clone(), with_hash: checksum, exclude },
     )
     .await?
     {
@@ -1368,9 +1373,18 @@ async fn handle_message(bytes: &[u8], shared: &HandlerShared) -> Result<()> {
                 // SyncDirTo, like SendFileTo, sources a transfer and needs the
                 // connection's peer-send primitives — handle it here, returning a
                 // transfer id to poll while the folder syncs in the background.
-                Ok(Command::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run }) => {
+                Ok(Command::SyncDirTo {
+                    src_path,
+                    dest_id,
+                    dest_path,
+                    delete,
+                    checksum,
+                    dry_run,
+                    exclude,
+                }) => {
                     match begin_sync_dir(
                         shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run,
+                        exclude,
                     )
                     .await
                     {

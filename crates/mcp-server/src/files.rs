@@ -102,9 +102,17 @@ pub fn read_chunk(
 /// Recursively list every regular file under `root`, relative to `root`, for a
 /// directory manifest (folder sync). Symlinks are not followed (avoids directory
 /// cycles and copying link targets as files). When `with_hash` is set each entry
-/// carries its SHA-256. The root must be an existing directory; path access is
-/// gated like every file op. Blocking — call from `spawn_blocking`.
-pub fn walk_dir(root: &str, with_hash: bool, sec: &SecurityConfig) -> Result<Vec<ManifestEntry>> {
+/// carries its SHA-256. `exclude` holds gitignore-flavored patterns (see
+/// [`crate::exclude`]): matching files are skipped and matching directories are
+/// pruned before descending, so their contents are never read or hashed. The
+/// root must be an existing directory; path access is gated like every file op.
+/// Blocking — call from `spawn_blocking`.
+pub fn walk_dir(
+    root: &str,
+    with_hash: bool,
+    exclude: &[String],
+    sec: &SecurityConfig,
+) -> Result<Vec<ManifestEntry>> {
     safety::check_path_allowed(root, sec)?;
     let root_path = std::path::Path::new(root);
     if !root_path.is_dir() {
@@ -123,14 +131,21 @@ pub fn walk_dir(root: &str, with_hash: bool, sec: &SecurityConfig) -> Result<Vec
             if md.file_type().is_symlink() {
                 continue;
             }
+            let rel = path
+                .strip_prefix(root_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if md.is_dir() {
-                stack.push(path);
+                // Prune an excluded directory: don't descend, so nothing under it
+                // is listed (or hashed in `checksum` mode).
+                if !crate::exclude::dir_excluded(&rel, exclude) {
+                    stack.push(path);
+                }
             } else if md.is_file() {
-                let rel = path
-                    .strip_prefix(root_path)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                if crate::exclude::is_excluded(&rel, exclude) {
+                    continue;
+                }
                 let sha256 = if with_hash {
                     Some(crate::transfer::sha256_file(&path.to_string_lossy())?)
                 } else {
@@ -373,7 +388,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/b.txt"), b"hi").unwrap();
         std::fs::write(dir.path().join("sub/deep/c.bin"), b"xyz!").unwrap();
 
-        let mut entries = walk_dir(&dir.path().to_string_lossy(), false, &sec()).unwrap();
+        let mut entries = walk_dir(&dir.path().to_string_lossy(), false, &[], &sec()).unwrap();
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
         assert_eq!(rels, vec!["a.txt", "sub/b.txt", "sub/deep/c.bin"]);
@@ -382,10 +397,28 @@ mod tests {
     }
 
     #[test]
+    fn walk_dir_prunes_excluded_dirs_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), b"fn main(){}").unwrap();
+        std::fs::write(dir.path().join("src/debug.log"), b"noise").unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), b"x").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"y").unwrap();
+
+        let exclude = vec!["node_modules".to_string(), "*.log".to_string()];
+        let mut entries =
+            walk_dir(&dir.path().to_string_lossy(), false, &exclude, &sec()).unwrap();
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["keep.txt", "src/main.rs"]);
+    }
+
+    #[test]
     fn walk_dir_with_hash_sets_sha256() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
-        let entries = walk_dir(&dir.path().to_string_lossy(), true, &sec()).unwrap();
+        let entries = walk_dir(&dir.path().to_string_lossy(), true, &[], &sec()).unwrap();
         // SHA-256("hello")
         assert_eq!(
             entries[0].sha256.as_deref(),
@@ -397,7 +430,7 @@ mod tests {
     fn walk_dir_errors_on_missing_or_nondir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert!(walk_dir(&missing.to_string_lossy(), false, &sec()).is_err());
+        assert!(walk_dir(&missing.to_string_lossy(), false, &[], &sec()).is_err());
     }
 
     #[test]
