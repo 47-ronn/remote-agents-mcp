@@ -7,7 +7,7 @@
 //!
 //! Usage:
 //!   sync_probe <relay> <room> <token> <src_id> <dest_id> <src_path> <dest_path> \
-//!              [delete] [checksum] [dry_run]
+//!              [delete] [checksum] [dry_run] [exclude_csv]
 
 use std::time::Duration;
 
@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
     let (src_path, dest_path) = (a[6].clone(), a[7].clone());
     let flag = |i: usize| a.get(i).map(|s| s == "true").unwrap_or(false);
     let (delete, checksum, dry_run) = (flag(8), flag(9), flag(10));
+    let exclude: Vec<String> = a
+        .get(11)
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
 
     let api = McpServer::new();
     api.join_room(relay, room, token, None, None, None).await?;
@@ -46,6 +50,7 @@ async fn main() -> Result<()> {
                 delete,
                 checksum,
                 dry_run,
+                exclude,
             },
         )
         .await?;

@@ -355,16 +355,17 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
 
         // Read-only directory manifest for a folder-sync diff (the destination
         // side of a `SyncDirTo`). A missing root reports `root_exists: false`.
-        Command::DirManifest { path, with_hash } => {
-            let (path, with_hash) = (path.clone(), *with_hash);
+        Command::DirManifest { path, with_hash, exclude } => {
+            let (path, with_hash, exclude) = (path.clone(), *with_hash, exclude.clone());
             if !std::path::Path::new(&path).is_dir() {
                 return Ok(CommandResult::DirManifest { entries: vec![], root_exists: false });
             }
             let sec = state.config.security.clone();
-            let entries =
-                tokio::task::spawn_blocking(move || crate::files::walk_dir(&path, with_hash, &sec))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("dir manifest failed: {e}"))??;
+            let entries = tokio::task::spawn_blocking(move || {
+                crate::files::walk_dir(&path, with_hash, &exclude, &sec)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("dir manifest failed: {e}"))??;
             Ok(CommandResult::DirManifest { entries, root_exists: true })
         }
 

@@ -738,10 +738,10 @@ impl TryFrom<crate::Command> for proto::Command {
                 })
             }
             D::TransferGet { id } => K::TransferGet(p::TransferGet { id }),
-            D::DirManifest { path, with_hash } => {
-                K::DirManifest(p::DirManifest { path, with_hash })
+            D::DirManifest { path, with_hash, exclude } => {
+                K::DirManifest(p::DirManifest { path, with_hash, exclude })
             }
-            D::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run } => {
+            D::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run, exclude } => {
                 K::SyncDirTo(p::SyncDirTo {
                     src_path,
                     dest_id,
@@ -749,6 +749,7 @@ impl TryFrom<crate::Command> for proto::Command {
                     delete,
                     checksum,
                     dry_run,
+                    exclude,
                 })
             }
             D::DeletePaths { paths } => K::DeletePaths(p::DeletePaths { paths }),
@@ -817,7 +818,9 @@ impl TryFrom<proto::Command> for crate::Command {
                 sha256: e.sha256,
             },
             K::TransferGet(e) => D::TransferGet { id: e.id },
-            K::DirManifest(e) => D::DirManifest { path: e.path, with_hash: e.with_hash },
+            K::DirManifest(e) => {
+                D::DirManifest { path: e.path, with_hash: e.with_hash, exclude: e.exclude }
+            }
             K::SyncDirTo(e) => D::SyncDirTo {
                 src_path: e.src_path,
                 dest_id: e.dest_id,
@@ -825,6 +828,7 @@ impl TryFrom<proto::Command> for crate::Command {
                 delete: e.delete,
                 checksum: e.checksum,
                 dry_run: e.dry_run,
+                exclude: e.exclude,
             },
             K::DeletePaths(e) => D::DeletePaths { paths: e.paths },
             K::TunnelStart(e) => D::TunnelStart { target: e.target },
@@ -1327,7 +1331,11 @@ mod tests {
                 sha256: Some("abc".into()),
             },
             Command::TransferGet { id: "t".into() },
-            Command::DirManifest { path: "/d".into(), with_hash: true },
+            Command::DirManifest {
+                path: "/d".into(),
+                with_hash: true,
+                exclude: vec!["*.log".into()],
+            },
             Command::SyncDirTo {
                 src_path: "/s".into(),
                 dest_id: "d".into(),
@@ -1335,6 +1343,7 @@ mod tests {
                 delete: true,
                 checksum: true,
                 dry_run: false,
+                exclude: vec!["node_modules".into(), "/build".into()],
             },
             Command::DeletePaths { paths: vec!["/d/a".into(), "/d/b".into()] },
             Command::TunnelStart { target: "http://localhost:3000".into() },

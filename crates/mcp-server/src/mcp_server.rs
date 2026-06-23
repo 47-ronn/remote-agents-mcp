@@ -247,6 +247,7 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
                 "delete": {"type": "boolean", "description": "Delete destination files absent from the source (default false)"},
                 "checksum": {"type": "boolean", "description": "Compare by SHA-256 instead of size+mtime (default false)"},
                 "dry_run": {"type": "boolean", "description": "Report what would change without transferring (default false)"},
+                "exclude": {"type": "array", "items": {"type": "string"}, "description": "Gitignore-flavored patterns to skip (e.g. [\"node_modules\", \"*.log\", \"/build\"]). A bare name matches at any depth; a leading / anchors to the root. Excluded paths are never transferred or deleted on either host."},
                 "agent_id": {"type": "string", "description": "Source host agent id (where the folder lives)"}
             }),
             vec!["src_path", "dest_id", "dest_path"],
@@ -725,6 +726,7 @@ impl McpHandler {
                 delete: get_bool("delete", false),
                 checksum: get_bool("checksum", false),
                 dry_run: get_bool("dry_run", false),
+                exclude: get_str_vec("exclude"),
             },
             "tunnel_start" => Command::TunnelStart {
                 target: get_str_required("target")?,

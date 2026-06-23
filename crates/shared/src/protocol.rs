@@ -285,6 +285,11 @@ pub enum Command {
         path: String,
         #[serde(default)]
         with_hash: bool,
+        /// Gitignore-flavored exclude patterns; matching files/dirs are omitted
+        /// so an excluded path is never reported (and so never deleted on a
+        /// `delete` sync).
+        #[serde(default)]
+        exclude: Vec<String>,
     },
 
     /// Sync a local directory tree to another host: diff against the
@@ -305,6 +310,11 @@ pub enum Command {
         /// Report what would change without transferring anything.
         #[serde(default)]
         dry_run: bool,
+        /// Gitignore-flavored exclude patterns (e.g. `node_modules`, `*.log`,
+        /// `/build`). Applied on both ends: matching files are neither
+        /// transferred nor (with `delete`) removed from the destination.
+        #[serde(default)]
+        exclude: Vec<String>,
     },
 
     /// Delete the given absolute paths (and prune now-empty parent dirs) on the
