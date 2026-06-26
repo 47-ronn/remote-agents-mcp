@@ -232,19 +232,25 @@ impl ConnectionPool {
         // only SEND over UDP, so any reply (e.g. a FileRecv ack from a peer it is
         // streaming to) would be lost and the transfer would stall.
         {
-            let pending_udp = pending.clone();
-            let cipher_udp = cipher.clone();
-            let agents_udp = agents.clone();
-            let udp_in = udp_transport.clone();
-            let executor_udp = executor_state.clone();
+            // Full handler context so the UDP inbound path can SOURCE transfers
+            // (begin_send_file/begin_sync_dir), not just receive them. A command
+            // that starts a transfer rides the direct UDP channel, so it lands
+            // here — it must be sourceable here, exactly like the WS path.
+            let shared_udp = HandlerShared {
+                agents: agents.clone(),
+                pending: pending.clone(),
+                cipher: cipher.clone(),
+                events: events.clone(),
+                events_notify: events_notify.clone(),
+                watched: watched.clone(),
+                tx: tx.clone(),
+                udp_transport: udp_transport.clone(),
+                executor_state: executor_state.clone(),
+            };
             let mut rx_in = udp_inbound_rx;
             tokio::spawn(async move {
                 while let Some((peer_session, data)) = rx_in.recv().await {
-                    handle_controller_udp_inbound(
-                        &peer_session, &data, &pending_udp, &cipher_udp, &agents_udp,
-                        &udp_in, &executor_udp,
-                    )
-                    .await;
+                    handle_controller_udp_inbound(&peer_session, &data, &shared_udp).await;
                 }
             });
         }
@@ -839,19 +845,35 @@ async fn begin_send_file(
             .size
     };
 
+    // Check destination agent mode BEFORE starting the transfer. This surfaces
+    // the error synchronously so the LLM knows to call set_mode first.
+    let (dest_mode, dest_session) = {
+        let agents = shared.agents.read().await;
+        let agent = agents.iter().find(|a| a.id == dest_id);
+        match agent {
+            Some(a) => (a.mode, a.session_id.clone()),
+            None => bail!(
+                "Destination agent '{}' not found. Use list_agents to see available agents.",
+                dest_id
+            ),
+        }
+    };
+    if !dest_mode.allows_write() {
+        bail!(
+            "Destination agent '{}' is in {:?} mode which does not allow writes. \
+             Call set_mode with agent_id='{}' and mode='edit' first, then retry send_file.",
+            dest_id,
+            dest_mode,
+            dest_id
+        );
+    }
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, size);
 
     // Best-effort: open a direct UDP channel before streaming so chunks take the
     // fast path. Failure is fine — send_peer_command falls back to the relay.
-    let dest_session = {
-        let agents = shared.agents.read().await;
-        agents
-            .iter()
-            .find(|a| a.id == dest_id)
-            .and_then(|a| a.session_id.clone())
-    };
     if let Some(session) = &dest_session {
         if !shared.udp_transport.has_udp_channel(session).await {
             let _ = shared.udp_transport.offer_channel(session.clone()).await;
@@ -985,19 +1007,35 @@ async fn begin_sync_dir(
             .map_err(|e| anyhow::anyhow!("walk failed: {e}"))??
     };
 
+    // Check destination agent mode BEFORE starting the transfer. This surfaces
+    // the error synchronously so the LLM knows to call set_mode first.
+    let (dest_mode, dest_session) = {
+        let agents = shared.agents.read().await;
+        let agent = agents.iter().find(|a| a.id == dest_id);
+        match agent {
+            Some(a) => (a.mode, a.session_id.clone()),
+            None => bail!(
+                "Destination agent '{}' not found. Use list_agents to see available agents.",
+                dest_id
+            ),
+        }
+    };
+    if !dest_mode.allows_write() {
+        bail!(
+            "Destination agent '{}' is in {:?} mode which does not allow writes. \
+             Call set_mode with agent_id='{}' and mode='edit' first, then retry sync_dir.",
+            dest_id,
+            dest_mode,
+            dest_id
+        );
+    }
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, 0);
 
     // Best-effort: open a direct UDP channel before streaming so files take the
     // fast path. Failure is fine — slices fall back to the relay.
-    let dest_session = {
-        let agents = shared.agents.read().await;
-        agents
-            .iter()
-            .find(|a| a.id == dest_id)
-            .and_then(|a| a.session_id.clone())
-    };
     if let Some(session) = &dest_session {
         if !shared.udp_transport.has_udp_channel(session).await {
             let _ = shared.udp_transport.offer_channel(session.clone()).await;
@@ -1127,12 +1165,13 @@ async fn run_sync(
 async fn handle_controller_udp_inbound(
     peer_session: &str,
     data: &[u8],
-    pending: &PendingMap,
-    cipher: &Cipher,
-    agents: &Arc<RwLock<Vec<AgentInfo>>>,
-    udp: &Arc<UdpTransport>,
-    executor: &Option<Arc<crate::state::AgentState>>,
+    shared: &HandlerShared,
 ) {
+    let pending = &shared.pending;
+    let cipher = &shared.cipher;
+    let agents = &shared.agents;
+    let udp = &shared.udp_transport;
+    let executor = &shared.executor_state;
     let Some(frame) = UdpFrame::from_bytes(data) else {
         return;
     };
@@ -1193,15 +1232,33 @@ async fn handle_controller_udp_inbound(
             }
         }
         UdpFrame::Command { request_id, payload, .. } => {
-            // A command addressed to us over UDP (we're the destination). Execute
-            // and reply over the same channel. We don't SOURCE transfers here.
+            // A command addressed to us over UDP. Execute and reply over the same
+            // channel. Transfers (SendFileTo / SyncDirTo) are SOURCED here just
+            // like the WS ServerMessage::Command path — the control command that
+            // starts a transfer rides this UDP channel, so it must be sourceable
+            // here; the bulk file data then streams over the same channel.
             let Some(state) = executor else {
                 return;
             };
             let outcome: Result<CommandResult> = match Command::decrypt(&payload, cipher) {
-                Ok(Command::SendFileTo { .. }) | Ok(Command::SyncDirTo { .. }) => {
-                    Err(anyhow::anyhow!("controller does not source transfers over UDP"))
+                Ok(Command::SendFileTo { src_path, dest_id, dest_path }) => {
+                    begin_send_file(shared, state, src_path, dest_id, dest_path)
+                        .await
+                        .map(|id| CommandResult::TransferQueued { id })
                 }
+                Ok(Command::SyncDirTo {
+                    src_path,
+                    dest_id,
+                    dest_path,
+                    delete,
+                    checksum,
+                    dry_run,
+                    exclude,
+                }) => begin_sync_dir(
+                    shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run, exclude,
+                )
+                .await
+                .map(|id| CommandResult::TransferQueued { id }),
                 Ok(Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. }) => {
                     crate::executor::recv_file_chunk(
                         state, &dest_path, offset, &bytes, eof, sha256.as_deref(), true,

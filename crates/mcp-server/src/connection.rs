@@ -862,16 +862,34 @@ async fn begin_send_file(
             .size
     };
 
+    // Check destination agent mode BEFORE starting the transfer. This surfaces
+    // the error synchronously so the LLM knows to call set_mode first.
+    let dest_agent = state
+        .peers()
+        .await
+        .into_iter()
+        .find(|a| a.id == dest_id);
+    let (dest_mode, dest_session) = match dest_agent {
+        Some(a) => (a.mode, a.session_id),
+        None => bail!(
+            "Destination agent '{}' not found. Use list_agents to see available agents.",
+            dest_id
+        ),
+    };
+    if !dest_mode.allows_write() {
+        bail!(
+            "Destination agent '{}' is in {:?} mode which does not allow writes. \
+             Call set_mode with agent_id='{}' and mode='edit' first, then retry send_file.",
+            dest_id,
+            dest_mode,
+            dest_id
+        );
+    }
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, size);
 
-    let dest_session = state
-        .peers()
-        .await
-        .into_iter()
-        .find(|a| a.id == dest_id)
-        .and_then(|a| a.session_id);
     if let Some(sess) = &dest_session {
         if !udp.has_udp_channel(sess).await {
             let _ = udp.offer_channel(sess.clone()).await;
