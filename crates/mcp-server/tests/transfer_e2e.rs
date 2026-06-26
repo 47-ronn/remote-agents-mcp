@@ -165,6 +165,115 @@ async fn host_to_host_transfer_round_trips_over_relay() {
     );
 }
 
+/// A `run`-agent SOURCES a folder sync: `SyncDirTo` dispatched to a run-mode
+/// agent must walk its own tree, query the destination manifest, and stream only
+/// the changed files — the agent-side `begin_sync_dir`/`run_sync_agent` path
+/// (previously only the controller could source a sync). Asserts every file
+/// lands at the destination byte-for-byte, across a nested subdirectory.
+#[tokio::test]
+async fn host_to_host_sync_dir_round_trips_over_relay() {
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1"); // hermetic: no live STUN
+    let port = start_relay().await;
+    let relay_url = format!("ws://127.0.0.1:{port}");
+
+    let mut src_cfg = agent_config("src-agent", port);
+    src_cfg.security.transfer_chunk_size = 1000; // several slices per file
+    let dst_cfg = agent_config("dst-agent", port);
+
+    tokio::spawn(async move {
+        let _ = connection::run(&src_cfg).await;
+    });
+    tokio::spawn(async move {
+        let _ = connection::run(&dst_cfg).await;
+    });
+
+    let ctrl = McpServer::new();
+    ctrl.join_room(&relay_url, "dev", "secret", None, None, None)
+        .await
+        .expect("controller joins room");
+
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(agents) = ctrl.list_agents("dev").await {
+            let has = |id: &str| agents.iter().any(|a| a.id == id);
+            if has("src-agent") && has("dst-agent") {
+                ready = true;
+                break;
+            }
+        }
+    }
+    assert!(ready, "both agents should register with the relay");
+
+    ctrl.set_mode("dev", "dst-agent", AgentMode::Bypass)
+        .await
+        .expect("set dst to bypass");
+
+    // Source tree on the src agent's filesystem: a file at the root and one in a
+    // nested subdirectory, with non-UTF8 bytes spanning several chunks.
+    let dir = tempfile::tempdir().unwrap();
+    let src_root = dir.path().join("src");
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(src_root.join("sub")).unwrap();
+    let a: Vec<u8> = (0u8..=255).cycle().take(3500).collect();
+    let b: Vec<u8> = (0u8..=255).rev().cycle().take(2200).collect();
+    std::fs::write(src_root.join("a.bin"), &a).unwrap();
+    std::fs::write(src_root.join("sub").join("b.bin"), &b).unwrap();
+
+    let res = ctrl
+        .send_command(
+            "dev",
+            Target::Agent { id: "src-agent".into() },
+            Command::SyncDirTo {
+                src_path: src_root.to_string_lossy().to_string(),
+                dest_id: "dst-agent".to_string(),
+                dest_path: dst_root.to_string_lossy().to_string(),
+                delete: false,
+                checksum: false,
+                dry_run: false,
+                exclude: vec![],
+            },
+        )
+        .await
+        .expect("dispatch SyncDirTo");
+    let id = match res.into_iter().next() {
+        Some((_, CommandResult::TransferQueued { id })) => id,
+        other => panic!("expected TransferQueued, got {other:?}"),
+    };
+
+    let mut done = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = ctrl
+            .send_command(
+                "dev",
+                Target::Agent { id: "src-agent".into() },
+                Command::TransferGet { id: id.clone() },
+            )
+            .await;
+        if let Ok(v) = r {
+            if let Some((_, CommandResult::Transfer { status })) = v.into_iter().next() {
+                match status.state {
+                    TransferState::Done => {
+                        done = true;
+                        break;
+                    }
+                    TransferState::Failed => panic!("sync failed: {:?}", status.error),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(done, "folder sync should reach Done state");
+
+    assert_eq!(std::fs::read(dst_root.join("a.bin")).unwrap(), a, "root file must match");
+    assert_eq!(
+        std::fs::read(dst_root.join("sub").join("b.bin")).unwrap(),
+        b,
+        "nested file must match"
+    );
+}
+
 /// iter141: `send_file` with no `agent_id` routes to the node's OWN id, so the
 /// local host streams its own filesystem to a remote agent. This exercises the
 /// loopback path the fix produces: a full peer node (executor attached, exactly

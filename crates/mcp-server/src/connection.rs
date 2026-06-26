@@ -474,6 +474,17 @@ async fn handle_server_message(
                             .await
                             .map(|id| CommandResult::TransferQueued { id })
                     }
+                    // SyncDirTo is the SOURCE side of a host↔host folder sync —
+                    // like SendFileTo it initiates commands to the destination, so
+                    // it's handled here, not in the generic executor.
+                    Command::SyncDirTo {
+                        src_path, dest_id, dest_path, delete, checksum, dry_run, exclude,
+                    } => begin_sync_dir(
+                        &state, &tx, &udp_transport, &pending, src_path, dest_id, dest_path,
+                        delete, checksum, dry_run, exclude,
+                    )
+                    .await
+                    .map(|id| CommandResult::TransferQueued { id }),
                     // Transfer chunk over the relay/WS path: keep the size cap
                     // UNLESS a direct UDP channel to the sender exists (then this
                     // is a p2p transfer that merely used WS for this slice).
@@ -685,6 +696,16 @@ async fn handle_udp_inbound(
                             .await
                             .map(|id| CommandResult::TransferQueued { id })
                     }
+                    // SyncDirTo, likewise, is the source side of a folder sync and
+                    // arrives over UDP when the initiator has a direct channel here.
+                    Command::SyncDirTo {
+                        src_path, dest_id, dest_path, delete, checksum, dry_run, exclude,
+                    } => begin_sync_dir(
+                        &state, &tx, &udp_transport, &pending, src_path, dest_id, dest_path,
+                        delete, checksum, dry_run, exclude,
+                    )
+                    .await
+                    .map(|id| CommandResult::TransferQueued { id }),
                     // Chunk arrived over the direct UDP channel → p2p, no relay to
                     // protect → no size cap.
                     Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. } => {
@@ -927,6 +948,231 @@ async fn begin_send_file(
     });
 
     Ok(transfer_id)
+}
+
+/// Join a destination root with a manifest-relative path (which uses `/`).
+fn join_dest(base: &str, rel: &str) -> String {
+    std::path::Path::new(base).join(rel).to_string_lossy().into_owned()
+}
+
+/// Send one command to a peer agent over the relay and await its single reply.
+/// Mirrors the controller's `send_peer_command`: used by the agent-sourced
+/// folder sync for its small control messages (the manifest query and the
+/// delete batch); the file bytes themselves take the UDP fast path via
+/// [`send_file_slice`].
+async fn send_peer_command(
+    cipher: &Cipher,
+    tx: &mpsc::Sender<ClientMessage>,
+    pending: &ConnPending,
+    dest_id: &str,
+    cmd: Command,
+) -> Result<CommandResult> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (otx, orx) = oneshot::channel::<ConnReply>();
+    pending.write().await.insert(request_id.clone(), otx);
+
+    let envelope = cmd
+        .encrypt(cipher)
+        .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
+    if tx
+        .send(ClientMessage::Command {
+            request_id: request_id.clone(),
+            target: Target::Agent { id: dest_id.to_string() },
+            payload: envelope,
+        })
+        .await
+        .is_err()
+    {
+        pending.write().await.remove(&request_id);
+        bail!("send peer command failed");
+    }
+
+    match timeout(Duration::from_secs(60), orx).await {
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(e))) => bail!("{e}"),
+        _ => {
+            pending.write().await.remove(&request_id);
+            bail!("peer command timed out")
+        }
+    }
+}
+
+/// Start a host→host folder sync from the `run`-agent loop: walk the source,
+/// validate it, then spawn a task that diffs against the destination and streams
+/// only the changed files (reusing the per-file transfer engine on one shared
+/// UDP channel). Returns the transfer id immediately; progress is polled with
+/// `TransferGet`. Mirrors the controller's `begin_sync_dir` so a run-agent can
+/// SOURCE a sync, not just a `send_file`.
+#[allow(clippy::too_many_arguments)]
+async fn begin_sync_dir(
+    state: &AgentState,
+    tx: &mpsc::Sender<ClientMessage>,
+    udp: &Arc<UdpTransport>,
+    pending: &ConnPending,
+    src_path: String,
+    dest_id: String,
+    dest_path: String,
+    delete: bool,
+    checksum: bool,
+    dry_run: bool,
+    exclude: Vec<String>,
+) -> Result<String> {
+    let sec = state.config.security.clone();
+
+    // Walk + validate the source up front (off the runtime). Errors here (not a
+    // dir, not allowed) surface synchronously. Excluded files/dirs are pruned
+    // here, so they're never offered to the destination.
+    let src_manifest = {
+        let (sp, sec2, ex) = (src_path.clone(), sec.clone(), exclude.clone());
+        tokio::task::spawn_blocking(move || crate::files::walk_dir(&sp, checksum, &ex, &sec2))
+            .await
+            .map_err(|e| anyhow::anyhow!("walk failed: {e}"))??
+    };
+
+    // Check destination agent mode BEFORE starting the transfer. This surfaces
+    // the error synchronously so the LLM knows to call set_mode first.
+    let dest_agent = state.peers().await.into_iter().find(|a| a.id == dest_id);
+    let (dest_mode, dest_session) = match dest_agent {
+        Some(a) => (a.mode, a.session_id),
+        None => bail!(
+            "Destination agent '{}' not found. Use list_agents to see available agents.",
+            dest_id
+        ),
+    };
+    if !dest_mode.allows_write() {
+        bail!(
+            "Destination agent '{}' is in {:?} mode which does not allow writes. \
+             Call set_mode with agent_id='{}' and mode='edit' first, then retry sync_dir.",
+            dest_id,
+            dest_mode,
+            dest_id
+        );
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let store = state.transfers();
+    store.start(&transfer_id, 0);
+
+    // Best-effort: open a direct UDP channel before streaming so files take the
+    // fast path. Failure is fine — slices fall back to the relay.
+    if let Some(sess) = &dest_session {
+        if !udp.has_udp_channel(sess).await {
+            let _ = udp.offer_channel(sess.clone()).await;
+        }
+    }
+
+    let cipher = state.cipher();
+    let (tx2, udp2, pending2) = (tx.clone(), udp.clone(), pending.clone());
+    let tid = transfer_id.clone();
+    let punched = dest_session.is_some();
+    tokio::spawn(async move {
+        // Give a freshly-offered channel a moment to hole-punch.
+        if punched {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        let result = run_sync_agent(
+            &cipher, &tx2, &udp2, &pending2, &store, &tid, src_path, src_manifest, &dest_id,
+            dest_session, dest_path, delete, checksum, dry_run, exclude, sec,
+        )
+        .await;
+        match result {
+            Ok(()) => store.done(&tid),
+            Err(e) => store.fail(&tid, e.to_string()),
+        }
+    });
+
+    Ok(transfer_id)
+}
+
+/// The agent-side folder-sync body: query the destination manifest, diff, then
+/// stream the changed files and (optionally) delete the extras. Mirrors the
+/// controller's `run_sync` but works off the `run`-agent's connection
+/// primitives (cipher/tx/udp/pending) instead of `HandlerShared`.
+#[allow(clippy::too_many_arguments)]
+async fn run_sync_agent(
+    cipher: &Cipher,
+    tx: &mpsc::Sender<ClientMessage>,
+    udp: &Arc<UdpTransport>,
+    pending: &ConnPending,
+    store: &crate::transfer::TransferStore,
+    transfer_id: &str,
+    src_path: String,
+    src_manifest: Vec<remote_agents_shared::ManifestEntry>,
+    dest_id: &str,
+    dest_session: Option<String>,
+    dest_path: String,
+    delete: bool,
+    checksum: bool,
+    dry_run: bool,
+    exclude: Vec<String>,
+    mut sec: crate::config::SecurityConfig,
+) -> Result<()> {
+    // 1. Ask the destination for its current manifest. Pass the excludes so the
+    //    destination's manifest omits them too — otherwise a `delete` sync would
+    //    see an excluded dest file as "absent from source" and remove it.
+    let (dest_entries, dest_root_exists) = match send_peer_command(
+        cipher,
+        tx,
+        pending,
+        dest_id,
+        Command::DirManifest { path: dest_path.clone(), with_hash: checksum, exclude },
+    )
+    .await?
+    {
+        CommandResult::DirManifest { entries, root_exists } => (entries, root_exists),
+        _ => bail!("destination returned an unexpected reply to the manifest request"),
+    };
+
+    // 2. Diff.
+    let opts = crate::sync::SyncOpts { delete, checksum };
+    let plan = crate::sync::diff_manifests(&src_manifest, &dest_entries, dest_root_exists, &opts);
+    let total_bytes: u64 = plan.to_transfer.iter().map(|e| e.size).sum();
+    store.set_totals(transfer_id, total_bytes, plan.to_transfer.len() as u32);
+
+    if dry_run {
+        return Ok(());
+    }
+
+    // 3. Lift the relay size cap when a direct channel is up (peer-to-peer).
+    if let Some(session) = &dest_session {
+        if udp.has_udp_channel(session).await {
+            sec.max_transfer_size = 0;
+        }
+    }
+    let chunk = sec.transfer_chunk_size;
+
+    // 4. Stream each changed file on the shared channel.
+    for entry in &plan.to_transfer {
+        let src_file = join_dest(&src_path, &entry.rel_path);
+        let dest_file = join_dest(&dest_path, &entry.rel_path);
+        let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway: keeps stream_file's progress() a no-op on the folder status
+        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let (cipher, tx3, udp3, pending3) =
+                (cipher.clone(), tx.clone(), udp.clone(), pending.clone());
+            let (did, dsess, dp, tid2) =
+                (dest_id.to_string(), dest_session.clone(), dest_file.clone(), file_tid.clone());
+            async move {
+                send_file_slice(
+                    &cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), &tid2, &dp, offset,
+                    raw, eof, sha,
+                )
+                .await
+            }
+        };
+        crate::transfer::stream_file(store, &src_file, &file_tid, &sec, chunk, entry.size, send)
+            .await
+            .with_context(|| format!("sync file {}", entry.rel_path))?;
+        store.file_done(transfer_id, entry.size);
+    }
+
+    // 5. Delete destination extras (additive default → only when requested).
+    if delete && !plan.to_delete.is_empty() {
+        let paths: Vec<String> =
+            plan.to_delete.iter().map(|rel| join_dest(&dest_path, rel)).collect();
+        send_peer_command(cipher, tx, pending, dest_id, Command::DeletePaths { paths }).await?;
+    }
+
+    Ok(())
 }
 
 pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::AgentMode) -> AgentInfo {
