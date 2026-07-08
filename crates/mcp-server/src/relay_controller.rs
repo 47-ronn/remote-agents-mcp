@@ -847,7 +847,11 @@ async fn begin_send_file(
 
     // Check destination agent mode BEFORE starting the transfer. This surfaces
     // the error synchronously so the LLM knows to call set_mode first.
-    let (dest_mode, dest_session) = {
+    //
+    // The local agents cache may be stale (AgentJoined broadcast not yet received
+    // after a remote set_mode), so if the cache says Plan/Disabled, query the
+    // destination directly via GetInfo to get the authoritative mode.
+    let (dest_mode, dest_session_cached) = {
         let agents = shared.agents.read().await;
         let agent = agents.iter().find(|a| a.id == dest_id);
         match agent {
@@ -858,12 +862,22 @@ async fn begin_send_file(
             ),
         }
     };
-    if !dest_mode.allows_write() {
+    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
+    // fix: the cache may lag behind a recent set_mode on the destination).
+    let (final_mode, dest_session) = if !dest_mode.allows_write() {
+        match send_peer_command(shared, &dest_id, Command::GetInfo).await {
+            Ok(CommandResult::Info { info }) => (info.mode, info.session_id),
+            _ => (dest_mode, dest_session_cached), // fallback to cached
+        }
+    } else {
+        (dest_mode, dest_session_cached)
+    };
+    if !final_mode.allows_write() {
         bail!(
             "Destination agent '{}' is in {:?} mode which does not allow writes. \
              Call set_mode with agent_id='{}' and mode='edit' first, then retry send_file.",
             dest_id,
-            dest_mode,
+            final_mode,
             dest_id
         );
     }
@@ -1009,7 +1023,11 @@ async fn begin_sync_dir(
 
     // Check destination agent mode BEFORE starting the transfer. This surfaces
     // the error synchronously so the LLM knows to call set_mode first.
-    let (dest_mode, dest_session) = {
+    //
+    // The local agents cache may be stale (AgentJoined broadcast not yet received
+    // after a remote set_mode), so if the cache says Plan/Disabled, query the
+    // destination directly via GetInfo to get the authoritative mode.
+    let (dest_mode, dest_session_cached) = {
         let agents = shared.agents.read().await;
         let agent = agents.iter().find(|a| a.id == dest_id);
         match agent {
@@ -1020,12 +1038,22 @@ async fn begin_sync_dir(
             ),
         }
     };
-    if !dest_mode.allows_write() {
+    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
+    // fix: the cache may lag behind a recent set_mode on the destination).
+    let (final_mode, dest_session) = if !dest_mode.allows_write() {
+        match send_peer_command(shared, &dest_id, Command::GetInfo).await {
+            Ok(CommandResult::Info { info }) => (info.mode, info.session_id),
+            _ => (dest_mode, dest_session_cached), // fallback to cached
+        }
+    } else {
+        (dest_mode, dest_session_cached)
+    };
+    if !final_mode.allows_write() {
         bail!(
             "Destination agent '{}' is in {:?} mode which does not allow writes. \
              Call set_mode with agent_id='{}' and mode='edit' first, then retry sync_dir.",
             dest_id,
-            dest_mode,
+            final_mode,
             dest_id
         );
     }

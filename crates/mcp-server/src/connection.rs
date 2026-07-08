@@ -885,24 +885,42 @@ async fn begin_send_file(
 
     // Check destination agent mode BEFORE starting the transfer. This surfaces
     // the error synchronously so the LLM knows to call set_mode first.
+    //
+    // The local peers cache may be stale (AgentJoined broadcast not yet received
+    // after a remote set_mode), so if the cache says Plan/Disabled, query the
+    // destination directly via GetInfo to get the authoritative mode.
     let dest_agent = state
         .peers()
         .await
         .into_iter()
         .find(|a| a.id == dest_id);
-    let (dest_mode, dest_session) = match dest_agent {
-        Some(a) => (a.mode, a.session_id),
+    let (dest_mode, mut dest_session) = match &dest_agent {
+        Some(a) => (a.mode, a.session_id.clone()),
         None => bail!(
             "Destination agent '{}' not found. Use list_agents to see available agents.",
             dest_id
         ),
     };
-    if !dest_mode.allows_write() {
+    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
+    // fix: the cache may lag behind a recent set_mode on the destination).
+    let final_mode = if !dest_mode.allows_write() {
+        let cipher = state.cipher();
+        match send_peer_command(&cipher, tx, pending, &dest_id, Command::GetInfo).await {
+            Ok(CommandResult::Info { info }) => {
+                dest_session = info.session_id;
+                info.mode
+            }
+            _ => dest_mode, // fallback to cached
+        }
+    } else {
+        dest_mode
+    };
+    if !final_mode.allows_write() {
         bail!(
             "Destination agent '{}' is in {:?} mode which does not allow writes. \
              Call set_mode with agent_id='{}' and mode='edit' first, then retry send_file.",
             dest_id,
-            dest_mode,
+            final_mode,
             dest_id
         );
     }
@@ -1031,20 +1049,38 @@ async fn begin_sync_dir(
 
     // Check destination agent mode BEFORE starting the transfer. This surfaces
     // the error synchronously so the LLM knows to call set_mode first.
+    //
+    // The local peers cache may be stale (AgentJoined broadcast not yet received
+    // after a remote set_mode), so if the cache says Plan/Disabled, query the
+    // destination directly via GetInfo to get the authoritative mode.
     let dest_agent = state.peers().await.into_iter().find(|a| a.id == dest_id);
-    let (dest_mode, dest_session) = match dest_agent {
-        Some(a) => (a.mode, a.session_id),
+    let (dest_mode, mut dest_session) = match &dest_agent {
+        Some(a) => (a.mode, a.session_id.clone()),
         None => bail!(
             "Destination agent '{}' not found. Use list_agents to see available agents.",
             dest_id
         ),
     };
-    if !dest_mode.allows_write() {
+    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
+    // fix: the cache may lag behind a recent set_mode on the destination).
+    let cipher = state.cipher();
+    let final_mode = if !dest_mode.allows_write() {
+        match send_peer_command(&cipher, tx, pending, &dest_id, Command::GetInfo).await {
+            Ok(CommandResult::Info { info }) => {
+                dest_session = info.session_id;
+                info.mode
+            }
+            _ => dest_mode, // fallback to cached
+        }
+    } else {
+        dest_mode
+    };
+    if !final_mode.allows_write() {
         bail!(
             "Destination agent '{}' is in {:?} mode which does not allow writes. \
              Call set_mode with agent_id='{}' and mode='edit' first, then retry sync_dir.",
             dest_id,
-            dest_mode,
+            final_mode,
             dest_id
         );
     }
