@@ -865,9 +865,20 @@ async fn begin_send_file(
     // If cached mode doesn't allow writes, refresh via GetInfo (race condition
     // fix: the cache may lag behind a recent set_mode on the destination).
     let (final_mode, dest_session) = if !dest_mode.allows_write() {
+        info!("Cached mode {:?} for dest {}, querying GetInfo", dest_mode, dest_id);
         match send_peer_command(shared, &dest_id, Command::GetInfo).await {
-            Ok(CommandResult::Info { info }) => (info.mode, info.session_id),
-            _ => (dest_mode, dest_session_cached), // fallback to cached
+            Ok(CommandResult::Info { info }) => {
+                info!("GetInfo returned mode {:?} for dest {}", info.mode, dest_id);
+                (info.mode, info.session_id)
+            }
+            Ok(other) => {
+                warn!("GetInfo returned unexpected result {:?}", other);
+                (dest_mode, dest_session_cached)
+            }
+            Err(e) => {
+                warn!("GetInfo failed for {}: {}", dest_id, e);
+                (dest_mode, dest_session_cached) // fallback to cached
+            }
         }
     } else {
         (dest_mode, dest_session_cached)

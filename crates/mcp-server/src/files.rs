@@ -54,8 +54,11 @@ pub fn stat(path: &str, sec: &SecurityConfig) -> Result<FileMeta> {
 }
 
 /// Read a binary-safe slice `[offset, offset+len)` of a file as raw bytes.
-/// Returns `(bytes, eof)`. The whole-file size is bounded by `max_transfer_size`
-/// (0 = unlimited). Backs [`read_chunk`], which base64's the result.
+/// Returns `(bytes, eof)`. This raw building block is transport-agnostic and
+/// applies NO whole-file size cap: `max_transfer_size` bounds only the WS/relay
+/// path, which is enforced by the base64 wrapper [`read_chunk`]. The direct
+/// host↔host UDP transfer streams via this function ([`crate::transfer::stream_file`])
+/// and is therefore uncapped — big files ride the direct channel unbounded.
 pub(crate) fn read_chunk_raw(
     path: &str,
     offset: u64,
@@ -65,13 +68,6 @@ pub(crate) fn read_chunk_raw(
     safety::check_path_allowed(path, sec)?;
     let md = std::fs::metadata(path).with_context(|| format!("stat {path}"))?;
     let size = md.len();
-    if sec.max_transfer_size > 0 && size > sec.max_transfer_size {
-        bail!(
-            "File size {} bytes exceeds transfer limit of {} bytes",
-            size,
-            sec.max_transfer_size
-        );
-    }
     if offset > size {
         bail!("offset {} past end of file ({} bytes)", offset, size);
     }
@@ -87,13 +83,28 @@ pub(crate) fn read_chunk_raw(
     Ok((buf, eof))
 }
 
-/// Like [`read_chunk_raw`] but base64-encodes the slice for the JSON/WS path.
+/// Like [`read_chunk_raw`] but base64-encodes the slice for the JSON/WS path
+/// (the browser pull-download `FileChunk`). This is the WS/relay path, so it is
+/// the one bounded by `max_transfer_size` (0 = unlimited) — the whole-file cap
+/// the raw building block deliberately omits.
 pub fn read_chunk(
     path: &str,
     offset: u64,
     len: u64,
     sec: &SecurityConfig,
 ) -> Result<(String, bool)> {
+    if sec.max_transfer_size > 0 {
+        let size = std::fs::metadata(path)
+            .with_context(|| format!("stat {path}"))?
+            .len();
+        if size > sec.max_transfer_size {
+            bail!(
+                "File size {} bytes exceeds transfer limit of {} bytes",
+                size,
+                sec.max_transfer_size
+            );
+        }
+    }
     let (buf, eof) = read_chunk_raw(path, offset, len, sec)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok((data, eof))
@@ -491,6 +502,28 @@ mod tests {
         std::fs::write(&path, b"abc").unwrap();
         let p = path.to_string_lossy().to_string();
         assert!(read_chunk(&p, 99, 10, &sec()).is_err());
+    }
+
+    // The WS/relay base64 path (`read_chunk`) still enforces `max_transfer_size`;
+    // the transport-agnostic raw building block (`read_chunk_raw`) does not — so
+    // a host↔host transfer of a file over the cap reads fine over the raw path.
+    #[test]
+    fn read_chunk_caps_ws_path_but_raw_is_uncapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        std::fs::write(&path, vec![7u8; 5000]).unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        let mut cfg = sec();
+        cfg.max_transfer_size = 1000; // file (5000) is 5× the cap
+
+        assert!(
+            read_chunk(&p, 0, 512, &cfg).is_err(),
+            "base64/WS path must reject a file over the cap"
+        );
+        let (buf, _eof) = read_chunk_raw(&p, 0, 512, &cfg)
+            .expect("raw path must ignore the cap for host↔host transfers");
+        assert_eq!(buf.len(), 512);
     }
 
     #[test]

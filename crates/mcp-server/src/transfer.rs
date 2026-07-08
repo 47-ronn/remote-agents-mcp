@@ -113,6 +113,18 @@ pub fn receive_chunk(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(bytes_b64)
         .context("decode transfer chunk")?;
+    // This is the WS/relay slice path (a `FileRecv` command over the relay), so
+    // it is the one bounded by `max_transfer_size` (0 = unlimited). The last
+    // slice's end equals the whole-file size, so the per-slice check caps the
+    // total. The direct UDP path calls `receive_chunk_raw` and stays uncapped.
+    if sec.max_transfer_size > 0 {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("transfer chunk offset overflow ({offset} + {})", bytes.len()))?;
+        if end > sec.max_transfer_size {
+            bail!("transfer exceeds limit of {} bytes", sec.max_transfer_size);
+        }
+    }
     receive_chunk_raw(dest_path, offset, &bytes, eof, expected_sha256, sec)
 }
 
@@ -129,15 +141,16 @@ pub fn receive_chunk_raw(
     safety::check_path_allowed(dest_path, sec)?;
 
     // `offset` is peer-supplied; compute the end with checked arithmetic so a
-    // near-`u64::MAX` offset can't wrap PAST the size guard and then `seek` to a
-    // colossal position (which would balloon a sparse file and make the eof
-    // sha256 read run effectively forever). Overflow ⇒ treat as over-limit.
+    // near-`u64::MAX` offset can't wrap and then `seek` to a colossal position
+    // (which would balloon a sparse file and make the eof sha256 read run
+    // effectively forever). This overflow guard is a safety invariant and stays
+    // on every path. The whole-file `max_transfer_size` cap, by contrast, bounds
+    // only the WS/relay path and lives in the base64 wrapper [`receive_chunk`];
+    // the direct UDP receive ([`receive_chunk_raw`]) is uncapped so big files
+    // ride the direct channel unbounded.
     let end = offset
         .checked_add(bytes.len() as u64)
         .ok_or_else(|| anyhow::anyhow!("transfer chunk offset overflow ({offset} + {})", bytes.len()))?;
-    if sec.max_transfer_size > 0 && end > sec.max_transfer_size {
-        bail!("transfer exceeds limit of {} bytes", sec.max_transfer_size);
-    }
 
     // Create any missing parent directories so nested destination paths work
     // (folder sync writes whole subtrees; `send_file` to a new nested path too).
@@ -455,5 +468,56 @@ mod tests {
         assert_eq!(round_trip(&data, 1024).await, data);
         // Empty file → a single eof slice; receiver writes an empty file.
         assert_eq!(round_trip(b"", 1024).await, Vec::<u8>::new());
+    }
+
+    // Host↔host transfer (the direct-UDP raw path) is NOT bounded by
+    // `max_transfer_size` — that cap applies only to the WS/relay base64 path.
+    // A file far larger than the cap must round-trip cleanly. This is the
+    // regression guard for the 1.9 GB `send_file` that failed at the source's
+    // `read_chunk_raw` with "exceeds transfer limit".
+    #[tokio::test]
+    async fn stream_file_ignores_transfer_cap_on_raw_path() {
+        // The receiver of `round_trip` uses `receive_chunk_raw` (the UDP path);
+        // the sender reads via `read_chunk_raw`. Both are uncapped now.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.bin");
+        let dst = dir.path().join("big.out");
+        // 4000 bytes, cap of 100 — nearly 40× over the limit.
+        let data: Vec<u8> = (0u8..=255).cycle().take(4000).collect();
+        std::fs::write(&src, &data).unwrap();
+
+        let mut cfg = sec();
+        cfg.max_transfer_size = 100;
+        cfg.transfer_chunk_size = 512;
+        let store = TransferStore::default();
+        store.start("big", data.len() as u64);
+
+        let (cfg_recv, dst_recv) = (cfg.clone(), dst.to_string_lossy().to_string());
+        let send = move |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let (cfg, dst) = (cfg_recv.clone(), dst_recv.clone());
+            async move {
+                receive_chunk_raw(&dst, offset, &raw, eof, sha.as_deref(), &cfg)?;
+                Ok(())
+            }
+        };
+        stream_file(&store, &src.to_string_lossy(), "big", &cfg, 512, data.len() as u64, send)
+            .await
+            .expect("large host↔host transfer must ignore the WS cap");
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+    }
+
+    // The base64 wrapper IS the WS path, so it still enforces the cap — a file
+    // over `max_transfer_size` is rejected before any bytes are written.
+    #[test]
+    fn receive_chunk_base64_still_enforces_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("capped.bin");
+        let dp = dest.to_string_lossy().to_string();
+        let mut cfg = sec();
+        cfg.max_transfer_size = 8;
+        // A slice whose end (offset 0 + 16 bytes) exceeds the 8-byte cap.
+        let r = receive_chunk(&dp, 0, &b64(&[0u8; 16]), false, None, &cfg);
+        assert!(r.is_err(), "WS base64 path must still honor max_transfer_size");
+        assert!(!dest.exists());
     }
 }

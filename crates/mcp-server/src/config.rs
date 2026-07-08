@@ -437,6 +437,20 @@ fn id_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("agent-id"))
 }
 
+/// Path to the machine-wide operating mode, shared by every `remote-agent`
+/// process that resolves to the same data dir (i.e. the same persisted
+/// `agent-id`). A box may hold several live sessions (many terminals / MCP
+/// clients); they present as one logical peer to the relay, so their mode must
+/// agree — otherwise a `set_mode` on one session leaves the others in the old
+/// mode, and a peer command routed by the relay to a *different* session (e.g. a
+/// file `FileRecv` write) is rejected even though the operator "set edit".
+/// Making mode a file next to `agent-id` gives one authoritative mode per box.
+pub fn mode_path() -> PathBuf {
+    dirs::data_dir()
+        .map(|p| p.join("remote-agents").join("mode"))
+        .unwrap_or_else(|| PathBuf::from("mode"))
+}
+
 /// Path to the cache file the npm launcher (`run.js`) writes when a newer
 /// release is published. The launcher does the version comparison (it knows the
 /// accurate *installed* package version — the compiled-in Cargo version can lag
