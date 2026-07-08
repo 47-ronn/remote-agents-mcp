@@ -1275,8 +1275,11 @@ fn format_result(result: &CommandResult) -> String {
 pub async fn run_mcp_server(config: &Config) -> Result<()> {
     info!("Starting MCP stdio server for agent '{}'", config.name);
 
-    // Create agent state
-    let state = AgentState::new(config.clone());
+    // Create agent state. Persistent: the operating mode is shared machine-wide
+    // with every other `remote-agent` session on this box (see `new_persistent`),
+    // so `set_mode` from one session/client is honored by all — the relay may
+    // route an incoming peer command to a different session of the same machine.
+    let state = AgentState::new_persistent(config.clone());
 
     // Start scheduler in background
     state.start_scheduler();

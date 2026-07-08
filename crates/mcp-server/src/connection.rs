@@ -75,7 +75,10 @@ pub(crate) fn relay_safe_result(request_id: String, envelope: Vec<u8>) -> Client
 /// don't linger as orphans.
 pub async fn run(config: &Config) -> Result<()> {
     // Built once so a runtime mode change (SetMode) survives reconnects.
-    let state = AgentState::new(config.clone());
+    // Persistent: mode is shared machine-wide with every other session of this
+    // box (so a peer command routed by the relay to a different session of the
+    // same machine sees the mode the operator set). See `new_persistent`.
+    let state = AgentState::new_persistent(config.clone());
 
     // Run scheduled tasks independently of relay connectivity.
     state.start_scheduler();
@@ -905,12 +908,21 @@ async fn begin_send_file(
     // fix: the cache may lag behind a recent set_mode on the destination).
     let final_mode = if !dest_mode.allows_write() {
         let cipher = state.cipher();
+        tracing::info!("Cached mode {:?} for dest {}, querying GetInfo", dest_mode, dest_id);
         match send_peer_command(&cipher, tx, pending, &dest_id, Command::GetInfo).await {
             Ok(CommandResult::Info { info }) => {
+                tracing::info!("GetInfo returned mode {:?} for dest {}", info.mode, dest_id);
                 dest_session = info.session_id;
                 info.mode
             }
-            _ => dest_mode, // fallback to cached
+            Ok(other) => {
+                tracing::warn!("GetInfo returned unexpected result {:?}", other);
+                dest_mode
+            }
+            Err(e) => {
+                tracing::warn!("GetInfo failed for {}: {}", dest_id, e);
+                dest_mode // fallback to cached
+            }
         }
     } else {
         dest_mode

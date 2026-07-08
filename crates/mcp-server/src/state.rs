@@ -17,7 +17,13 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 #[derive(Clone)]
 pub struct AgentState {
     pub config: Arc<Config>,
+    /// In-memory view of the operating mode (also a fallback when the shared
+    /// mode file is absent/unreadable).
     mode: Arc<RwLock<AgentMode>>,
+    /// Path to the machine-wide mode file shared by every session of this box
+    /// (see [`crate::config::mode_path`]). `None` for ephemeral, in-memory
+    /// states (tests), where mode is purely process-local.
+    mode_path: Option<Arc<PathBuf>>,
     scheduler: Arc<Scheduler>,
     autonomous: Arc<AutonomousStore>,
     /// Receiver for outbound agent events; drained by the connection loop and
@@ -39,8 +45,39 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    /// An ephemeral, in-memory state: mode is process-local (used by tests and
+    /// any short-lived state that must not touch the shared machine mode file).
     pub fn new(config: Config) -> Self {
-        let mode = config.security.mode;
+        Self::build(config, None)
+    }
+
+    /// A persistent state whose operating mode is shared machine-wide via a file
+    /// next to the persisted `agent-id` (see [`crate::config::mode_path`]). Every
+    /// `remote-agent` session on the same box reads/writes it, so a `set_mode` on
+    /// one session is honored by all — the fix for a peer command (e.g. a file
+    /// `FileRecv`) that the relay routes to a *different* session of the same
+    /// machine than the one the operator set to `edit`. Used by the real agent
+    /// entry points (`connection::run`, the MCP peer).
+    pub fn new_persistent(config: Config) -> Self {
+        let path = crate::config::mode_path();
+        Self::build(config, Some(Arc::new(path)))
+    }
+
+    /// Test-only: a state whose machine-wide mode file lives at `path`, so a
+    /// test can exercise cross-session sharing without touching the real
+    /// `~/.local/share` mode file.
+    #[cfg(test)]
+    pub(crate) fn with_mode_file(config: Config, path: PathBuf) -> Self {
+        Self::build(config, Some(Arc::new(path)))
+    }
+
+    fn build(config: Config, mode_path: Option<Arc<PathBuf>>) -> Self {
+        // A mode file present on disk is authoritative for the box (it reflects
+        // the latest `set_mode` by any session); otherwise fall back to config.
+        let mode = mode_path
+            .as_ref()
+            .and_then(|p| read_mode_file(p))
+            .unwrap_or(config.security.mode);
         let scheduler = Arc::new(Scheduler::load(schedule_path()));
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (info_update_tx, info_update_rx) = mpsc::unbounded_channel::<()>();
@@ -52,6 +89,7 @@ impl AgentState {
         Self {
             config: Arc::new(config),
             mode: Arc::new(RwLock::new(mode)),
+            mode_path,
             scheduler,
             autonomous,
             events_rx: Arc::new(Mutex::new(events_rx)),
@@ -105,14 +143,28 @@ impl AgentState {
         self.autonomous.clone()
     }
 
-    /// Current operating mode.
+    /// Current operating mode. For a persistent state this re-reads the shared
+    /// machine-wide mode file so a `set_mode` performed by *another* session of
+    /// the same box is honored (e.g. an incoming `FileRecv` the relay routed
+    /// here rather than to the session the operator set to `edit`). Falls back
+    /// to the in-memory view if the file is absent/unreadable.
     pub async fn mode(&self) -> AgentMode {
+        if let Some(path) = &self.mode_path {
+            if let Some(m) = read_mode_file(path) {
+                *self.mode.write().await = m;
+                return m;
+            }
+        }
         *self.mode.read().await
     }
 
     /// Update the operating mode and notify the connection loop to send
-    /// an UpdateAgent message to the relay.
+    /// an UpdateAgent message to the relay. For a persistent state this also
+    /// writes the shared machine-wide mode file so sibling sessions converge.
     pub async fn set_mode(&self, mode: AgentMode) {
+        if let Some(path) = &self.mode_path {
+            write_mode_file(path, mode);
+        }
         *self.mode.write().await = mode;
         // Notify connection loop to send UpdateAgent; ignore send errors
         // (e.g. if not connected to relay).
@@ -177,6 +229,48 @@ fn tasks_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("tasks.db"))
 }
 
+/// Parse the one-word mode file body into an [`AgentMode`] (matches the serde
+/// `rename_all = "lowercase"` on the type). Unknown/garbage ⇒ `None`.
+fn parse_mode(s: &str) -> Option<AgentMode> {
+    match s.trim() {
+        "plan" => Some(AgentMode::Plan),
+        "edit" => Some(AgentMode::Edit),
+        "bypass" => Some(AgentMode::Bypass),
+        "disabled" => Some(AgentMode::Disabled),
+        _ => None,
+    }
+}
+
+/// The lowercase token written to the shared mode file for `mode`.
+fn mode_token(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Plan => "plan",
+        AgentMode::Edit => "edit",
+        AgentMode::Bypass => "bypass",
+        AgentMode::Disabled => "disabled",
+    }
+}
+
+/// Read the machine-wide mode file, returning `None` if it is absent or holds
+/// an unrecognized value (caller then falls back to config/in-memory).
+fn read_mode_file(path: &std::path::Path) -> Option<AgentMode> {
+    std::fs::read_to_string(path).ok().as_deref().and_then(parse_mode)
+}
+
+/// Write `mode` to the machine-wide mode file atomically (tmp + rename) so a
+/// concurrent reader in a sibling process never sees a torn value. Best-effort:
+/// a write failure just means siblings keep their current view. The tmp file is
+/// PID-suffixed so two processes writing at once don't clobber each other's tmp.
+fn write_mode_file(path: &std::path::Path, mode: AgentMode) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, mode_token(mode)).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +320,57 @@ mod tests {
         // Removing an unknown id is a no-op.
         remove_peer_in(&mut peers, "zzz");
         assert_eq!(peers.len(), 1);
+    }
+
+    #[test]
+    fn mode_file_round_trips_every_variant() {
+        for m in [
+            AgentMode::Plan,
+            AgentMode::Edit,
+            AgentMode::Bypass,
+            AgentMode::Disabled,
+        ] {
+            assert_eq!(parse_mode(mode_token(m)), Some(m));
+        }
+        assert_eq!(parse_mode("  edit\n"), Some(AgentMode::Edit));
+        assert_eq!(parse_mode("garbage"), None);
+    }
+
+    // The core of the machine-wide-mode fix: two sessions of the same box share
+    // one mode file, so a `set_mode` on one is seen by `mode()` on the other —
+    // exactly the case where the relay routes a peer command (e.g. `FileRecv`)
+    // to a *different* session than the one the operator set to `edit`.
+    #[tokio::test]
+    async fn set_mode_is_shared_across_sessions_via_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode");
+
+        let session_a = AgentState::with_mode_file(Config::default(), path.clone());
+        let session_b = AgentState::with_mode_file(Config::default(), path.clone());
+
+        // Both start at the config default (plan); no file yet.
+        assert_eq!(session_a.mode().await, AgentMode::Plan);
+        assert_eq!(session_b.mode().await, AgentMode::Plan);
+
+        // Operator flips session A to edit; B must observe it (it re-reads the
+        // shared file), and the file holds the token.
+        session_a.set_mode(AgentMode::Edit).await;
+        assert_eq!(session_b.mode().await, AgentMode::Edit);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edit");
+
+        // A brand-new session started afterwards reads the current machine mode.
+        let session_c = AgentState::with_mode_file(Config::default(), path.clone());
+        assert_eq!(session_c.mode().await, AgentMode::Edit);
+    }
+
+    // An ephemeral (in-memory) state must NEVER touch a shared file — its mode
+    // is process-local, guaranteeing tests can't clobber the real machine mode.
+    #[tokio::test]
+    async fn ephemeral_state_is_process_local() {
+        let a = AgentState::new(Config::default());
+        let b = AgentState::new(Config::default());
+        a.set_mode(AgentMode::Bypass).await;
+        assert_eq!(a.mode().await, AgentMode::Bypass);
+        assert_eq!(b.mode().await, AgentMode::Plan); // unaffected
     }
 }
