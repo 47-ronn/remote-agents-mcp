@@ -980,9 +980,23 @@ async fn begin_send_file(
     Ok(transfer_id)
 }
 
-/// Join a destination root with a manifest-relative path (which uses `/`).
+/// Join a *local* root with a manifest-relative path (which uses `/`), using the
+/// running host's native separator. Only correct for paths opened on THIS host
+/// (e.g. the sync source's own files) — for a path interpreted on the remote
+/// destination, use [`join_remote`].
 fn join_dest(base: &str, rel: &str) -> String {
     std::path::Path::new(base).join(rel).to_string_lossy().into_owned()
+}
+
+/// Join a *remote* destination root with a manifest-relative path (which uses
+/// `/`), always with `/` — never `std::path::Path::join`. This runs on the sync
+/// SOURCE, so `Path::join` would stamp the source platform's separator into a
+/// path interpreted on the DESTINATION: a Windows source would emit
+/// `dest\sub\file`, which a Unix destination creates as a single flat filename
+/// with literal backslashes (the transfer still reports success, so the
+/// corruption is silent). Forward slashes are accepted by both Windows and Unix.
+fn join_remote(base: &str, rel: &str) -> String {
+    format!("{}/{}", base.trim_end_matches(['/', '\\']), rel)
 }
 
 /// Send one command to a peer agent over the relay and await its single reply.
@@ -1192,7 +1206,7 @@ async fn run_sync_agent(
     // 4. Stream each changed file on the shared channel.
     for entry in &plan.to_transfer {
         let src_file = join_dest(&src_path, &entry.rel_path);
-        let dest_file = join_dest(&dest_path, &entry.rel_path);
+        let dest_file = join_remote(&dest_path, &entry.rel_path);
         let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway: keeps stream_file's progress() a no-op on the folder status
         let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
             let (cipher, tx3, udp3, pending3) =
@@ -1216,7 +1230,7 @@ async fn run_sync_agent(
     // 5. Delete destination extras (additive default → only when requested).
     if delete && !plan.to_delete.is_empty() {
         let paths: Vec<String> =
-            plan.to_delete.iter().map(|rel| join_dest(&dest_path, rel)).collect();
+            plan.to_delete.iter().map(|rel| join_remote(&dest_path, rel)).collect();
         send_peer_command(cipher, tx, pending, dest_id, Command::DeletePaths { paths }).await?;
     }
 
@@ -1254,6 +1268,18 @@ pub(crate) fn build_agent_info(config: &Config, mode: remote_agents_shared::Agen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_remote_always_uses_forward_slashes() {
+        // The agent-sourced sync (run_sync_agent) runs on the SOURCE host, so a
+        // Windows source must still emit `/`-joined destination paths — else a
+        // Unix destination creates one flat backslash-named file per entry.
+        assert_eq!(join_remote("/tmp/dst", "f_1.bin"), "/tmp/dst/f_1.bin");
+        assert_eq!(join_remote("/tmp/dst", "a/b/c.dat"), "/tmp/dst/a/b/c.dat");
+        assert_eq!(join_remote("/tmp/dst/", "f.bin"), "/tmp/dst/f.bin");
+        assert_eq!(join_remote("C:\\dst\\", "a/b.dat"), "C:\\dst/a/b.dat");
+        assert!(!join_remote("C:\\dst", "a/b.dat").contains("dst\\a"));
+    }
 
     /// An empty outbound-pending map for handler tests that don't initiate.
     fn empty_pending() -> ConnPending {
