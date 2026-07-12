@@ -673,12 +673,11 @@ fn parse_zed_thread(json: &[u8]) -> Result<Vec<SessionMessage>> {
 /// non-conversational variants (Resume / Compaction / empty content).
 fn zed_message(m: &serde_json::Value) -> Option<SessionMessage> {
     let obj = m.as_object()?;
-    let (role, body) = if let Some(u) = obj.get("User") {
-        ("user", u)
-    } else if let Some(a) = obj.get("Agent") {
-        ("assistant", a)
-    } else {
-        return None; // "Resume" (string) / Compaction / unknown
+    // User wins if present; otherwise Agent. `?` yields None for the
+    // non-conversational variants ("Resume" string / Compaction / unknown).
+    let (role, body) = match obj.get("User") {
+        Some(u) => ("user", u),
+        None => ("assistant", obj.get("Agent")?),
     };
     let parts: Vec<String> = body
         .get("content")?
