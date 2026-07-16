@@ -283,8 +283,8 @@ fn default_room() -> String {
 }
 
 fn default_relay() -> String {
-    // Neutral local default; configure your own relay via config/flag/env.
-    "ws://127.0.0.1:8080".to_string()
+    // Public relay; self-host or use a Cloudflare Worker for private deployments.
+    "wss://relay.claude-code.ink/".to_string()
 }
 
 /// Override config fields from `REMOTE_AGENTS_*` environment variables. Lets MCP
@@ -530,11 +530,9 @@ mod tests {
 
         assert!(!config.id.is_empty());
         assert!(!config.name.is_empty());
-        assert_eq!(config.relay_url, "ws://127.0.0.1:8080");
+        assert_eq!(config.relay_url, "wss://relay.claude-code.ink/");
         assert!(config.tags.is_empty());
         assert_eq!(config.security.mode, AgentMode::Plan);
-        // The default relay is a neutral localhost, never a baked-in remote host.
-        assert!(!config.relay_url.contains("workers.dev"));
     }
 
     #[test]

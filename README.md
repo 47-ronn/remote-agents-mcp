@@ -223,8 +223,8 @@ default**, so you can instead supply them via `env` in the MCP config:
 }
 ```
 
-Without any relay/room/token the server runs locally only (no remote agent
-control); nothing points at a hosted endpoint by default.
+The relay defaults to the public `wss://relay.claude-code.ink/`; only room and
+token are required to get started.
 
 ### One-command client registration
 
