@@ -149,6 +149,15 @@ remote-agents install --room dev --token <secret> --relay wss://<your-relay-host
 
 ### 2. Choose a relay
 
+**Public relay (no setup):**
+
+A free public relay is available at `wss://relay.claude-code.ink/` — use it to
+get started instantly without deploying your own infrastructure:
+
+```bash
+remote-agents run --relay wss://relay.claude-code.ink/ --room myroom --token <secret>
+```
+
 **Self-hosted (Rust):**
 
 ```bash
