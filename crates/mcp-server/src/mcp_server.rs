@@ -631,14 +631,23 @@ impl ServerHandler for McpHandler {
             self.remote_command(aid, command).await?
         } else if (tool_name == "send_file" || tool_name == "sync_dir") && self.has_relay() {
             // local host → agent: the local executor has no peer-send primitives
-            // (it would bail), so route SendFileTo/SyncDirTo to our OWN node id.
-            // The relay delivers Target::Agent{self} back to this peer's socket,
-            // where the relay-controller handler runs begin_send_file/begin_sync_dir.
-            // Both relays resolve Agent-targets without excluding the sender, so no
-            // relay change is needed. See docs/ITERATION_LOG.md iter141.
-            let own_id = self.state.read().await.config.id.clone();
-            debug!("Routing {} to own node {} (local host → agent)", tool_name, own_id);
-            self.remote_command(&own_id, command).await?
+            // (it would bail), so source the transfer directly on our own relay
+            // connection, in THIS process.
+            //
+            // This used to dispatch to our OWN node id over the relay. That breaks
+            // whenever a machine has several MCP clients open: they all join under
+            // the same agent id (`list_agents` shows `connections: N`) and
+            // `Target::Agent` delivers to just one of them by capability score. The
+            // transfer then started in a different process with its own
+            // TransferStore, so the id we returned was unknown here — `transfer_get`
+            // said "no such transfer" and the sync ran (or failed) unobservably.
+            // See docs/ITERATION_LOG.md iter141.
+            let (relay, room) = self.relay_room()?;
+            debug!("Sourcing {} on the local relay connection", tool_name);
+            relay
+                .source_transfer(room, command)
+                .await
+                .map_err(exec_error)?
         } else {
             debug!("Executing {} locally", tool_name);
             let state = self.state.read().await;
@@ -798,8 +807,40 @@ impl McpHandler {
             .ok_or_else(|| exec_error("Room not configured"))?;
 
         let agents = relay.list_agents(room).await.map_err(exec_error)?;
-        let text =
-            serde_json::to_string_pretty(&agents).unwrap_or_else(|_| format!("{:?}", agents));
+
+        // Annotate each entry with a real liveness result. The roster only proves
+        // the agent's WebSocket is open, which a wedged agent keeps open too —
+        // reporting that as healthy is what made dead hosts look available and
+        // every command against them hang. `responsive` is computed here rather
+        // than added to `AgentInfo`, which is a wire type the agent fills in and
+        // therefore cannot speak to whether it is currently answering.
+        let ids: Vec<String> = agents.iter().map(|a| a.id.clone()).collect();
+        let alive = relay.probe_liveness(room, &ids).await;
+
+        let annotated: Vec<Value> = agents
+            .iter()
+            .map(|a| {
+                let mut v = serde_json::to_value(a).unwrap_or_else(|_| json!({}));
+                if let Value::Object(map) = &mut v {
+                    let responsive = alive.get(&a.id).copied().unwrap_or(false);
+                    map.insert("responsive".into(), json!(responsive));
+                    if !responsive {
+                        map.insert(
+                            "health".into(),
+                            json!(
+                                "NOT RESPONDING — connected to the relay but no reply to a \
+                                 liveness probe. Commands and transfers to this host will fail; \
+                                 restart the agent on it."
+                            ),
+                        );
+                    }
+                }
+                v
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&annotated)
+            .unwrap_or_else(|_| format!("{:?}", agents));
         Ok(text_result(text))
     }
 
