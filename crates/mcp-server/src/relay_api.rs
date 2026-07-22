@@ -139,6 +139,30 @@ impl McpServer {
         pool.list_agents(room).await
     }
 
+    /// Probe the given agents for liveness (concurrently), reporting which ones
+    /// actually replied. See [`ConnectionPool::probe_liveness`] for why relay
+    /// presence alone is not a health signal.
+    pub async fn probe_liveness(
+        &self,
+        room: &str,
+        ids: &[String],
+    ) -> std::collections::HashMap<String, bool> {
+        let pool = self.connections.read().await;
+        pool.probe_liveness(room, ids).await
+    }
+
+    /// Start a `SendFileTo`/`SyncDirTo` sourced by THIS process, returning its
+    /// transfer id. See [`ConnectionPool::source_transfer`] for why this must not
+    /// be dispatched to our own agent id over the relay.
+    pub async fn source_transfer(
+        &self,
+        room: &str,
+        command: remote_agents_shared::Command,
+    ) -> Result<remote_agents_shared::CommandResult> {
+        let pool = self.connections.read().await;
+        pool.source_transfer(room, command).await
+    }
+
     /// Recommend which idle hosts in a room should be updated (those reporting a
     /// newer published version). Lets the orchestrator roll an update across the
     /// fleet instead of chasing per-host logs.

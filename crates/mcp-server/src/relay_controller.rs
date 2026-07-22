@@ -33,6 +33,18 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// For broadcasts: once at least one reply has arrived, stop waiting after this
 /// much idle time with no new reply (bounds latency if the agent count is stale).
 const FLEET_IDLE_GAP: Duration = Duration::from_secs(3);
+/// Max time `list_agents` waits for a fresh `AgentList` reply before falling
+/// back to the cached list. Returns early the instant the reply arrives; this
+/// is only the slow-relay backstop (replaces the old fixed 100ms sleep that
+/// raced the round-trip and returned stale/empty lists on any slower relay).
+const LIST_AGENTS_WAIT: Duration = Duration::from_secs(3);
+/// Liveness probe budget. An agent can hold its relay WebSocket open while its
+/// command loop is wedged — it then shows up in `list_agents` looking healthy but
+/// answers nothing. A healthy peer replies to `GetInfo` in ~100ms, so this only
+/// costs real time when a peer is actually dead. Used for the `list_agents`
+/// health column and the transfer preflight, both of which must fail fast rather
+/// than sit on `COMMAND_TIMEOUT`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Controller reconnect backoff bounds (mirrors the agent-side connection loop).
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
@@ -95,28 +107,13 @@ pub struct AgentOutcome {
     pub error: Option<String>,
 }
 
-/// A connection to a single room
+/// A connection to a single room.
+///
+/// Holds the same [`HandlerShared`] context the WS and UDP inbound tasks run
+/// on, so a transfer can be SOURCED in this process (`source_transfer`) with
+/// the very maps, cipher and transport that the background tasks use.
 struct RoomConnection {
-    /// Sender for outgoing messages
-    tx: mpsc::Sender<ClientMessage>,
-    /// Cached agent list
-    agents: Arc<RwLock<Vec<AgentInfo>>>,
-    /// Pending command responses
-    pending: PendingMap,
-    /// End-to-end transport cipher for this room.
-    cipher: Cipher,
-    /// Latest autonomous task statuses from push events.
-    events: EventMap,
-    /// Wakes `task_wait` callers when a new event arrives.
-    events_notify: Arc<Notify>,
-    /// Tasks with a reminder cron to auto-cancel on completion.
-    watched: WatchMap,
-    /// UDP transport for direct peer-to-peer communication.
-    // Held to keep the transport alive; the MCP-side UDP data path is still
-    // WIP (plan.md Phase 14: "UDP transport в MCP-сервере"), so it is not yet
-    // read. Remove the allow once that path lands.
-    #[allow(dead_code)]
-    udp_transport: Arc<UdpTransport>,
+    shared: HandlerShared,
 }
 
 /// Pool of connections to relay servers
@@ -188,6 +185,7 @@ impl ConnectionPool {
         let pending: PendingMap = Arc::new(RwLock::new(HashMap::new()));
         let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
         let events_notify = Arc::new(Notify::new());
+        let agents_notify = Arc::new(Notify::new());
         let watched: WatchMap = Arc::new(RwLock::new(HashMap::new()));
 
         // Create UDP signaling channel
@@ -226,6 +224,24 @@ impl ConnectionPool {
         udp_transport.set_session_id(session_id.clone()).await;
         info!("UDP transport initialized");
 
+        // One handler context per connection, shared by the WS task, the UDP
+        // inbound task and `source_transfer`. They must all see the same pending
+        // map / cipher / transport / executor state — a transfer sourced here is
+        // registered in THIS process's transfer store, which is what
+        // `transfer_get` then polls.
+        let shared = HandlerShared {
+            agents,
+            agents_notify,
+            pending,
+            cipher,
+            events,
+            events_notify,
+            watched,
+            tx: tx.clone(),
+            udp_transport,
+            executor_state,
+        };
+
         // Drain inbound UDP frames: resolve replies to our commands and execute
         // commands addressed to us that arrived over a direct UDP channel,
         // replying back over the same channel. Without this the controller could
@@ -236,17 +252,7 @@ impl ConnectionPool {
             // (begin_send_file/begin_sync_dir), not just receive them. A command
             // that starts a transfer rides the direct UDP channel, so it lands
             // here — it must be sourceable here, exactly like the WS path.
-            let shared_udp = HandlerShared {
-                agents: agents.clone(),
-                pending: pending.clone(),
-                cipher: cipher.clone(),
-                events: events.clone(),
-                events_notify: events_notify.clone(),
-                watched: watched.clone(),
-                tx: tx.clone(),
-                udp_transport: udp_transport.clone(),
-                executor_state: executor_state.clone(),
-            };
+            let shared_udp = shared.clone();
             let mut rx_in = udp_inbound_rx;
             tokio::spawn(async move {
                 while let Some((peer_session, data)) = rx_in.recv().await {
@@ -256,32 +262,13 @@ impl ConnectionPool {
         }
 
         // Spawn message handler
-        let agents_clone = agents.clone();
-        let pending_clone = pending.clone();
-        let cipher_clone = cipher.clone();
-        let events_clone = events.clone();
-        let notify_clone = events_notify.clone();
-        let watched_clone = watched.clone();
-        let tx_clone = tx.clone();
-        let udp_transport_clone = udp_transport.clone();
-
-        let executor_clone = executor_state.clone();
         let ws_url_task = ws_url.clone();
         let room_task = room.to_string();
         let token_task = token.to_string();
-        let udp_for_session = udp_transport.clone();
+        let udp_for_session = shared.udp_transport.clone();
+        let shared_ws = shared.clone();
         tokio::spawn(async move {
-            let shared = HandlerShared {
-                agents: agents_clone,
-                pending: pending_clone,
-                cipher: cipher_clone,
-                events: events_clone,
-                events_notify: notify_clone,
-                watched: watched_clone,
-                tx: tx_clone,
-                udp_transport: udp_transport_clone,
-                executor_state: executor_clone,
-            };
+            let shared = shared_ws;
 
             // The first connection is handed in; thereafter the supervisor loop
             // re-dials with exponential backoff so the controller survives relay
@@ -375,19 +362,7 @@ impl ConnectionPool {
         // Request initial agent list
         tx.send(ClientMessage::ListAgents).await?;
 
-        self.rooms.insert(
-            room.to_string(),
-            RoomConnection {
-                tx,
-                agents,
-                pending,
-                cipher,
-                events,
-                events_notify,
-                watched,
-                udp_transport,
-            },
-        );
+        self.rooms.insert(room.to_string(), RoomConnection { shared });
 
         Ok(format!("Connected to room '{}' as session '{}'", room, session_id))
     }
@@ -395,7 +370,7 @@ impl ConnectionPool {
     /// Disconnect from a room
     pub async fn disconnect(&mut self, room: &str) -> Result<()> {
         if let Some(conn) = self.rooms.remove(room) {
-            conn.tx.send(ClientMessage::Close).await?;
+            conn.shared.tx.send(ClientMessage::Close).await?;
         }
         Ok(())
     }
@@ -406,14 +381,88 @@ impl ConnectionPool {
             anyhow::anyhow!("Not connected to room '{}'", room)
         })?;
 
-        // Request fresh list
-        conn.tx.send(ClientMessage::ListAgents).await?;
+        // Register interest in the next fresh `AgentList` BEFORE sending the
+        // request, so a fast relay reply can't fire the notify before we start
+        // waiting (lost-wakeup race). `enable()` arms the waiter without awaiting.
+        let notified = conn.shared.agents_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-        // Wait a bit for response
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Request a fresh list.
+        conn.shared.tx.send(ClientMessage::ListAgents).await?;
 
-        let agents = conn.agents.read().await;
+        // Return as soon as the response lands; fall back to the cached list if
+        // the relay is slow past the deadline. The old fixed 100ms sleep raced
+        // the round-trip: any relay slower than 100ms (public relay/jitter)
+        // returned a stale-or-empty list, which then broke dest_id lookups in
+        // sync_dir/send_file. Waiting on the actual reply removes that race.
+        let _ = timeout(LIST_AGENTS_WAIT, notified).await;
+
+        let agents = conn.shared.agents.read().await;
         Ok(agents.clone())
+    }
+
+    /// Probe each agent for liveness, concurrently, and report which ones
+    /// actually answered.
+    ///
+    /// Relay presence is not health: an agent whose command loop is wedged holds
+    /// its WebSocket open and keeps appearing in the roster as connected and
+    /// `accepts_commands: true`, so every subsequent exec/sync against it hangs
+    /// until some longer timeout fires. A `GetInfo` round trip is the cheapest
+    /// thing that distinguishes the two. Healthy peers answer in ~100ms, so this
+    /// only costs [`PROBE_TIMEOUT`] when a host is genuinely dead.
+    pub async fn probe_liveness(&self, room: &str, ids: &[String]) -> HashMap<String, bool> {
+        let Some(conn) = self.rooms.get(room) else {
+            return HashMap::new();
+        };
+        let probes = ids.iter().map(|id| {
+            let shared = conn.shared.clone();
+            async move {
+                let alive =
+                    send_peer_command(&shared, id, Command::GetInfo, PROBE_TIMEOUT).await.is_ok();
+                (id.clone(), alive)
+            }
+        });
+        futures::future::join_all(probes).await.into_iter().collect()
+    }
+
+    /// SOURCE a transfer (`SendFileTo` / `SyncDirTo`) from THIS process, using
+    /// this room connection's peer-send primitives.
+    ///
+    /// This must never round-trip through the relay to our own agent id: several
+    /// processes on one machine share that id (one per MCP client — `list_agents`
+    /// reports them as `connections: N`), and `Target::Agent` picks exactly one
+    /// of them by capability score. The transfer would then start in a *different*
+    /// process, registered in that process's `TransferStore`, so the returned id
+    /// was unknown to the caller and `transfer_get` answered "no such transfer"
+    /// while the sync ran — or silently failed — out of reach. Sourcing in-process
+    /// keeps the id and the transfer in the same store.
+    pub async fn source_transfer(&self, room: &str, command: Command) -> Result<CommandResult> {
+        let conn = self
+            .rooms
+            .get(room)
+            .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
+        let shared = &conn.shared;
+        let state = shared.executor_state.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "This node runs with --no-agent (no executor), so it cannot source a transfer. \
+                 Set agent_id to a host that can."
+            )
+        })?;
+
+        let id = match command {
+            Command::SendFileTo { src_path, dest_id, dest_path } => {
+                begin_send_file(shared, state, src_path, dest_id, dest_path).await?
+            }
+            Command::SyncDirTo { src_path, dest_id, dest_path, delete, checksum, dry_run, exclude } => {
+                begin_sync_dir(
+                    shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run, exclude,
+                )
+                .await?
+            }
+            other => bail!("not a transfer command: {:?}", other),
+        };
+        Ok(CommandResult::TransferQueued { id })
     }
 
     /// Send a command to agent(s) and return only the successful results.
@@ -476,14 +525,14 @@ impl ConnectionPool {
 
         // Encrypt the command into an opaque envelope before it touches the relay.
         let envelope = payload
-            .encrypt(&conn.cipher)
+            .encrypt(&conn.shared.cipher)
             .map_err(|e| anyhow::anyhow!("failed to encrypt command: {}", e))?;
 
         // How many replies do we expect? Filter the cached agent list with the
         // same rules the relay's resolveTarget uses. This is a hint for early
         // return only — correctness is guaranteed by the deadline backstop.
         let expected = {
-            let agents = conn.agents.read().await;
+            let agents = conn.shared.agents.read().await;
             match &target {
                 Target::Agent { id } => agents.iter().filter(|a| &a.id == id).count(),
                 Target::All => agents.len(),
@@ -506,20 +555,20 @@ impl ConnectionPool {
         // like a MapTask partition then bypasses the relay). The agent replies
         // over WS, correlated by request_id, so the collector below is unchanged.
         let udp_session = {
-            let agents = conn.agents.read().await;
+            let agents = conn.shared.agents.read().await;
             udp_session_for(&agents, &target)
         };
 
         // Register the collector BEFORE sending so no reply can race ahead of it.
         let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
         {
-            let mut pending = conn.pending.write().await;
+            let mut pending = conn.shared.pending.write().await;
             pending.insert(request_id.clone(), reply_tx);
         }
 
         let mut sent_via_udp = false;
         if let Some(session) = &udp_session {
-            if conn.udp_transport.has_udp_channel(session).await {
+            if conn.shared.udp_transport.has_udp_channel(session).await {
                 let frame = UdpFrame::Command {
                     request_id: request_id.clone(),
                     // Agent replies over WS (correlated by request_id), so the
@@ -527,7 +576,7 @@ impl ConnectionPool {
                     from_session: String::new(),
                     payload: envelope.clone(),
                 };
-                if let Ok(true) = conn.udp_transport.send_via_udp(session, &frame.to_bytes()).await {
+                if let Ok(true) = conn.shared.udp_transport.send_via_udp(session, &frame.to_bytes()).await {
                     sent_via_udp = true;
                     debug!("Sent command {} via UDP to {}", request_id, session);
                 }
@@ -541,7 +590,7 @@ impl ConnectionPool {
             // silently dropped. Fail loudly — the only uncapped path is the
             // direct UDP channel, which wasn't available for this send.
             if crate::connection::relay_payload_too_large(envelope.len()) {
-                conn.pending.write().await.remove(&request_id);
+                conn.shared.pending.write().await.remove(&request_id);
                 bail!(
                     "command too large for relay ({} bytes); no direct UDP channel \
                      was available — use a smaller payload or write in chunks",
@@ -555,6 +604,7 @@ impl ConnectionPool {
                 let _ = writeln!(f, "[{}] Sending command {} via WS ({} bytes)", chrono::Utc::now(), request_id, envelope.len());
             }
             if let Err(e) = conn
+                .shared
                 .tx
                 .send(ClientMessage::Command {
                     request_id: request_id.clone(),
@@ -563,7 +613,7 @@ impl ConnectionPool {
                 })
                 .await
             {
-                conn.pending.write().await.remove(&request_id);
+                conn.shared.pending.write().await.remove(&request_id);
                 return Err(e.into());
             }
         }
@@ -574,7 +624,7 @@ impl ConnectionPool {
             use std::io::Write;
             let _ = writeln!(f, "[{}] Waiting for replies to {}, expected={}", chrono::Utc::now(), request_id, expected);
         }
-        let collected = collect_replies(reply_rx, expected, single).await;
+        let collected = collect_replies(reply_rx, expected, single, COMMAND_TIMEOUT).await;
         info!("Collected {} successes, {} errors for command {}", collected.0.len(), collected.1.len(), request_id);
         // Debug: log to file
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
@@ -583,7 +633,7 @@ impl ConnectionPool {
         }
 
         // Single cleanup covering every exit path; late replies are then dropped.
-        conn.pending.write().await.remove(&request_id);
+        conn.shared.pending.write().await.remove(&request_id);
 
         Ok(collected)
     }
@@ -600,7 +650,7 @@ impl ConnectionPool {
             .rooms
             .get(room)
             .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
-        conn.watched.write().await.insert(
+        conn.shared.watched.write().await.insert(
             task_id.to_string(),
             Watch {
                 reminder_name: reminder_name.to_string(),
@@ -624,7 +674,7 @@ impl ConnectionPool {
                 .rooms
                 .get(room)
                 .ok_or_else(|| anyhow::anyhow!("Not connected to room '{}'", room))?;
-            (conn.events.clone(), conn.events_notify.clone())
+            (conn.shared.events.clone(), conn.shared.events_notify.clone())
         };
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -684,10 +734,11 @@ async fn collect_replies(
     mut rx: mpsc::UnboundedReceiver<AgentReply>,
     expected: usize,
     single: bool,
+    budget: Duration,
 ) -> (Vec<(String, CommandResult)>, Vec<(String, String)>) {
     let mut successes: Vec<(String, CommandResult)> = Vec::new();
     let mut errors: Vec<(String, String)> = Vec::new();
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let deadline = Instant::now() + budget;
 
     loop {
         let total = successes.len() + errors.len();
@@ -813,7 +864,7 @@ async fn send_file_slice(
         }
     }
 
-    let (mut ok, mut err) = collect_replies(reply_rx, 1, true).await;
+    let (mut ok, mut err) = collect_replies(reply_rx, 1, true, COMMAND_TIMEOUT).await;
     shared.pending.write().await.remove(&request_id);
     if ok.drain(..).next().is_some() {
         return Ok(());
@@ -827,6 +878,60 @@ async fn send_file_slice(
 /// Start a host↔host file transfer: register progress, best-effort open a direct
 /// UDP channel to the destination, and spawn the streaming task. Returns the
 /// transfer id immediately (progress is polled with `TransferGet`).
+/// Validate the destination BEFORE a transfer id is minted: it must be in the
+/// roster, actually answering, and in a mode that allows writes. Returns its
+/// session id (for the direct-UDP fast path) on success.
+///
+/// The liveness probe is the point. An agent whose command loop is wedged keeps
+/// its relay WebSocket open, so the roster still reports it connected and
+/// `accepts_commands: true`. The old path trusted that, minted a transfer, and
+/// left it sitting in `Queued` for a full `COMMAND_TIMEOUT` before the manifest
+/// request gave up with a bare "peer command timed out" — which reads, to anyone
+/// not polling for a solid minute, as a sync that succeeded instantly. Probing
+/// with `GetInfo` on a short budget turns that into a synchronous, named error.
+///
+/// `GetInfo` also returns the authoritative mode and session id, so this
+/// subsumes the old cached-mode-then-refresh dance: the cache can lag a remote
+/// `set_mode`, and we are paying for a round trip regardless.
+async fn preflight_dest(
+    shared: &HandlerShared,
+    dest_id: &str,
+    op: &str,
+) -> Result<Option<String>> {
+    if !shared.agents.read().await.iter().any(|a| a.id == dest_id) {
+        bail!(
+            "Destination agent '{}' not found. Use list_agents to see available agents.",
+            dest_id
+        );
+    }
+
+    let info = match send_peer_command(shared, dest_id, Command::GetInfo, PROBE_TIMEOUT).await {
+        Ok(CommandResult::Info { info }) => info,
+        Ok(other) => bail!("destination probe returned an unexpected reply: {:?}", other),
+        Err(e) => bail!(
+            "Destination agent '{}' is connected to the relay but not responding \
+             (no reply to a liveness probe within {}s: {e}). Its command loop is likely \
+             wedged — restart the agent on that host, then retry {}.",
+            dest_id,
+            PROBE_TIMEOUT.as_secs(),
+            op
+        ),
+    };
+
+    if !info.mode.allows_write() {
+        bail!(
+            "Destination agent '{}' is in {:?} mode which does not allow writes. \
+             Call set_mode with agent_id='{}' and mode='edit' first, then retry {}.",
+            dest_id,
+            info.mode,
+            dest_id,
+            op
+        );
+    }
+
+    Ok(info.session_id)
+}
+
 async fn begin_send_file(
     shared: &HandlerShared,
     state: &Arc<crate::state::AgentState>,
@@ -845,53 +950,7 @@ async fn begin_send_file(
             .size
     };
 
-    // Check destination agent mode BEFORE starting the transfer. This surfaces
-    // the error synchronously so the LLM knows to call set_mode first.
-    //
-    // The local agents cache may be stale (AgentJoined broadcast not yet received
-    // after a remote set_mode), so if the cache says Plan/Disabled, query the
-    // destination directly via GetInfo to get the authoritative mode.
-    let (dest_mode, dest_session_cached) = {
-        let agents = shared.agents.read().await;
-        let agent = agents.iter().find(|a| a.id == dest_id);
-        match agent {
-            Some(a) => (a.mode, a.session_id.clone()),
-            None => bail!(
-                "Destination agent '{}' not found. Use list_agents to see available agents.",
-                dest_id
-            ),
-        }
-    };
-    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
-    // fix: the cache may lag behind a recent set_mode on the destination).
-    let (final_mode, dest_session) = if !dest_mode.allows_write() {
-        info!("Cached mode {:?} for dest {}, querying GetInfo", dest_mode, dest_id);
-        match send_peer_command(shared, &dest_id, Command::GetInfo).await {
-            Ok(CommandResult::Info { info }) => {
-                info!("GetInfo returned mode {:?} for dest {}", info.mode, dest_id);
-                (info.mode, info.session_id)
-            }
-            Ok(other) => {
-                warn!("GetInfo returned unexpected result {:?}", other);
-                (dest_mode, dest_session_cached)
-            }
-            Err(e) => {
-                warn!("GetInfo failed for {}: {}", dest_id, e);
-                (dest_mode, dest_session_cached) // fallback to cached
-            }
-        }
-    } else {
-        (dest_mode, dest_session_cached)
-    };
-    if !final_mode.allows_write() {
-        bail!(
-            "Destination agent '{}' is in {:?} mode which does not allow writes. \
-             Call set_mode with agent_id='{}' and mode='edit' first, then retry send_file.",
-            dest_id,
-            final_mode,
-            dest_id
-        );
-    }
+    let dest_session = preflight_dest(shared, &dest_id, "send_file").await?;
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
@@ -962,10 +1021,15 @@ async fn begin_send_file(
 /// Used by the folder-sync source for its small control messages (the manifest
 /// query and the delete batch); the file bytes themselves still take the UDP
 /// fast path via [`send_file_slice`].
+/// `budget` bounds the wait for the reply. Control messages that do real work
+/// (manifest walk, delete batch) get the full [`COMMAND_TIMEOUT`]; liveness
+/// probes pass [`PROBE_TIMEOUT`] so a wedged peer fails fast instead of parking
+/// the caller for a minute.
 async fn send_peer_command(
     shared: &HandlerShared,
     dest_id: &str,
     cmd: Command,
+    budget: Duration,
 ) -> Result<CommandResult> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel::<AgentReply>();
@@ -987,7 +1051,7 @@ async fn send_peer_command(
         return Err(e.into());
     }
 
-    let (mut ok, mut err) = collect_replies(reply_rx, 1, true).await;
+    let (mut ok, mut err) = collect_replies(reply_rx, 1, true, budget).await;
     shared.pending.write().await.remove(&request_id);
     if let Some((_, result)) = ok.drain(..).next() {
         return Ok(result);
@@ -1048,42 +1112,7 @@ async fn begin_sync_dir(
             .map_err(|e| anyhow::anyhow!("walk failed: {e}"))??
     };
 
-    // Check destination agent mode BEFORE starting the transfer. This surfaces
-    // the error synchronously so the LLM knows to call set_mode first.
-    //
-    // The local agents cache may be stale (AgentJoined broadcast not yet received
-    // after a remote set_mode), so if the cache says Plan/Disabled, query the
-    // destination directly via GetInfo to get the authoritative mode.
-    let (dest_mode, dest_session_cached) = {
-        let agents = shared.agents.read().await;
-        let agent = agents.iter().find(|a| a.id == dest_id);
-        match agent {
-            Some(a) => (a.mode, a.session_id.clone()),
-            None => bail!(
-                "Destination agent '{}' not found. Use list_agents to see available agents.",
-                dest_id
-            ),
-        }
-    };
-    // If cached mode doesn't allow writes, refresh via GetInfo (race condition
-    // fix: the cache may lag behind a recent set_mode on the destination).
-    let (final_mode, dest_session) = if !dest_mode.allows_write() {
-        match send_peer_command(shared, &dest_id, Command::GetInfo).await {
-            Ok(CommandResult::Info { info }) => (info.mode, info.session_id),
-            _ => (dest_mode, dest_session_cached), // fallback to cached
-        }
-    } else {
-        (dest_mode, dest_session_cached)
-    };
-    if !final_mode.allows_write() {
-        bail!(
-            "Destination agent '{}' is in {:?} mode which does not allow writes. \
-             Call set_mode with agent_id='{}' and mode='edit' first, then retry sync_dir.",
-            dest_id,
-            final_mode,
-            dest_id
-        );
-    }
+    let dest_session = preflight_dest(shared, &dest_id, "sync_dir").await?;
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
@@ -1146,6 +1175,7 @@ async fn run_sync(
         shared,
         dest_id,
         Command::DirManifest { path: dest_path.clone(), with_hash: checksum, exclude },
+        COMMAND_TIMEOUT,
     )
     .await?
     {
@@ -1206,7 +1236,7 @@ async fn run_sync(
     if delete && !plan.to_delete.is_empty() {
         let paths: Vec<String> =
             plan.to_delete.iter().map(|rel| join_remote(&dest_path, rel)).collect();
-        send_peer_command(shared, dest_id, Command::DeletePaths { paths }).await?;
+        send_peer_command(shared, dest_id, Command::DeletePaths { paths }, COMMAND_TIMEOUT).await?;
     }
 
     Ok(())
@@ -1295,25 +1325,53 @@ async fn handle_controller_udp_inbound(
             let Some(state) = executor else {
                 return;
             };
+            // Sourcing a transfer issues its own round trips to the destination
+            // (liveness preflight, manifest query) whose replies arrive on THIS
+            // inbound loop. Awaiting them here deadlocks it, so hand them to a
+            // task that sends the reply itself — same reasoning as the WS
+            // ServerMessage::Command path.
+            if let Ok(cmd @ (Command::SendFileTo { .. } | Command::SyncDirTo { .. })) =
+                Command::decrypt(&payload, cipher)
+            {
+                let (shared, state) = (shared.clone(), state.clone());
+                let (udp, peer_session) = (udp.clone(), peer_session.to_string());
+                tokio::spawn(async move {
+                    let outcome = match cmd {
+                        Command::SendFileTo { src_path, dest_id, dest_path } => {
+                            begin_send_file(&shared, &state, src_path, dest_id, dest_path).await
+                        }
+                        Command::SyncDirTo {
+                            src_path,
+                            dest_id,
+                            dest_path,
+                            delete,
+                            checksum,
+                            dry_run,
+                            exclude,
+                        } => {
+                            begin_sync_dir(
+                                &shared, &state, src_path, dest_id, dest_path, delete, checksum,
+                                dry_run, exclude,
+                            )
+                            .await
+                        }
+                        _ => unreachable!("guarded by the match above"),
+                    };
+                    let reply = match outcome {
+                        Ok(id) => CommandResult::TransferQueued { id }
+                            .encrypt(&shared.cipher)
+                            .ok()
+                            .map(|result| UdpFrame::Result { request_id, result }),
+                        Err(e) => Some(UdpFrame::Error { request_id, error: e.to_string() }),
+                    };
+                    if let Some(f) = reply {
+                        let _ = udp.send_via_udp(&peer_session, &f.to_bytes()).await;
+                    }
+                });
+                return;
+            }
+
             let outcome: Result<CommandResult> = match Command::decrypt(&payload, cipher) {
-                Ok(Command::SendFileTo { src_path, dest_id, dest_path }) => {
-                    begin_send_file(shared, state, src_path, dest_id, dest_path)
-                        .await
-                        .map(|id| CommandResult::TransferQueued { id })
-                }
-                Ok(Command::SyncDirTo {
-                    src_path,
-                    dest_id,
-                    dest_path,
-                    delete,
-                    checksum,
-                    dry_run,
-                    exclude,
-                }) => begin_sync_dir(
-                    shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run, exclude,
-                )
-                .await
-                .map(|id| CommandResult::TransferQueued { id }),
                 Ok(Command::FileRecv { dest_path, offset, bytes, eof, sha256, .. }) => {
                     crate::executor::recv_file_chunk(
                         state, &dest_path, offset, &bytes, eof, sha256.as_deref(), true,
@@ -1341,6 +1399,7 @@ async fn handle_controller_udp_inbound(
 #[derive(Clone)]
 struct HandlerShared {
     agents: Arc<RwLock<Vec<AgentInfo>>>,
+    agents_notify: Arc<Notify>,
     pending: PendingMap,
     cipher: Cipher,
     events: EventMap,
@@ -1395,6 +1454,9 @@ async fn handle_message(bytes: &[u8], shared: &HandlerShared) -> Result<()> {
             let mut list = shared.agents.write().await;
             *list = new_agents;
             debug!("Updated agent list: {} agents", list.len());
+            drop(list);
+            // Wake any `list_agents` caller waiting for this fresh response.
+            shared.agents_notify.notify_waiters();
         }
 
         ServerMessage::AgentJoined { agent } => {
@@ -1467,48 +1529,60 @@ async fn handle_message(bytes: &[u8], shared: &HandlerShared) -> Result<()> {
                 info!("No executor state, ignoring command {}", request_id);
                 return Ok(()); // no executor: we don't run others' commands
             };
+            // SendFileTo/SyncDirTo need the connection's peer-send primitives, so
+            // they're handled here rather than in the generic executor: start a
+            // background transfer and reply with its id.
+            //
+            // Spawn rather than await: sourcing a transfer issues its own round
+            // trips to the destination (the liveness preflight, then the manifest
+            // query). This function runs INLINE in the WebSocket read loop, so
+            // awaiting them here wedges the very loop that must deliver their
+            // replies — a self-deadlock that only unblocks when the probe times
+            // out, turning every relayed sync into a spurious "destination not
+            // responding". Same reasoning as the UdpOffer arm below.
+            if let Ok(cmd @ (Command::SendFileTo { .. } | Command::SyncDirTo { .. })) =
+                Command::decrypt(&payload, &shared.cipher)
+            {
+                let shared = shared.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let started = match cmd {
+                        Command::SendFileTo { src_path, dest_path, dest_id } => {
+                            begin_send_file(&shared, &state, src_path, dest_id, dest_path).await
+                        }
+                        Command::SyncDirTo {
+                            src_path,
+                            dest_id,
+                            dest_path,
+                            delete,
+                            checksum,
+                            dry_run,
+                            exclude,
+                        } => {
+                            begin_sync_dir(
+                                &shared, &state, src_path, dest_id, dest_path, delete, checksum,
+                                dry_run, exclude,
+                            )
+                            .await
+                        }
+                        _ => unreachable!("guarded by the match above"),
+                    };
+                    let reply = match started {
+                        Ok(id) => encrypt_result(
+                            &shared.cipher,
+                            request_id,
+                            CommandResult::TransferQueued { id },
+                        ),
+                        Err(e) => {
+                            ClientMessage::CommandError { request_id, error: e.to_string() }
+                        }
+                    };
+                    let _ = shared.tx.send(reply).await;
+                });
+                return Ok(());
+            }
+
             let reply = match Command::decrypt(&payload, &shared.cipher) {
-                // SendFileTo needs the connection's peer-send primitives, so it's
-                // handled here (not in the generic executor): start a background
-                // transfer and reply immediately with its id.
-                Ok(Command::SendFileTo { src_path, dest_path, dest_id }) => {
-                    match begin_send_file(shared, state, src_path, dest_id, dest_path).await {
-                        Ok(id) => {
-                            encrypt_result(&shared.cipher, request_id, CommandResult::TransferQueued { id })
-                        }
-                        Err(e) => ClientMessage::CommandError {
-                            request_id,
-                            error: e.to_string(),
-                        },
-                    }
-                }
-                // SyncDirTo, like SendFileTo, sources a transfer and needs the
-                // connection's peer-send primitives — handle it here, returning a
-                // transfer id to poll while the folder syncs in the background.
-                Ok(Command::SyncDirTo {
-                    src_path,
-                    dest_id,
-                    dest_path,
-                    delete,
-                    checksum,
-                    dry_run,
-                    exclude,
-                }) => {
-                    match begin_sync_dir(
-                        shared, state, src_path, dest_id, dest_path, delete, checksum, dry_run,
-                        exclude,
-                    )
-                    .await
-                    {
-                        Ok(id) => {
-                            encrypt_result(&shared.cipher, request_id, CommandResult::TransferQueued { id })
-                        }
-                        Err(e) => ClientMessage::CommandError {
-                            request_id,
-                            error: e.to_string(),
-                        },
-                    }
-                }
                 Ok(cmd) => {
                     let is_set_mode = matches!(cmd, Command::SetMode { .. });
                     match crate::executor::execute(&cmd, state).await {
@@ -1668,7 +1742,7 @@ mod tests {
         tx.send(("b".into(), Err("boom".into()))).unwrap();
         tx.send(("c".into(), Ok(CommandResult::Ok))).unwrap();
         // expected=3 → early return without hitting any timeout.
-        let (ok, err) = collect_replies(rx, 3, false).await;
+        let (ok, err) = collect_replies(rx, 3, false, COMMAND_TIMEOUT).await;
         assert_eq!(ok.len(), 2);
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].0, "b");
@@ -1679,7 +1753,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<AgentReply>();
         tx.send(("a".into(), Ok(CommandResult::Ok))).unwrap();
         tx.send(("b".into(), Ok(CommandResult::Ok))).unwrap();
-        let (ok, _err) = collect_replies(rx, 1, true).await;
+        let (ok, _err) = collect_replies(rx, 1, true, COMMAND_TIMEOUT).await;
         assert_eq!(ok.len(), 1, "single target must stop at the first reply");
         assert_eq!(ok[0].0, "a");
     }
@@ -1722,7 +1796,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<AgentReply>();
         tx.send(("".into(), Err("No matching agents found".into()))).unwrap();
         // Single target → returns on first reply (no 60s wait).
-        let (ok, err) = collect_replies(rx, 1, true).await;
+        let (ok, err) = collect_replies(rx, 1, true, COMMAND_TIMEOUT).await;
         assert!(ok.is_empty());
         assert_eq!(err.len(), 1);
     }
@@ -1808,6 +1882,7 @@ mod tests {
         let events: EventMap = Arc::new(RwLock::new(HashMap::new()));
         let shared = HandlerShared {
             agents: Arc::new(RwLock::new(Vec::new())),
+            agents_notify: Arc::new(Notify::new()),
             pending: Arc::new(RwLock::new(HashMap::new())),
             cipher: cipher.clone(),
             events: events.clone(),
@@ -1900,6 +1975,7 @@ mod tests {
         let state = Arc::new(crate::state::AgentState::new(crate::config::Config::default()));
         let shared = HandlerShared {
             agents: Arc::new(RwLock::new(Vec::new())),
+            agents_notify: Arc::new(Notify::new()),
             pending: Arc::new(RwLock::new(HashMap::new())),
             cipher: cipher.clone(),
             events: Arc::new(RwLock::new(HashMap::new())),
@@ -1955,6 +2031,36 @@ mod tests {
         let list = shared.agents.read().await;
         assert_eq!(list.len(), 1, "same id must not appear twice");
         assert_eq!(list[0].name, "x-renamed", "upsert replaces in place");
+    }
+
+    #[tokio::test]
+    async fn agent_list_updates_cache_and_wakes_waiter() {
+        // Regression: `list_agents` used to sleep a fixed 100ms and read the
+        // cache, racing the relay round-trip — a slower reply returned a
+        // stale/empty list (the intermittent `list_agents` error that then
+        // broke dest_id lookups in sync_dir/send_file). The handler must signal
+        // `agents_notify` so a waiter returns the instant the reply lands, and
+        // the wait must be race-free: a waiter armed via `enable()` before the
+        // notify fires must NOT miss the wakeup.
+        let (shared, _rx, _w, _e) = handler_shared();
+
+        // Arm the waiter first (mirrors list_agents: register before request).
+        let notified = shared.agents_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let a = agent("x", Some("s1"));
+        let text = ServerMessage::AgentList { agents: vec![a] }.to_proto_bytes().unwrap();
+        handle_message(&text, &shared).await.unwrap();
+
+        // The notify must already be pending — this resolves without timing out.
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("AgentList must wake a pre-armed list_agents waiter");
+
+        let list = shared.agents.read().await;
+        assert_eq!(list.len(), 1, "AgentList replaces the cached list");
+        assert_eq!(list[0].name, "x");
     }
 
     #[tokio::test]

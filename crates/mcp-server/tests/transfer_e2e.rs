@@ -389,3 +389,248 @@ async fn local_host_to_agent_loopback_round_trips_over_relay() {
         "destination file must match the source"
     );
 }
+
+/// A machine with several MCP clients open joins the relay N times under ONE
+/// agent id (`list_agents` reports `connections: N`). A locally-sourced transfer
+/// must start in the process that asked for it.
+///
+/// Regression: the local `send_file`/`sync_dir` path used to dispatch to our own
+/// agent id over the relay, and `Target::Agent` delivers to exactly one socket
+/// chosen by capability score — so the transfer could start in a *sibling*
+/// process, registered in that process's `TransferStore`. The id came back to a
+/// caller that had never heard of it: `transfer_get` answered "no such transfer"
+/// while the sync ran, or failed, somewhere unobservable. `source_transfer` keeps
+/// the transfer and its id in the same process.
+#[tokio::test]
+async fn local_source_registers_the_transfer_in_this_process() {
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1"); // hermetic: no live STUN
+    let port = start_relay().await;
+    let relay_url = format!("ws://127.0.0.1:{port}");
+
+    let dst_cfg = agent_config("dst-agent", port);
+    tokio::spawn(async move {
+        let _ = connection::run(&dst_cfg).await;
+    });
+
+    // Two peers of the SAME machine: same agent id, separate AgentStates —
+    // exactly what two Claude Code sessions on one box look like to the relay.
+    let mut cfg = agent_config("host-agent", port);
+    cfg.security.transfer_chunk_size = 1000;
+    let state_a = Arc::new(AgentState::new(cfg.clone()));
+    let state_b = Arc::new(AgentState::new(cfg));
+    let peer_a = McpServer::new();
+    let peer_b = McpServer::new();
+    for (peer, state) in [(&peer_a, &state_a), (&peer_b, &state_b)] {
+        peer.join_room(
+            &relay_url,
+            "dev",
+            "secret",
+            None,
+            Some(Box::new(agent_info("host-agent"))),
+            Some(state.clone()),
+        )
+        .await
+        .expect("peer joins room");
+    }
+
+    let mut ready = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(agents) = peer_a.list_agents("dev").await {
+            let has = |id: &str| agents.iter().any(|a| a.id == id);
+            if has("host-agent") && has("dst-agent") {
+                ready = true;
+                break;
+            }
+        }
+    }
+    assert!(ready, "both peers and the destination should register");
+
+    peer_a
+        .set_mode("dev", "dst-agent", AgentMode::Bypass)
+        .await
+        .expect("set dst to bypass");
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("payload.bin");
+    let dst_path = dir.path().join("received.bin");
+    let data: Vec<u8> = (0u8..=255).cycle().take(4000).collect();
+    std::fs::write(&src_path, &data).unwrap();
+
+    // Source it on peer A — the local `send_file` path with no agent_id.
+    let id = match peer_a
+        .source_transfer(
+            "dev",
+            Command::SendFileTo {
+                src_path: src_path.to_string_lossy().to_string(),
+                dest_id: "dst-agent".to_string(),
+                dest_path: dst_path.to_string_lossy().to_string(),
+            },
+        )
+        .await
+        .expect("source the transfer locally")
+    {
+        CommandResult::TransferQueued { id } => id,
+        other => panic!("expected TransferQueued, got {other:?}"),
+    };
+
+    // The returned id must be poll-able right here — this is what broke.
+    assert!(
+        state_a.transfers().get(&id).is_some(),
+        "the caller's own store must know the id it was handed"
+    );
+    assert!(
+        state_b.transfers().get(&id).is_none(),
+        "the sibling process must not have been handed the transfer"
+    );
+
+    let mut done = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match state_a.transfers().get(&id).expect("transfer stays in this store").state {
+            TransferState::Done => {
+                done = true;
+                break;
+            }
+            TransferState::Failed => {
+                panic!("transfer failed: {:?}", state_a.transfers().get(&id).unwrap().error)
+            }
+            _ => {}
+        }
+    }
+    assert!(done, "locally-sourced transfer should reach Done state");
+    assert_eq!(
+        std::fs::read(&dst_path).unwrap(),
+        data,
+        "destination file must match the source"
+    );
+}
+
+/// A peer that holds the relay connection open but runs no executor is exactly
+/// what a wedged agent looks like from the outside: present in the roster,
+/// `accepts_commands: true`, and silent. It stands in for the real failure here —
+/// an agent whose command loop hangs while its WebSocket stays up.
+async fn join_zombie(relay_url: &str, id: &str) {
+    let peer = McpServer::new();
+    peer.join_room(relay_url, "dev", "secret", None, Some(Box::new(agent_info(id))), None)
+        .await
+        .expect("zombie peer joins room");
+    // Keep it in the room for the life of the test.
+    Box::leak(Box::new(peer));
+}
+
+async fn wait_for_agents(peer: &McpServer, ids: &[&str]) {
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(agents) = peer.list_agents("dev").await {
+            if ids.iter().all(|id| agents.iter().any(|a| a.id == *id)) {
+                return;
+            }
+        }
+    }
+    panic!("agents {ids:?} should register");
+}
+
+/// Regression: syncing to an agent that is connected but not answering must fail
+/// synchronously with a diagnosable error, not return a transfer id that then
+/// sits in `Queued` for a full COMMAND_TIMEOUT. The silent-queue behaviour read
+/// as "the sync finished instantly" to anyone who didn't poll for a minute.
+#[tokio::test]
+async fn sync_to_unresponsive_dest_fails_fast_instead_of_queueing() {
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1");
+    let port = start_relay().await;
+    let relay_url = format!("ws://127.0.0.1:{port}");
+
+    join_zombie(&relay_url, "zombie-agent").await;
+
+    let cfg = agent_config("host-agent", port);
+    let state = Arc::new(AgentState::new(cfg));
+    let peer = McpServer::new();
+    peer.join_room(
+        &relay_url,
+        "dev",
+        "secret",
+        None,
+        Some(Box::new(agent_info("host-agent"))),
+        Some(state.clone()),
+    )
+    .await
+    .expect("host peer joins room");
+
+    wait_for_agents(&peer, &["host-agent", "zombie-agent"]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"payload").unwrap();
+
+    let started = std::time::Instant::now();
+    let result = peer
+        .source_transfer(
+            "dev",
+            Command::SyncDirTo {
+                src_path: dir.path().to_string_lossy().to_string(),
+                dest_id: "zombie-agent".to_string(),
+                dest_path: "/tmp/never-written".to_string(),
+                delete: false,
+                checksum: false,
+                dry_run: false,
+                exclude: vec![],
+            },
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(other) => panic!("expected a synchronous error, got {other:?}"),
+    };
+    assert!(
+        err.contains("not responding"),
+        "error should name the unresponsive destination, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "must fail on the probe budget, not the 60s command timeout (took {elapsed:?})"
+    );
+    assert!(
+        !std::path::Path::new("/tmp/never-written").exists(),
+        "nothing should have been written to the destination path"
+    );
+}
+
+/// `list_agents` presence is not health: the probe must separate a live peer from
+/// one that only holds its socket open.
+#[tokio::test]
+async fn probe_liveness_separates_live_peers_from_wedged_ones() {
+    std::env::set_var("REMOTE_AGENTS_NO_STUN", "1");
+    let port = start_relay().await;
+    let relay_url = format!("ws://127.0.0.1:{port}");
+
+    let dst_cfg = agent_config("live-agent", port);
+    tokio::spawn(async move {
+        let _ = connection::run(&dst_cfg).await;
+    });
+    join_zombie(&relay_url, "zombie-agent").await;
+
+    let cfg = agent_config("host-agent", port);
+    let state = Arc::new(AgentState::new(cfg));
+    let peer = McpServer::new();
+    peer.join_room(
+        &relay_url,
+        "dev",
+        "secret",
+        None,
+        Some(Box::new(agent_info("host-agent"))),
+        Some(state),
+    )
+    .await
+    .expect("host peer joins room");
+
+    wait_for_agents(&peer, &["live-agent", "zombie-agent"]).await;
+
+    let alive = peer
+        .probe_liveness("dev", &["live-agent".to_string(), "zombie-agent".to_string()])
+        .await;
+
+    assert_eq!(alive.get("live-agent"), Some(&true), "a running agent must answer the probe");
+    assert_eq!(alive.get("zombie-agent"), Some(&false), "a wedged agent must not be reported alive");
+}
