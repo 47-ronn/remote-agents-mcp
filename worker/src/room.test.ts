@@ -173,4 +173,17 @@ describe('selectTargets', () => {
     const picked = selectTargets(candidates, { type: 'platform', family: 'LINUX' } as Target);
     expect(picked).toEqual(['lin:']);
   });
+
+  it('on a capability tie, agent and broadcast both pick the freshest socket and agree', () => {
+    // Two equally-capable sockets of one machine (a reconnect left a stale,
+    // not-yet-reaped connection behind). Both the single-agent path AND a
+    // broadcast must route to the newer socket — and to the SAME one — so a
+    // command and a fleet sweep never disagree about which connection answers.
+    const candidates = [
+      cand(agent({ id: 'dup', session_id: 'stale', connected_at: 100 })),
+      cand(agent({ id: 'dup', session_id: 'fresh', connected_at: 200 })),
+    ];
+    expect(selectTargets(candidates, { type: 'agent', id: 'dup' } as Target)).toEqual(['dup:fresh']);
+    expect(selectTargets(candidates, { type: 'all' } as Target)).toEqual(['dup:fresh']);
+  });
 });
