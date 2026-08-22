@@ -63,6 +63,14 @@ pub struct RelayState {
     /// every 30s, so a silent gap means the TCP died without a close (NAT/idle
     /// timeout); reaping it stops a phantom session lingering in the room.
     pub idle_timeout: std::time::Duration,
+    /// Close a connection whose single outbound WS write can't complete within
+    /// this window. A peer that stops reading fills its TCP send buffer, so the
+    /// writer's `sink.send().await` blocks indefinitely (backpressure, NOT an
+    /// error) — the connection becomes a half-open "zombie": inbound pings keep
+    /// it past `idle_timeout` while every outbound frame is silently dropped
+    /// (`send_raw`'s full-channel drop). Reaping on a stuck write frees routing
+    /// and stops the drop storm.
+    pub write_timeout: std::time::Duration,
 }
 
 impl RelayState {
@@ -71,12 +79,19 @@ impl RelayState {
             rooms: DashMap::new(),
             token,
             idle_timeout: std::time::Duration::from_secs(90),
+            write_timeout: std::time::Duration::from_secs(30),
         }
     }
 
     /// Override the idle-reaper window (tests use a short value).
     pub fn with_idle_timeout(mut self, d: std::time::Duration) -> Self {
         self.idle_timeout = d;
+        self
+    }
+
+    /// Override the stuck-write reap window (tests use a short value).
+    pub fn with_write_timeout(mut self, d: std::time::Duration) -> Self {
+        self.write_timeout = d;
         self
     }
 

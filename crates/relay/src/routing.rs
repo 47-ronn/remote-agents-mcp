@@ -13,6 +13,21 @@ fn score(info: &AgentInfo) -> u8 {
     (info.accepts_commands as u8) + if info.autonomous { 2 } else { 0 }
 }
 
+/// Rank for choosing which connection to route to among sockets that share one
+/// agent-id: most capable first, then **freshest** (`connected_at`). The
+/// tie-breaker matters when a machine holds more than one live socket — e.g. a
+/// reconnect that left a stale, soon-to-be-reaped connection behind: the fresh
+/// socket outranks it, so commands go to the live one instead of a phantom.
+///
+/// Both the single-agent path and the broadcast dedup use this SAME rank, so
+/// `Target::Agent` and a broadcast that includes the host pick the same socket.
+/// A bare `score` tie was previously resolved by DashMap iteration order, which
+/// differs between the two call sites (`max_by_key` keeps the last equal-max;
+/// dedup keeps the first) — they could route to different sockets for one id.
+fn routing_rank(info: &AgentInfo) -> (u8, u64) {
+    (score(info), info.connected_at)
+}
+
 /// Collapse agent sessions that share one agent-id into a single logical host.
 /// A machine may hold several live connections (many terminals on the same box);
 /// it is listed once, and a capability (autonomous / accepts_commands) is present
@@ -51,17 +66,17 @@ pub fn dedup_agents(room: &Room) -> Vec<AgentInfo> {
 /// broadcast targets so each machine receives a command once (on its most-
 /// capable connection), never several times for its several open terminals.
 fn dedup_targets(room: &Room, pred: impl Fn(&AgentInfo) -> bool) -> Vec<(String, Tx)> {
-    let mut by_id: HashMap<String, (u8, Tx)> = HashMap::new();
+    let mut by_id: HashMap<String, ((u8, u64), Tx)> = HashMap::new();
     for e in room.agents.iter() {
         let info = &e.value().info;
         if !pred(info) {
             continue;
         }
-        let s = score(info);
+        let rank = routing_rank(info);
         match by_id.get(&info.id) {
-            Some((best, _)) if *best >= s => {}
+            Some((best, _)) if *best >= rank => {}
             _ => {
-                by_id.insert(info.id.clone(), (s, e.value().tx.clone()));
+                by_id.insert(info.id.clone(), (rank, e.value().tx.clone()));
             }
         }
     }
@@ -80,13 +95,16 @@ fn dedup_targets(room: &Room, pred: impl Fn(&AgentInfo) -> bool) -> Vec<(String,
 pub fn resolve_targets(room: &Room, target: &Target) -> Vec<(String, Tx)> {
     match target {
         // Pick the single most-capable connection for this id (prefer one that
-        // executes AND is autonomous), so a stale/less-capable terminal of the
-        // same machine can't answer first (e.g. "autonomous not enabled").
+        // executes AND is autonomous), and on a capability tie the freshest
+        // socket, so a stale/less-capable terminal of the same machine — or a
+        // soon-to-be-reaped connection left by a reconnect — can't answer first.
+        // Uses the SAME `routing_rank` as the broadcast dedup, so single-agent
+        // and broadcast never route one id to different sockets.
         Target::Agent { id } => room
             .agents
             .iter()
             .filter(|e| &e.value().info.id == id)
-            .max_by_key(|e| score(&e.value().info))
+            .max_by_key(|e| routing_rank(&e.value().info))
             .map(|e| vec![(id.clone(), e.value().tx.clone())])
             .unwrap_or_default(),
 
@@ -348,5 +366,38 @@ mod tests {
         assert_eq!(resolve_targets(&r, &Target::All).len(), 0);
         // ...but an explicit Agent target still reaches it (self-rejects).
         assert_eq!(resolve_targets(&r, &Target::Agent { id: "x".into() }).len(), 1);
+    }
+
+    // Two EQUALLY-capable sockets share one id (a reconnect that left a stale,
+    // not-yet-reaped connection behind). The freshness tie-break must send both
+    // the single-agent path AND a broadcast to the newer socket — and to the
+    // SAME one. Before `routing_rank`, a bare score tie was resolved by DashMap
+    // iteration order, and `Target::Agent` (max_by_key = last equal-max) vs
+    // dedup (first equal-max) could pick opposite sockets for the same id —
+    // exactly how a phantom socket used to hijack single-agent commands while a
+    // fleet sweep still reached the live one.
+    #[test]
+    fn duplicate_sockets_route_to_freshest_and_single_agrees_with_broadcast() {
+        let r = Room::default();
+        let (mut stale, mut stale_rx) = sess("dup", "s-stale", false, true);
+        let (mut fresh, mut fresh_rx) = sess("dup", "s-fresh", false, true);
+        stale.info.connected_at = 100; // older
+        fresh.info.connected_at = 200; // newer — same score, higher rank
+        r.agents.insert("s-stale".into(), stale);
+        r.agents.insert("s-fresh".into(), fresh);
+
+        // Single-agent → exactly one socket, the fresher one.
+        let hit = resolve_targets(&r, &Target::Agent { id: "dup".into() });
+        assert_eq!(hit.len(), 1);
+        hit[0].1.try_send(b"A".to_vec()).unwrap();
+        assert_eq!(fresh_rx.try_recv().unwrap(), b"A", "single-agent hits the fresh socket");
+        assert!(stale_rx.try_recv().is_err(), "stale socket must not receive");
+
+        // Broadcast lists the id once, on the SAME fresh socket.
+        let all = resolve_targets(&r, &Target::All);
+        let dup = all.iter().find(|(id, _)| id == "dup").expect("dup present once");
+        dup.1.try_send(b"B".to_vec()).unwrap();
+        assert_eq!(fresh_rx.try_recv().unwrap(), b"B", "broadcast hits the same fresh socket");
+        assert!(stale_rx.try_recv().is_err(), "single and broadcast agree on one socket");
     }
 }

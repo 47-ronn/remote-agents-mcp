@@ -13,9 +13,32 @@ use remote_agents_shared::{AgentInfo, ClientMessage, Endpoint, ServerMessage};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+/// Drain the outbound channel to the socket, bounding each write by
+/// `write_timeout` so a peer that stops reading — its TCP send buffer full, so
+/// `sink.send().await` blocks forever rather than erroring — is treated as dead
+/// instead of parking the writer. Returning ends the task, which the reader loop
+/// observes (`_ = &mut writer => break`) and then reaps the connection. Without
+/// the bound such a peer becomes an immortal half-open "zombie": its inbound
+/// pings keep it past `idle_timeout` while its full outbound channel makes
+/// routing silently drop every frame to it (`send_raw`).
+async fn run_writer<S>(mut rx: mpsc::Receiver<Vec<u8>>, mut sink: S, write_timeout: Duration)
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    while let Some(bytes) = rx.recv().await {
+        match tokio::time::timeout(write_timeout, sink.send(Message::Binary(bytes))).await {
+            Ok(Ok(())) => {}
+            // Write error (peer gone) OR the write didn't complete in time (peer
+            // not draining): the connection is unusable — stop, so it's reaped.
+            _ => break,
+        }
+    }
+}
 
 /// Drive a single accepted WebSocket connection to completion.
 pub async fn handle_socket(
@@ -70,14 +93,8 @@ pub async fn handle_socket(
     }
 
     // --- 2. Outbound channel + writer task ---------------------------------
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
-    let mut writer = tokio::spawn(async move {
-        while let Some(bytes) = rx.recv().await {
-            if sink.send(Message::Binary(bytes)).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
+    let mut writer = tokio::spawn(run_writer(rx, sink, state.write_timeout));
 
     // Reflect the client's observed public IP so it can build a reachable UDP
     // endpoint for hole-punching (port is the client's own UDP port, so 0 here).
@@ -714,5 +731,44 @@ mod routing_tests {
         let flow = handle_client_msg(&[0xff, 0x00, 0x42, 0x13], &room, "s", &None, &self_tx);
         assert!(flow.is_continue());
         assert!(next(&mut rx).is_none());
+    }
+
+    // A peer that stops reading fills its TCP send buffer, so the writer's
+    // `sink.send().await` blocks forever (backpressure, not an error). The
+    // `write_timeout` must make the writer give up and END, so the reader loop
+    // reaps the connection instead of it lingering as a drop-everything zombie.
+    #[tokio::test]
+    async fn writer_reaps_a_peer_that_stops_reading() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        // Never ready to send — models a full send buffer: every write blocks.
+        struct BlockingSink;
+        impl futures::Sink<Message> for BlockingSink {
+            type Error = ();
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), ()> {
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
+        let writer = tokio::spawn(run_writer(rx, BlockingSink, Duration::from_millis(200)));
+        tx.try_send(vec![1, 2, 3]).unwrap(); // one frame the blocked sink can't deliver
+
+        // The 200ms write timeout trips; the writer must then exit. Without the
+        // bound this would hang forever (the 5s guard would fire and fail).
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer must exit after a stuck write, not hang forever")
+            .unwrap();
     }
 }
