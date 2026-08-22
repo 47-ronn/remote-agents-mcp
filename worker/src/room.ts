@@ -30,6 +30,19 @@ export function scoreAgent(a: AgentInfo): number {
 }
 
 /**
+ * Rank two sockets that share one agent-id: most capable first, then the
+ * FRESHEST (`connected_at`). Returns >0 if `a` outranks `b`, <0 if `b` does.
+ * The freshness tie-break matters when a machine holds several sockets — e.g. a
+ * reconnect that left a stale, not-yet-reaped connection behind: the fresh
+ * socket wins, so commands go to the live one, not a phantom. Kept in lock-step
+ * with the Rust relay's `routing::routing_rank`.
+ */
+export function rankAgent(a: AgentInfo, b: AgentInfo): number {
+  const s = scoreAgent(a) - scoreAgent(b);
+  return s !== 0 ? s : (a.connected_at ?? 0) - (b.connected_at ?? 0);
+}
+
+/**
  * Collapse sockets sharing one agent-id into a single logical host. A machine
  * has a stable agent-id but may hold several connections at once (many
  * terminals / AI sessions on the same box); it is listed once, and a capability
@@ -80,7 +93,7 @@ export function selectTargets<T>(
     const matches = candidates.filter((c) => c.info.id === target.id);
     if (matches.length <= 1) return matches.map((c) => c.item);
     const best = matches.reduce((b, c) =>
-      scoreAgent(c.info) > scoreAgent(b.info) ? c : b
+      rankAgent(c.info, b.info) > 0 ? c : b
     );
     return [best.item];
   }
@@ -103,7 +116,7 @@ export function selectTargets<T>(
   for (const c of candidates) {
     if (!matchesTarget(c.info)) continue;
     const prev = byId.get(c.info.id);
-    if (!prev || scoreAgent(c.info) > scoreAgent(prev.info)) byId.set(c.info.id, c);
+    if (!prev || rankAgent(c.info, prev.info) > 0) byId.set(c.info.id, c);
   }
   return [...byId.values()].map((c) => c.item);
 }
