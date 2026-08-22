@@ -171,11 +171,17 @@ impl AgentState {
         let _ = self.info_update_tx.send(());
     }
 
-    /// Take the info update receiver (called once by connection loop).
-    pub async fn take_info_update_rx(&self) -> mpsc::UnboundedReceiver<()> {
-        // Replace with a dummy channel; the real one is taken by connection.
-        let (_, dummy_rx) = mpsc::unbounded_channel::<()>();
-        std::mem::replace(&mut *self.info_update_rx.lock().await, dummy_rx)
+    /// Await the next agent-info update (mode change), like [`Self::next_event`].
+    ///
+    /// Borrowed, never taken: an earlier version handed the receiver out and
+    /// left a *closed* dummy behind, so the second call — i.e. the connection
+    /// loop's first reconnect — got a receiver whose `recv()` returned `None`
+    /// immediately. In `select!` that branch then fired on every iteration,
+    /// hot-spinning the loop and flooding the relay with `UpdateAgent` frames
+    /// (which the relay fans out to every peer, starving command routing).
+    /// Keeping the sender in `self` means `recv()` pends forever when idle.
+    pub async fn next_info_update(&self) -> Option<()> {
+        self.info_update_rx.lock().await.recv().await
     }
 
     /// The shared scheduler.
@@ -372,5 +378,43 @@ mod tests {
         a.set_mode(AgentMode::Bypass).await;
         assert_eq!(a.mode().await, AgentMode::Bypass);
         assert_eq!(b.mode().await, AgentMode::Plan); // unaffected
+    }
+
+    // Regression: the info-update channel must survive a relay reconnect.
+    //
+    // It used to be *taken* by the connection loop, which left a closed dummy
+    // behind; the loop's second call (the first reconnect) therefore got a
+    // receiver that returned `None` instantly, re-arming its `select!` branch
+    // every iteration. That hot spin flooded the relay with `UpdateAgent`
+    // frames, which the relay fanned out to every peer until command routing
+    // starved (commands to other agents timed out).
+    #[tokio::test]
+    async fn info_updates_survive_a_reconnect_and_never_yield_none() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let state = AgentState::new(Config::default());
+
+        // First "connection": a mode change delivers exactly one update.
+        state.set_mode(AgentMode::Edit).await;
+        assert_eq!(state.next_info_update().await, Some(()));
+
+        // Second "connection" (post-reconnect): idle must PEND, not return
+        // `None` — a `None` here is the hot spin this test guards against.
+        assert!(
+            timeout(Duration::from_millis(100), state.next_info_update())
+                .await
+                .is_err(),
+            "info-update channel closed after reconnect — select! would hot-spin"
+        );
+
+        // ...and it still delivers, so mode changes reach the relay as before.
+        state.set_mode(AgentMode::Bypass).await;
+        assert_eq!(
+            timeout(Duration::from_secs(5), state.next_info_update())
+                .await
+                .expect("mode change must wake the connection loop"),
+            Some(())
+        );
     }
 }

@@ -313,9 +313,6 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     let mut alive = true;
     let mut commands_handled: u64 = 0;
 
-    // Channel for agent info updates (e.g. mode change)
-    let mut info_update_rx = state.take_info_update_rx().await;
-
     // Main loop
     loop {
         tokio::select! {
@@ -385,18 +382,21 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                 }
             }
 
-            // Outbound agent events (e.g. autonomous task completion)
-            event = state.next_event() => {
-                if let Some(event) = event {
-                    let msg = ClientMessage::Notify { event };
-                    if let Ok(bytes) = msg.to_proto_bytes() {
-                        let _ = ws_tx.send(Message::Binary(bytes)).await;
-                    }
+            // Outbound agent events (e.g. autonomous task completion).
+            // `Some(event)`, same reason as the info-update branch below: a
+            // closed channel must disable the branch, not re-arm it forever.
+            Some(event) = state.next_event() => {
+                let msg = ClientMessage::Notify { event };
+                if let Ok(bytes) = msg.to_proto_bytes() {
+                    let _ = ws_tx.send(Message::Binary(bytes)).await;
                 }
             }
 
-            // Agent info update (e.g. mode change) - send UpdateAgent to relay
-            _ = info_update_rx.recv() => {
+            // Agent info update (e.g. mode change) - send UpdateAgent to relay.
+            // `Some(())` (not `_`): a closed channel yields `None` forever, and
+            // matching it would re-arm this branch every iteration — a hot spin
+            // that floods the relay. The pattern disables the branch instead.
+            Some(()) = state.next_info_update() => {
                 let updated_info = build_agent_info(config, state.mode().await);
                 let msg = ClientMessage::UpdateAgent {
                     agent_info: Box::new(updated_info),
