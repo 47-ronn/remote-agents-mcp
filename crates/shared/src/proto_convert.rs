@@ -421,6 +421,39 @@ impl From<proto::SessionMessage> for crate::SessionMessage {
     }
 }
 
+impl From<crate::SessionSearchHit> for proto::SessionSearchHit {
+    fn from(h: crate::SessionSearchHit) -> Self {
+        proto::SessionSearchHit {
+            provider: h.provider,
+            session_id: h.session_id,
+            title: h.title,
+            role: h.role,
+            snippet: h.snippet,
+            ts: h.ts,
+            seq: h.seq,
+            score: h.score,
+            match_count: h.match_count,
+            cwd: h.cwd,
+        }
+    }
+}
+impl From<proto::SessionSearchHit> for crate::SessionSearchHit {
+    fn from(h: proto::SessionSearchHit) -> Self {
+        crate::SessionSearchHit {
+            provider: h.provider,
+            session_id: h.session_id,
+            title: h.title,
+            role: h.role,
+            snippet: h.snippet,
+            ts: h.ts,
+            seq: h.seq,
+            score: h.score,
+            match_count: h.match_count,
+            cwd: h.cwd,
+        }
+    }
+}
+
 impl From<crate::FileMeta> for proto::FileMeta {
     fn from(m: crate::FileMeta) -> Self {
         proto::FileMeta {
@@ -711,7 +744,12 @@ impl TryFrom<crate::Command> for proto::Command {
             D::TaskGet { id } => K::TaskGet(p::TaskGet { id }),
             D::TaskList => K::TaskList(p::TaskList {}),
             D::SessionList => K::SessionList(p::SessionList {}),
-            D::SessionGet { provider, id } => K::SessionGet(p::SessionGet { provider, id }),
+            D::SessionGet { provider, id, around_seq, window } => {
+                K::SessionGet(p::SessionGet { provider, id, around_seq, window })
+            }
+            D::SessionSearch { query, providers, limit } => {
+                K::SessionSearch(p::SessionSearch { query, providers, limit })
+            }
             D::SessionResume { provider, id, prompt } => {
                 K::SessionResume(p::SessionResume { provider, id, prompt })
             }
@@ -793,7 +831,17 @@ impl TryFrom<proto::Command> for crate::Command {
             K::TaskGet(e) => D::TaskGet { id: e.id },
             K::TaskList(_) => D::TaskList,
             K::SessionList(_) => D::SessionList,
-            K::SessionGet(e) => D::SessionGet { provider: e.provider, id: e.id },
+            K::SessionGet(e) => D::SessionGet {
+                provider: e.provider,
+                id: e.id,
+                around_seq: e.around_seq,
+                window: e.window,
+            },
+            K::SessionSearch(e) => D::SessionSearch {
+                query: e.query,
+                providers: e.providers,
+                limit: e.limit,
+            },
             K::SessionResume(e) => {
                 D::SessionResume { provider: e.provider, id: e.id, prompt: e.prompt }
             }
@@ -912,6 +960,9 @@ impl TryFrom<crate::CommandResult> for proto::CommandResult {
             D::SessionTranscript { messages } => K::SessionTranscript(p::SessionTranscript {
                 messages: messages.into_iter().map(Into::into).collect(),
             }),
+            D::SessionSearch { hits } => K::SessionSearch(p::SessionSearchResult {
+                hits: hits.into_iter().map(Into::into).collect(),
+            }),
             D::MapResult { job_id, partition_id, output, success, error } => {
                 K::MapResult(p::MapResult { job_id, partition_id, output, success, error })
             }
@@ -1000,6 +1051,9 @@ impl TryFrom<proto::CommandResult> for crate::CommandResult {
             },
             K::SessionTranscript(e) => D::SessionTranscript {
                 messages: e.messages.into_iter().map(Into::into).collect(),
+            },
+            K::SessionSearch(e) => D::SessionSearch {
+                hits: e.hits.into_iter().map(Into::into).collect(),
             },
             K::MapResult(e) => D::MapResult {
                 job_id: e.job_id,
@@ -1314,7 +1368,10 @@ mod tests {
             Command::TaskGet { id: "t".into() },
             Command::TaskList,
             Command::SessionList,
-            Command::SessionGet { provider: "claude".into(), id: "s".into() },
+            Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: None, window: None },
+            Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: Some(3), window: Some(5) },
+            Command::SessionSearch { query: "q".into(), providers: vec!["claude".into()], limit: Some(20) },
+            Command::SessionSearch { query: "q".into(), providers: vec![], limit: None },
             Command::SessionResume { provider: "claude".into(), id: "s".into(), prompt: "go".into() },
             Command::SessionTerminate { id: "s".into() },
             Command::FileStat { path: "/f".into() },
@@ -1384,6 +1441,20 @@ mod tests {
             CommandResult::TunnelList { tunnels: vec![] },
             CommandResult::SessionList { sessions: vec![SessionMeta { provider: "claude".into(), id: "s".into(), title: "t".into(), updated: 1, cwd: None, resumable: true }], active: vec!["s".into()] },
             CommandResult::SessionTranscript { messages: vec![SessionMessage { role: "user".into(), text: "hi".into(), ts: Some(1) }] },
+            CommandResult::SessionSearch {
+                hits: vec![crate::SessionSearchHit {
+                    provider: "claude".into(),
+                    session_id: "s".into(),
+                    title: "t".into(),
+                    role: "user".into(),
+                    snippet: "…hi…".into(),
+                    ts: Some(1),
+                    seq: 2,
+                    score: 1.5,
+                    match_count: 3,
+                    cwd: Some("/r".into()),
+                }],
+            },
             CommandResult::MapResult { job_id: "j".into(), partition_id: 0, output: "o".into(), success: true, error: None },
             CommandResult::MapResult { job_id: "j".into(), partition_id: 1, output: "".into(), success: false, error: Some("boom".into()) },
             CommandResult::ReduceResult { job_id: "j".into(), output: "o".into(), success: true, error: None },

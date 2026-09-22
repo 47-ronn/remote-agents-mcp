@@ -28,6 +28,12 @@ over end-to-end-encrypted channels.
 - **Direct UDP data channel** (QUIC) with hole-punching and WebSocket fallback.
 - **File & folder transfer** host→host over that channel — single files
   (`send_file`) or rsync-like directory sync (`sync_dir`), SHA-256 verified.
+- **Fleet-wide AI-chat history search** — every host indexes its provider
+  transcripts locally (Tantivy/BM25): claude, opencode, codex, cursor,
+  cline/roo/kilo, zed, gemini, qwen, goose, continue. `session_search` /
+  `fleet_session_search` return ranked, cited snippets with a jump link to
+  the exact context window — instant recall of past decisions, solutions, and
+  failed approaches across the whole fleet.
 
 ## Architecture
 
@@ -255,8 +261,11 @@ the registered entry.
 | `git_status` / `git_pull` / `git_commit` / `git_push` | Git operations |
 | `schedule_add` / `schedule_remove` / `schedule_list` | Cron-style tasks on a host |
 | `task_dispatch` / `task_get` / `task_list` / `task_wait` | Autonomous AI tasks run with the host's own credentials |
+| `session_list` / `session_get` | Browse the host's AI-chat history (claude / opencode / codex / cline / roo / kilo / zed / cursor / gemini / qwen / goose / continue); `session_get` fetches a transcript or a window around one message |
+| `session_search` | Full-text search over the host's AI-chat history — a local Tantivy (BM25) index of every provider transcript, returning ranked cited snippets with `session_id` + message position (follow up with `session_get { around_seq }` for the context) |
 | `list_agents` | List agents connected to the relay room |
 | `fleet_exec` / `fleet_read` / `fleet_write` / `fleet_git` / `fleet_search` | Run an operation across the fleet — `target = all \| tag1,tag2 \| os:<family>` |
+| `fleet_session_search` | Search the AI-chat history across the whole fleet: every matched host queries its local index, hits merge by score with host labels |
 | `file_search` / `file_stat` / `send_file` / `transfer_get` | Find files on a host, and move a file host→host (UDP, SHA-256 verified) |
 | `sync_dir` | Sync a directory tree host→host (rsync-like): only changed/new files are sent, with optional `delete`, `checksum`, and `dry_run` |
 | `tunnel_start` / `tunnel_list` / `tunnel_stop` | Expose a host's local port at a public `*.trycloudflare.com` URL via a Cloudflare quick tunnel (`cloudflared` auto-downloaded; Edit/Bypass) |
@@ -295,9 +304,38 @@ preview photos in chat, download, and move files between hosts with live
 progress.
 
 It also surfaces each host's **local AI-chat history**, labelled by host and
-provider. Resumable providers (`claude`, `opencode`) can be continued from the
-panel; the VS Code agents (`cline`, `roo`, `kilo`) and `zed` are imported
-read-only — their transcripts are shown for browsing but have no headless resume.
+provider. Resumable providers (`claude`, `opencode`, `codex`) can be continued from
+the panel (`claude -p --resume`, `opencode run -s`, `codex exec resume`);
+the VS Code agents (`cline`, `roo`, `kilo`), `zed`, `cursor`'s agent
+transcripts, `gemini`/`qwen` recordings, and `goose`/`continue` stores are
+imported read-only — shown for browsing, no headless resume.
+
+## Chat-history search (ctx-style)
+
+Every host keeps a **local full-text index** of its imported AI-chat history
+(`~/.local/share/remote-agents/sessions-index/`, [Tantivy](https://github.com/quickwit-oss/tantivy)
+— one document per message) across all imported providers: claude, opencode,
+codex, cline, roo, kilo, zed, cursor, gemini, qwen, goose, continue. `session_search` (and the fleet-wide
+`fleet_session_search`) return **ranked, cited snippets** — provider, session
+id, message position, score — instead of whole transcripts, which makes them
+an order of magnitude more token-efficient for an AI to consume than pulling
+transcripts. Follow up with `session_get { provider, id, around_seq }` to open
+just the context window around a hit.
+
+- **Incremental**: a sidecar manifest fingerprints each session (its `updated`
+  value); only changed sessions are re-parsed, removed ones deleted. A refresh
+  is one atomic writer commit — searchers never see a partial generation.
+- **Budgeted**: a refresh has a soft 90 s budget; a huge first-time history
+  converges over a few searches instead of blocking one.
+- **Freshness**: the index refreshes before answering when stale (TTL 60 s) and
+  is marked dirty whenever an autonomous task finishes (a chat turn just
+  extended/created a provider session).
+- **Tunable**: `REMOTE_AGENTS_SESSION_INDEX_MAX` caps sessions indexed per
+  provider (default 2000).
+
+The browser panel has the same search in the dialog sidebar: it fans the query
+out to every host, merges hits by score, and a click jumps straight to the
+cited context window.
 
 ## Security modes
 

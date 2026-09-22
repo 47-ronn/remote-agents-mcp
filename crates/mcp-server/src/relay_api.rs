@@ -258,6 +258,30 @@ impl McpServer {
         .await
     }
 
+    /// Full-text search over AI-chat history across a fleet (single agent,
+    /// all, or tagged) — "which session discussed this, on which host". Each
+    /// host queries its local session index and returns ranked cited hits.
+    pub async fn fleet_session_search(
+        &self,
+        room: &str,
+        target: remote_agents_shared::Target,
+        query: &str,
+        providers: Vec<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<AgentOutcome>> {
+        let pool = self.connections.read().await;
+        pool.send_command_fleet(
+            room,
+            target,
+            remote_agents_shared::Command::SessionSearch {
+                query: query.to_string(),
+                providers,
+                limit,
+            },
+        )
+        .await
+    }
+
     /// Write a file across a fleet (single agent, all, or tagged).
     pub async fn fleet_write(
         &self,

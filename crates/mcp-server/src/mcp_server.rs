@@ -401,6 +401,45 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             }),
             vec![],
         ),
+        make_tool(
+            "session_list",
+            "List the host's AI-chat history sessions (claude / opencode / codex / cline / roo / \
+             kilo / zed / cursor / gemini / qwen / goose / continue), newest first, with live flags.",
+            json!({
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec![],
+        ),
+        make_tool(
+            "session_get",
+            "Fetch a session transcript. Without `around_seq`: the capped whole transcript. With \
+             `around_seq` (a message position from a session_search hit): only `window` messages \
+             centered on it — the cited context, token-efficient.",
+            json!({
+                "provider": {"type": "string", "description": "Provider: claude | opencode | codex | cline | roo | kilo | zed | cursor | gemini | qwen | goose | continue"},
+                "id": {"type": "string", "description": "Provider-native session id"},
+                "around_seq": {"type": "integer", "description": "Optional: 0-based message position to center the window on (from a search hit)"},
+                "window": {"type": "integer", "description": "Optional: half-window size when around_seq is set (default 5)"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["provider", "id"],
+        ),
+        make_tool(
+            "session_search",
+            "Full-text search over the host's AI-chat history (local BM25 index of claude / \
+             opencode / codex / cline / roo / kilo / zed / cursor / gemini / qwen / \
+             goose / continue transcripts). Returns ranked, cited snippets \
+             with session id + message position (`seq`) — follow up with session_get \
+             {provider, id, around_seq: seq} for the context. Much more token-efficient than \
+             pulling whole transcripts.",
+            json!({
+                "query": {"type": "string", "description": "Search query (terms, file names, error messages…); BM25-ranked"},
+                "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict to these providers (e.g. [\"claude\", \"opencode\"]); empty = all"},
+                "limit": {"type": "integer", "description": "Optional: max sessions to return (default 20)"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["query"],
+        ),
     ];
 
     // Add relay-only tools when connected
@@ -490,6 +529,21 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
                     "files": {"type": "array", "items": {"type": "string"}, "description": "Files to stage (for commit; empty = all)"}
                 }),
                 vec!["target", "op", "repo"],
+            ),
+            make_tool(
+                "fleet_session_search",
+                "Full-text search over AI-chat history across the fleet: every matched agent \
+                 searches its local BM25 index of provider transcripts (claude / opencode / codex / \
+                 cline / roo / kilo / zed / cursor / gemini / qwen / goose / continue) and results are merged by score with a host label. \
+                 Use it to surface decisions, prior solutions, and failed approaches from past \
+                 sessions on any host.",
+                json!({
+                    "target": {"type": "string", "description": "Target: 'all', comma-separated tags, or 'os:<family>' (e.g. 'os:linux')"},
+                    "query": {"type": "string", "description": "Search query (terms, file names, error messages…); BM25-ranked"},
+                    "providers": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict to these providers; empty = all"},
+                    "limit": {"type": "integer", "description": "Optional: max sessions per host (default 20)"}
+                }),
+                vec!["target", "query"],
             ),
         ]);
     }
@@ -588,6 +642,7 @@ impl ServerHandler for McpHandler {
             "fleet_exec" => return self.handle_fleet_exec(args).await,
             "fleet_read" => return self.handle_fleet_read(args).await,
             "fleet_search" => return self.handle_fleet_search(args).await,
+            "fleet_session_search" => return self.handle_fleet_session_search(args).await,
             "fleet_write" => return self.handle_fleet_write(args).await,
             "fleet_git" => return self.handle_fleet_git(args).await,
             "mapreduce" => return self.handle_mapreduce(args).await,
@@ -787,6 +842,18 @@ impl McpHandler {
                 id: get_str_required("id")?,
             },
             "task_list" => Command::TaskList,
+            "session_list" => Command::SessionList,
+            "session_get" => Command::SessionGet {
+                provider: get_str_required("provider")?,
+                id: get_str_required("id")?,
+                around_seq: get_u64("around_seq").map(|v| v.min(u32::MAX as u64) as u32),
+                window: get_u64("window").map(|v| v.min(u32::MAX as u64) as u32),
+            },
+            "session_search" => Command::SessionSearch {
+                query: get_str_required("query")?,
+                providers: get_str_vec("providers"),
+                limit: get_u64("limit").map(|v| v.min(u32::MAX as u64) as u32),
+            },
             other => {
                 return Err(CallToolError::unknown_tool(other.to_string()));
             }
@@ -973,6 +1040,95 @@ impl McpHandler {
         Ok(text_result(format_outcomes(results)))
     }
 
+    /// Handle fleet_session_search tool: every matched host searches its local
+    /// chat-history index; hits are merged across hosts by score (each keeps
+    /// its host label) so the answer reads as one ranked list.
+    async fn handle_fleet_session_search(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, CallToolError> {
+        let (relay, room) = self.relay_room()?;
+        let target = parse_target(
+            args.get("target").and_then(|v| v.as_str()).ok_or_else(|| {
+                parse_error("fleet_session_search", "missing required field 'target'")
+            })?,
+        );
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| parse_error("fleet_session_search", "missing required field 'query'"))?;
+        let providers = args
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(u32::MAX as u64) as u32);
+
+        let results = relay
+            .fleet_session_search(room, target, query, providers, limit)
+            .await
+            .map_err(exec_error)?;
+
+        // Merge each host's hits into one score-ranked list with host labels;
+        // hosts that errored are reported in a footer, not mixed into ranking.
+        let mut merged: Vec<(String, remote_agents_shared::SessionSearchHit)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for outcome in results {
+            match outcome.result {
+                Some(CommandResult::SessionSearch { hits }) => {
+                    for h in hits {
+                        merged.push((outcome.agent_id.clone(), h));
+                    }
+                }
+                Some(_) => unreachable!("fleet_session_search wraps SessionSearch results"),                None => failed.push(format!(
+                    "[{}] {}",
+                    outcome.agent_id,
+                    outcome.error.unwrap_or_else(|| "unknown error".into())
+                )),
+            }
+        }
+        merged.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let limit = limit.unwrap_or(crate::session_index::DEFAULT_LIMIT as u32) as usize;
+        merged.truncate(limit);
+
+        let mut text = if merged.is_empty() {
+            "0 hits".to_string()
+        } else {
+            format!("{} hit(s):", merged.len())
+        };
+        for (host, h) in &merged {
+            let when = h
+                .ts
+                .map(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms as i64)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "?".into())
+                })
+                .unwrap_or_else(|| "—".into());
+            let cwd = h.cwd.as_deref().map(|c| format!("  @ {c}")).unwrap_or_default();
+            text.push_str(&format!(
+                "\n[{}/{}] {} — {}  ({}; {when}; {} match(es); score {:.2}){cwd}\n    {}",
+                host, h.provider, h.session_id, h.title, h.role, h.match_count, h.score, h.snippet
+            ));
+        }
+        if !failed.is_empty() {
+            text.push_str(&format!("\n---\n{} host(s) failed:\n{}", failed.len(), failed.join("\n")));
+        }
+        if !merged.is_empty() {
+            text.push_str(
+                "\n(open the context with session_get: agent_id of the host + provider + id + around_seq from a hit)",
+            );
+        }
+        Ok(text_result(text))
+    }
+
     /// Handle fleet_write tool.
     async fn handle_fleet_write(
         &self,
@@ -1146,6 +1302,33 @@ fn format_outcomes(results: Vec<crate::relay_controller::AgentOutcome>) -> Strin
         .join("\n---\n")
 }
 
+/// Compact ctx-style rendering of session-search hits: one line per session
+/// (provider, id, role, date, match count, score) + the cited snippet, plus a
+/// `session_get` hint for jumping to the context.
+fn format_session_search(hits: &[remote_agents_shared::SessionSearchHit]) -> String {
+    if hits.is_empty() {
+        return "0 hits".to_string();
+    }
+    let mut out = format!("{} hit(s):", hits.len());
+    for h in hits {
+        let when = h
+            .ts
+            .map(|ms| {
+                chrono::DateTime::from_timestamp_millis(ms as i64)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "?".into())
+            })
+            .unwrap_or_else(|| "—".into());
+        let cwd = h.cwd.as_deref().map(|c| format!("  @ {c}")).unwrap_or_default();
+        out.push_str(&format!(
+            "\n[{}] {} — {}  ({}; {when}; {} match(es); score {:.2}){cwd}\n    {}",
+            h.provider, h.session_id, h.title, h.role, h.match_count, h.score, h.snippet
+        ));
+    }
+    out.push_str("\n(open the context with session_get: provider + id + around_seq from a hit)");
+    out
+}
+
 /// Human-readable byte size (B / KB / MB / GB).
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
@@ -1264,6 +1447,7 @@ fn format_result(result: &CommandResult) -> String {
         CommandResult::SessionTranscript { messages } => {
             serde_json::to_string_pretty(messages).unwrap_or_else(|_| format!("{:?}", messages))
         }
+        CommandResult::SessionSearch { hits } => format_session_search(hits),
         CommandResult::FileMeta { meta } => format_file_meta(meta),
         CommandResult::FileChunk { data, eof } => {
             format!("file chunk: {} base64 bytes (eof={})", data.len(), eof)
@@ -1604,13 +1788,14 @@ mod tests {
             "mapreduce",
             "fleet_read",
             "fleet_search",
+            "fleet_session_search",
             "fleet_write",
             "fleet_git",
         ] {
             assert!(relay.contains(&t.to_string()), "missing relay tool {t}");
         }
         // Enabling the relay only adds tools, never removes them.
-        assert_eq!(relay.len(), local.len() + 8);
+        assert_eq!(relay.len(), local.len() + 9);
     }
 
     // --- format_result ------------------------------------------------------
@@ -1629,6 +1814,39 @@ mod tests {
         assert!(s.contains("--- stderr ---"));
         assert!(s.contains("err"));
         assert!(s.contains("[exit code: 2, 150ms]"));
+    }
+
+    #[test]
+    fn format_result_session_search_cites_snippet_and_context_hint() {
+        use remote_agents_shared::SessionSearchHit;
+        let r = CommandResult::SessionSearch {
+            hits: vec![SessionSearchHit {
+                provider: "claude".into(),
+                session_id: "abc-123".into(),
+                title: "Fix the build".into(),
+                role: "user".into(),
+                snippet: "…the migration failed because…".into(),
+                ts: Some(1_758_000_000_000),
+                seq: 4,
+                score: 0.87,
+                match_count: 3,
+                cwd: Some("/repo".into()),
+            }],
+        };
+        let s = format_result(&r);
+        assert!(s.contains("1 hit(s)"));
+        assert!(s.contains("[claude] abc-123 — Fix the build"));
+        assert!(s.contains("user;"));
+        assert!(s.contains("3 match(es); score 0.87"));
+        assert!(s.contains("…the migration failed because…"));
+        assert!(s.contains("@ /repo"));
+        assert!(s.contains("session_get"));
+    }
+
+    #[test]
+    fn format_result_session_search_empty() {
+        let s = format_result(&CommandResult::SessionSearch { hits: vec![] });
+        assert_eq!(s, "0 hits");
     }
 
     #[test]

@@ -50,6 +50,7 @@ rust-mcp-sdk = { version = "0.9", default-features = false, features = ["server"
 rust-mcp-macros = "0.9"
 schemars = "0.8"
 async-trait = "0.1"
+tantivy = "0.26.2"
 
 # Process-group kill on timeout (Unix): SIGKILL the whole `sh -c` tree, not just
 # the leader, so backgrounded grandchildren can't be orphaned to init.

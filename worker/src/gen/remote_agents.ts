@@ -232,6 +232,34 @@ export interface SessionMessage {
   ts?: number | undefined;
 }
 
+/**
+ * One full-text search hit over the local AI-chat history index (ctx-style:
+ * a cited event inside a session, not a whole transcript).
+ */
+export interface SessionSearchHit {
+  provider: string;
+  sessionId: string;
+  title: string;
+  /** Role of the matched message: user | assistant | system. */
+  role: string;
+  /** Snippet around the best matching term (already truncated, fit for UI). */
+  snippet: string;
+  /** Unix ms of the matched message, if known (0 = unknown). */
+  ts?:
+    | number
+    | undefined;
+  /**
+   * 0-based position of the message in the session transcript (for
+   * session_get { around_seq } windowing).
+   */
+  seq: number;
+  /** BM25 score of the matched message. */
+  score: number;
+  /** How many messages of this session matched the query. */
+  matchCount: number;
+  cwd?: string | undefined;
+}
+
 export interface FileMeta {
   path: string;
   size: number;
@@ -246,6 +274,15 @@ export interface TransferStatus {
   bytes: number;
   total: number;
   error?: string | undefined;
+  filesDone: number;
+  filesTotal: number;
+}
+
+export interface ManifestEntry {
+  relPath: string;
+  size: number;
+  mtimeMs: number;
+  sha256?: string | undefined;
 }
 
 export interface TunnelInfo {
@@ -387,6 +424,7 @@ export interface Command {
     | { $case: "sessionGet"; sessionGet: Command_SessionGet }
     | { $case: "sessionResume"; sessionResume: Command_SessionResume }
     | { $case: "sessionTerminate"; sessionTerminate: Command_SessionTerminate }
+    | { $case: "sessionSearch"; sessionSearch: Command_SessionSearch }
     | { $case: "fileStat"; fileStat: Command_FileStat }
     | { $case: "fileChunk"; fileChunk: Command_FileChunk }
     | { $case: "fileThumb"; fileThumb: Command_FileThumb }
@@ -401,6 +439,9 @@ export interface Command {
     | { $case: "getInfo"; getInfo: Command_GetInfo }
     | { $case: "mapTask"; mapTask: Command_MapTask }
     | { $case: "reduceTask"; reduceTask: Command_ReduceTask }
+    | { $case: "dirManifest"; dirManifest: Command_DirManifest }
+    | { $case: "syncDirTo"; syncDirTo: Command_SyncDirTo }
+    | { $case: "deletePaths"; deletePaths: Command_DeletePaths }
     | undefined;
 }
 
@@ -481,6 +522,20 @@ export interface Command_SessionList {
 export interface Command_SessionGet {
   provider: string;
   id: string;
+  /**
+   * When set, return only `window` messages *around* message #`around_seq`
+   * (cited context for a search hit) instead of the capped whole transcript.
+   */
+  aroundSeq?: number | undefined;
+  window?: number | undefined;
+}
+
+export interface Command_SessionSearch {
+  query: string;
+  /** Restrict to these providers (claude, opencode, cline, …); empty = all. */
+  providers: string[];
+  /** Max hits to return (per host); default 20. */
+  limit?: number | undefined;
 }
 
 export interface Command_SessionResume {
@@ -532,6 +587,26 @@ export interface Command_FileRecv {
 
 export interface Command_TransferGet {
   id: string;
+}
+
+export interface Command_DirManifest {
+  path: string;
+  withHash: boolean;
+  exclude: string[];
+}
+
+export interface Command_SyncDirTo {
+  srcPath: string;
+  destId: string;
+  destPath: string;
+  delete: boolean;
+  checksum: boolean;
+  dryRun: boolean;
+  exclude: string[];
+}
+
+export interface Command_DeletePaths {
+  paths: string[];
 }
 
 export interface Command_TunnelStart {
@@ -591,6 +666,8 @@ export interface CommandResult {
     | { $case: "mapResult"; mapResult: CommandResult_MapResult }
     | { $case: "reduceResult"; reduceResult: CommandResult_ReduceResult }
     | { $case: "ok"; ok: CommandResult_Ok }
+    | { $case: "dirManifest"; dirManifest: CommandResult_DirManifestResult }
+    | { $case: "sessionSearch"; sessionSearch: CommandResult_SessionSearchResult }
     | undefined;
 }
 
@@ -673,6 +750,11 @@ export interface CommandResult_Transfer {
   status: TransferStatus | undefined;
 }
 
+export interface CommandResult_DirManifestResult {
+  entries: ManifestEntry[];
+  rootExists: boolean;
+}
+
 export interface CommandResult_TunnelStarted {
   tunnel: TunnelInfo | undefined;
 }
@@ -688,6 +770,10 @@ export interface CommandResult_SessionListResult {
 
 export interface CommandResult_SessionTranscript {
   messages: SessionMessage[];
+}
+
+export interface CommandResult_SessionSearchResult {
+  hits: SessionSearchHit[];
 }
 
 export interface CommandResult_MapResult {
@@ -1539,6 +1625,229 @@ export const SessionMessage: MessageFns<SessionMessage> = {
   },
 };
 
+function createBaseSessionSearchHit(): SessionSearchHit {
+  return {
+    provider: "",
+    sessionId: "",
+    title: "",
+    role: "",
+    snippet: "",
+    ts: undefined,
+    seq: 0,
+    score: 0,
+    matchCount: 0,
+    cwd: undefined,
+  };
+}
+
+export const SessionSearchHit: MessageFns<SessionSearchHit> = {
+  encode(message: SessionSearchHit, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.provider !== "") {
+      writer.uint32(10).string(message.provider);
+    }
+    if (message.sessionId !== "") {
+      writer.uint32(18).string(message.sessionId);
+    }
+    if (message.title !== "") {
+      writer.uint32(26).string(message.title);
+    }
+    if (message.role !== "") {
+      writer.uint32(34).string(message.role);
+    }
+    if (message.snippet !== "") {
+      writer.uint32(42).string(message.snippet);
+    }
+    if (message.ts !== undefined) {
+      writer.uint32(48).uint64(message.ts);
+    }
+    if (message.seq !== 0) {
+      writer.uint32(56).uint32(message.seq);
+    }
+    if (message.score !== 0) {
+      writer.uint32(69).float(message.score);
+    }
+    if (message.matchCount !== 0) {
+      writer.uint32(72).uint32(message.matchCount);
+    }
+    if (message.cwd !== undefined) {
+      writer.uint32(82).string(message.cwd);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionSearchHit {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionSearchHit();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.provider = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.title = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.role = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.snippet = reader.string();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.ts = longToNumber(reader.uint64());
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.seq = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 69) {
+            break;
+          }
+
+          message.score = reader.float();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.matchCount = reader.uint32();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.cwd = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionSearchHit {
+    return {
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      title: isSet(object.title) ? globalThis.String(object.title) : "",
+      role: isSet(object.role) ? globalThis.String(object.role) : "",
+      snippet: isSet(object.snippet) ? globalThis.String(object.snippet) : "",
+      ts: isSet(object.ts) ? globalThis.Number(object.ts) : undefined,
+      seq: isSet(object.seq) ? globalThis.Number(object.seq) : 0,
+      score: isSet(object.score) ? globalThis.Number(object.score) : 0,
+      matchCount: isSet(object.matchCount)
+        ? globalThis.Number(object.matchCount)
+        : isSet(object.match_count)
+        ? globalThis.Number(object.match_count)
+        : 0,
+      cwd: isSet(object.cwd) ? globalThis.String(object.cwd) : undefined,
+    };
+  },
+
+  toJSON(message: SessionSearchHit): unknown {
+    const obj: any = {};
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.title !== "") {
+      obj.title = message.title;
+    }
+    if (message.role !== "") {
+      obj.role = message.role;
+    }
+    if (message.snippet !== "") {
+      obj.snippet = message.snippet;
+    }
+    if (message.ts !== undefined) {
+      obj.ts = Math.round(message.ts);
+    }
+    if (message.seq !== 0) {
+      obj.seq = Math.round(message.seq);
+    }
+    if (message.score !== 0) {
+      obj.score = message.score;
+    }
+    if (message.matchCount !== 0) {
+      obj.matchCount = Math.round(message.matchCount);
+    }
+    if (message.cwd !== undefined) {
+      obj.cwd = message.cwd;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SessionSearchHit>): SessionSearchHit {
+    return SessionSearchHit.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SessionSearchHit>): SessionSearchHit {
+    const message = createBaseSessionSearchHit();
+    message.provider = object.provider ?? "";
+    message.sessionId = object.sessionId ?? "";
+    message.title = object.title ?? "";
+    message.role = object.role ?? "";
+    message.snippet = object.snippet ?? "";
+    message.ts = object.ts ?? undefined;
+    message.seq = object.seq ?? 0;
+    message.score = object.score ?? 0;
+    message.matchCount = object.matchCount ?? 0;
+    message.cwd = object.cwd ?? undefined;
+    return message;
+  },
+};
+
 function createBaseFileMeta(): FileMeta {
   return { path: "", size: 0, modified: undefined, mime: "", isImage: false };
 }
@@ -1668,7 +1977,7 @@ export const FileMeta: MessageFns<FileMeta> = {
 };
 
 function createBaseTransferStatus(): TransferStatus {
-  return { id: "", state: 0, bytes: 0, total: 0, error: undefined };
+  return { id: "", state: 0, bytes: 0, total: 0, error: undefined, filesDone: 0, filesTotal: 0 };
 }
 
 export const TransferStatus: MessageFns<TransferStatus> = {
@@ -1687,6 +1996,12 @@ export const TransferStatus: MessageFns<TransferStatus> = {
     }
     if (message.error !== undefined) {
       writer.uint32(42).string(message.error);
+    }
+    if (message.filesDone !== 0) {
+      writer.uint32(48).uint32(message.filesDone);
+    }
+    if (message.filesTotal !== 0) {
+      writer.uint32(56).uint32(message.filesTotal);
     }
     return writer;
   },
@@ -1738,6 +2053,22 @@ export const TransferStatus: MessageFns<TransferStatus> = {
           message.error = reader.string();
           continue;
         }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.filesDone = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.filesTotal = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1754,6 +2085,16 @@ export const TransferStatus: MessageFns<TransferStatus> = {
       bytes: isSet(object.bytes) ? globalThis.Number(object.bytes) : 0,
       total: isSet(object.total) ? globalThis.Number(object.total) : 0,
       error: isSet(object.error) ? globalThis.String(object.error) : undefined,
+      filesDone: isSet(object.filesDone)
+        ? globalThis.Number(object.filesDone)
+        : isSet(object.files_done)
+        ? globalThis.Number(object.files_done)
+        : 0,
+      filesTotal: isSet(object.filesTotal)
+        ? globalThis.Number(object.filesTotal)
+        : isSet(object.files_total)
+        ? globalThis.Number(object.files_total)
+        : 0,
     };
   },
 
@@ -1774,6 +2115,12 @@ export const TransferStatus: MessageFns<TransferStatus> = {
     if (message.error !== undefined) {
       obj.error = message.error;
     }
+    if (message.filesDone !== 0) {
+      obj.filesDone = Math.round(message.filesDone);
+    }
+    if (message.filesTotal !== 0) {
+      obj.filesTotal = Math.round(message.filesTotal);
+    }
     return obj;
   },
 
@@ -1787,6 +2134,124 @@ export const TransferStatus: MessageFns<TransferStatus> = {
     message.bytes = object.bytes ?? 0;
     message.total = object.total ?? 0;
     message.error = object.error ?? undefined;
+    message.filesDone = object.filesDone ?? 0;
+    message.filesTotal = object.filesTotal ?? 0;
+    return message;
+  },
+};
+
+function createBaseManifestEntry(): ManifestEntry {
+  return { relPath: "", size: 0, mtimeMs: 0, sha256: undefined };
+}
+
+export const ManifestEntry: MessageFns<ManifestEntry> = {
+  encode(message: ManifestEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.relPath !== "") {
+      writer.uint32(10).string(message.relPath);
+    }
+    if (message.size !== 0) {
+      writer.uint32(16).uint64(message.size);
+    }
+    if (message.mtimeMs !== 0) {
+      writer.uint32(24).uint64(message.mtimeMs);
+    }
+    if (message.sha256 !== undefined) {
+      writer.uint32(34).string(message.sha256);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ManifestEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseManifestEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.relPath = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.size = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.mtimeMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.sha256 = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ManifestEntry {
+    return {
+      relPath: isSet(object.relPath)
+        ? globalThis.String(object.relPath)
+        : isSet(object.rel_path)
+        ? globalThis.String(object.rel_path)
+        : "",
+      size: isSet(object.size) ? globalThis.Number(object.size) : 0,
+      mtimeMs: isSet(object.mtimeMs)
+        ? globalThis.Number(object.mtimeMs)
+        : isSet(object.mtime_ms)
+        ? globalThis.Number(object.mtime_ms)
+        : 0,
+      sha256: isSet(object.sha256) ? globalThis.String(object.sha256) : undefined,
+    };
+  },
+
+  toJSON(message: ManifestEntry): unknown {
+    const obj: any = {};
+    if (message.relPath !== "") {
+      obj.relPath = message.relPath;
+    }
+    if (message.size !== 0) {
+      obj.size = Math.round(message.size);
+    }
+    if (message.mtimeMs !== 0) {
+      obj.mtimeMs = Math.round(message.mtimeMs);
+    }
+    if (message.sha256 !== undefined) {
+      obj.sha256 = message.sha256;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ManifestEntry>): ManifestEntry {
+    return ManifestEntry.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ManifestEntry>): ManifestEntry {
+    const message = createBaseManifestEntry();
+    message.relPath = object.relPath ?? "";
+    message.size = object.size ?? 0;
+    message.mtimeMs = object.mtimeMs ?? 0;
+    message.sha256 = object.sha256 ?? undefined;
     return message;
   },
 };
@@ -3659,6 +4124,9 @@ export const Command: MessageFns<Command> = {
       case "sessionTerminate":
         Command_SessionTerminate.encode(message.kind.sessionTerminate, writer.uint32(146).fork()).join();
         break;
+      case "sessionSearch":
+        Command_SessionSearch.encode(message.kind.sessionSearch, writer.uint32(290).fork()).join();
+        break;
       case "fileStat":
         Command_FileStat.encode(message.kind.fileStat, writer.uint32(154).fork()).join();
         break;
@@ -3700,6 +4168,15 @@ export const Command: MessageFns<Command> = {
         break;
       case "reduceTask":
         Command_ReduceTask.encode(message.kind.reduceTask, writer.uint32(258).fork()).join();
+        break;
+      case "dirManifest":
+        Command_DirManifest.encode(message.kind.dirManifest, writer.uint32(266).fork()).join();
+        break;
+      case "syncDirTo":
+        Command_SyncDirTo.encode(message.kind.syncDirTo, writer.uint32(274).fork()).join();
+        break;
+      case "deletePaths":
+        Command_DeletePaths.encode(message.kind.deletePaths, writer.uint32(282).fork()).join();
         break;
     }
     return writer;
@@ -3865,6 +4342,17 @@ export const Command: MessageFns<Command> = {
           };
           continue;
         }
+        case 36: {
+          if (tag !== 290) {
+            break;
+          }
+
+          message.kind = {
+            $case: "sessionSearch",
+            sessionSearch: Command_SessionSearch.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
         case 19: {
           if (tag !== 154) {
             break;
@@ -3977,6 +4465,30 @@ export const Command: MessageFns<Command> = {
           message.kind = { $case: "reduceTask", reduceTask: Command_ReduceTask.decode(reader, reader.uint32()) };
           continue;
         }
+        case 33: {
+          if (tag !== 266) {
+            break;
+          }
+
+          message.kind = { $case: "dirManifest", dirManifest: Command_DirManifest.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 34: {
+          if (tag !== 274) {
+            break;
+          }
+
+          message.kind = { $case: "syncDirTo", syncDirTo: Command_SyncDirTo.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.kind = { $case: "deletePaths", deletePaths: Command_DeletePaths.decode(reader, reader.uint32()) };
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4058,6 +4570,10 @@ export const Command: MessageFns<Command> = {
         ? { $case: "sessionTerminate", sessionTerminate: Command_SessionTerminate.fromJSON(object.sessionTerminate) }
         : isSet(object.session_terminate)
         ? { $case: "sessionTerminate", sessionTerminate: Command_SessionTerminate.fromJSON(object.session_terminate) }
+        : isSet(object.sessionSearch)
+        ? { $case: "sessionSearch", sessionSearch: Command_SessionSearch.fromJSON(object.sessionSearch) }
+        : isSet(object.session_search)
+        ? { $case: "sessionSearch", sessionSearch: Command_SessionSearch.fromJSON(object.session_search) }
         : isSet(object.fileStat)
         ? { $case: "fileStat", fileStat: Command_FileStat.fromJSON(object.fileStat) }
         : isSet(object.file_stat)
@@ -4114,6 +4630,18 @@ export const Command: MessageFns<Command> = {
         ? { $case: "reduceTask", reduceTask: Command_ReduceTask.fromJSON(object.reduceTask) }
         : isSet(object.reduce_task)
         ? { $case: "reduceTask", reduceTask: Command_ReduceTask.fromJSON(object.reduce_task) }
+        : isSet(object.dirManifest)
+        ? { $case: "dirManifest", dirManifest: Command_DirManifest.fromJSON(object.dirManifest) }
+        : isSet(object.dir_manifest)
+        ? { $case: "dirManifest", dirManifest: Command_DirManifest.fromJSON(object.dir_manifest) }
+        : isSet(object.syncDirTo)
+        ? { $case: "syncDirTo", syncDirTo: Command_SyncDirTo.fromJSON(object.syncDirTo) }
+        : isSet(object.sync_dir_to)
+        ? { $case: "syncDirTo", syncDirTo: Command_SyncDirTo.fromJSON(object.sync_dir_to) }
+        : isSet(object.deletePaths)
+        ? { $case: "deletePaths", deletePaths: Command_DeletePaths.fromJSON(object.deletePaths) }
+        : isSet(object.delete_paths)
+        ? { $case: "deletePaths", deletePaths: Command_DeletePaths.fromJSON(object.delete_paths) }
         : undefined,
     };
   },
@@ -4156,6 +4684,8 @@ export const Command: MessageFns<Command> = {
       obj.sessionResume = Command_SessionResume.toJSON(message.kind.sessionResume);
     } else if (message.kind?.$case === "sessionTerminate") {
       obj.sessionTerminate = Command_SessionTerminate.toJSON(message.kind.sessionTerminate);
+    } else if (message.kind?.$case === "sessionSearch") {
+      obj.sessionSearch = Command_SessionSearch.toJSON(message.kind.sessionSearch);
     } else if (message.kind?.$case === "fileStat") {
       obj.fileStat = Command_FileStat.toJSON(message.kind.fileStat);
     } else if (message.kind?.$case === "fileChunk") {
@@ -4184,6 +4714,12 @@ export const Command: MessageFns<Command> = {
       obj.mapTask = Command_MapTask.toJSON(message.kind.mapTask);
     } else if (message.kind?.$case === "reduceTask") {
       obj.reduceTask = Command_ReduceTask.toJSON(message.kind.reduceTask);
+    } else if (message.kind?.$case === "dirManifest") {
+      obj.dirManifest = Command_DirManifest.toJSON(message.kind.dirManifest);
+    } else if (message.kind?.$case === "syncDirTo") {
+      obj.syncDirTo = Command_SyncDirTo.toJSON(message.kind.syncDirTo);
+    } else if (message.kind?.$case === "deletePaths") {
+      obj.deletePaths = Command_DeletePaths.toJSON(message.kind.deletePaths);
     }
     return obj;
   },
@@ -4323,6 +4859,15 @@ export const Command: MessageFns<Command> = {
         }
         break;
       }
+      case "sessionSearch": {
+        if (object.kind?.sessionSearch !== undefined && object.kind?.sessionSearch !== null) {
+          message.kind = {
+            $case: "sessionSearch",
+            sessionSearch: Command_SessionSearch.fromPartial(object.kind.sessionSearch),
+          };
+        }
+        break;
+      }
       case "fileStat": {
         if (object.kind?.fileStat !== undefined && object.kind?.fileStat !== null) {
           message.kind = { $case: "fileStat", fileStat: Command_FileStat.fromPartial(object.kind.fileStat) };
@@ -4410,6 +4955,30 @@ export const Command: MessageFns<Command> = {
       case "reduceTask": {
         if (object.kind?.reduceTask !== undefined && object.kind?.reduceTask !== null) {
           message.kind = { $case: "reduceTask", reduceTask: Command_ReduceTask.fromPartial(object.kind.reduceTask) };
+        }
+        break;
+      }
+      case "dirManifest": {
+        if (object.kind?.dirManifest !== undefined && object.kind?.dirManifest !== null) {
+          message.kind = {
+            $case: "dirManifest",
+            dirManifest: Command_DirManifest.fromPartial(object.kind.dirManifest),
+          };
+        }
+        break;
+      }
+      case "syncDirTo": {
+        if (object.kind?.syncDirTo !== undefined && object.kind?.syncDirTo !== null) {
+          message.kind = { $case: "syncDirTo", syncDirTo: Command_SyncDirTo.fromPartial(object.kind.syncDirTo) };
+        }
+        break;
+      }
+      case "deletePaths": {
+        if (object.kind?.deletePaths !== undefined && object.kind?.deletePaths !== null) {
+          message.kind = {
+            $case: "deletePaths",
+            deletePaths: Command_DeletePaths.fromPartial(object.kind.deletePaths),
+          };
         }
         break;
       }
@@ -5492,7 +6061,7 @@ export const Command_SessionList: MessageFns<Command_SessionList> = {
 };
 
 function createBaseCommand_SessionGet(): Command_SessionGet {
-  return { provider: "", id: "" };
+  return { provider: "", id: "", aroundSeq: undefined, window: undefined };
 }
 
 export const Command_SessionGet: MessageFns<Command_SessionGet> = {
@@ -5502,6 +6071,12 @@ export const Command_SessionGet: MessageFns<Command_SessionGet> = {
     }
     if (message.id !== "") {
       writer.uint32(18).string(message.id);
+    }
+    if (message.aroundSeq !== undefined) {
+      writer.uint32(24).uint32(message.aroundSeq);
+    }
+    if (message.window !== undefined) {
+      writer.uint32(32).uint32(message.window);
     }
     return writer;
   },
@@ -5529,6 +6104,22 @@ export const Command_SessionGet: MessageFns<Command_SessionGet> = {
           message.id = reader.string();
           continue;
         }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.aroundSeq = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.window = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5542,6 +6133,12 @@ export const Command_SessionGet: MessageFns<Command_SessionGet> = {
     return {
       provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
       id: isSet(object.id) ? globalThis.String(object.id) : "",
+      aroundSeq: isSet(object.aroundSeq)
+        ? globalThis.Number(object.aroundSeq)
+        : isSet(object.around_seq)
+        ? globalThis.Number(object.around_seq)
+        : undefined,
+      window: isSet(object.window) ? globalThis.Number(object.window) : undefined,
     };
   },
 
@@ -5553,6 +6150,12 @@ export const Command_SessionGet: MessageFns<Command_SessionGet> = {
     if (message.id !== "") {
       obj.id = message.id;
     }
+    if (message.aroundSeq !== undefined) {
+      obj.aroundSeq = Math.round(message.aroundSeq);
+    }
+    if (message.window !== undefined) {
+      obj.window = Math.round(message.window);
+    }
     return obj;
   },
 
@@ -5563,6 +6166,102 @@ export const Command_SessionGet: MessageFns<Command_SessionGet> = {
     const message = createBaseCommand_SessionGet();
     message.provider = object.provider ?? "";
     message.id = object.id ?? "";
+    message.aroundSeq = object.aroundSeq ?? undefined;
+    message.window = object.window ?? undefined;
+    return message;
+  },
+};
+
+function createBaseCommand_SessionSearch(): Command_SessionSearch {
+  return { query: "", providers: [], limit: undefined };
+}
+
+export const Command_SessionSearch: MessageFns<Command_SessionSearch> = {
+  encode(message: Command_SessionSearch, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.query !== "") {
+      writer.uint32(10).string(message.query);
+    }
+    for (const v of message.providers) {
+      writer.uint32(18).string(v!);
+    }
+    if (message.limit !== undefined) {
+      writer.uint32(24).uint32(message.limit);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Command_SessionSearch {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommand_SessionSearch();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.query = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.providers.push(reader.string());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.limit = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Command_SessionSearch {
+    return {
+      query: isSet(object.query) ? globalThis.String(object.query) : "",
+      providers: globalThis.Array.isArray(object?.providers)
+        ? object.providers.map((e: any) => globalThis.String(e))
+        : [],
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : undefined,
+    };
+  },
+
+  toJSON(message: Command_SessionSearch): unknown {
+    const obj: any = {};
+    if (message.query !== "") {
+      obj.query = message.query;
+    }
+    if (message.providers?.length) {
+      obj.providers = message.providers;
+    }
+    if (message.limit !== undefined) {
+      obj.limit = Math.round(message.limit);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Command_SessionSearch>): Command_SessionSearch {
+    return Command_SessionSearch.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Command_SessionSearch>): Command_SessionSearch {
+    const message = createBaseCommand_SessionSearch();
+    message.query = object.query ?? "";
+    message.providers = object.providers?.map((e) => e) || [];
+    message.limit = object.limit ?? undefined;
     return message;
   },
 };
@@ -6349,6 +7048,334 @@ export const Command_TransferGet: MessageFns<Command_TransferGet> = {
   },
 };
 
+function createBaseCommand_DirManifest(): Command_DirManifest {
+  return { path: "", withHash: false, exclude: [] };
+}
+
+export const Command_DirManifest: MessageFns<Command_DirManifest> = {
+  encode(message: Command_DirManifest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== "") {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.withHash !== false) {
+      writer.uint32(16).bool(message.withHash);
+    }
+    for (const v of message.exclude) {
+      writer.uint32(26).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Command_DirManifest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommand_DirManifest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.path = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.withHash = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.exclude.push(reader.string());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Command_DirManifest {
+    return {
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      withHash: isSet(object.withHash)
+        ? globalThis.Boolean(object.withHash)
+        : isSet(object.with_hash)
+        ? globalThis.Boolean(object.with_hash)
+        : false,
+      exclude: globalThis.Array.isArray(object?.exclude) ? object.exclude.map((e: any) => globalThis.String(e)) : [],
+    };
+  },
+
+  toJSON(message: Command_DirManifest): unknown {
+    const obj: any = {};
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.withHash !== false) {
+      obj.withHash = message.withHash;
+    }
+    if (message.exclude?.length) {
+      obj.exclude = message.exclude;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Command_DirManifest>): Command_DirManifest {
+    return Command_DirManifest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Command_DirManifest>): Command_DirManifest {
+    const message = createBaseCommand_DirManifest();
+    message.path = object.path ?? "";
+    message.withHash = object.withHash ?? false;
+    message.exclude = object.exclude?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseCommand_SyncDirTo(): Command_SyncDirTo {
+  return { srcPath: "", destId: "", destPath: "", delete: false, checksum: false, dryRun: false, exclude: [] };
+}
+
+export const Command_SyncDirTo: MessageFns<Command_SyncDirTo> = {
+  encode(message: Command_SyncDirTo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.srcPath !== "") {
+      writer.uint32(10).string(message.srcPath);
+    }
+    if (message.destId !== "") {
+      writer.uint32(18).string(message.destId);
+    }
+    if (message.destPath !== "") {
+      writer.uint32(26).string(message.destPath);
+    }
+    if (message.delete !== false) {
+      writer.uint32(32).bool(message.delete);
+    }
+    if (message.checksum !== false) {
+      writer.uint32(40).bool(message.checksum);
+    }
+    if (message.dryRun !== false) {
+      writer.uint32(48).bool(message.dryRun);
+    }
+    for (const v of message.exclude) {
+      writer.uint32(58).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Command_SyncDirTo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommand_SyncDirTo();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.srcPath = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.destId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.destPath = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.delete = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.checksum = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.dryRun = reader.bool();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.exclude.push(reader.string());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Command_SyncDirTo {
+    return {
+      srcPath: isSet(object.srcPath)
+        ? globalThis.String(object.srcPath)
+        : isSet(object.src_path)
+        ? globalThis.String(object.src_path)
+        : "",
+      destId: isSet(object.destId)
+        ? globalThis.String(object.destId)
+        : isSet(object.dest_id)
+        ? globalThis.String(object.dest_id)
+        : "",
+      destPath: isSet(object.destPath)
+        ? globalThis.String(object.destPath)
+        : isSet(object.dest_path)
+        ? globalThis.String(object.dest_path)
+        : "",
+      delete: isSet(object.delete) ? globalThis.Boolean(object.delete) : false,
+      checksum: isSet(object.checksum) ? globalThis.Boolean(object.checksum) : false,
+      dryRun: isSet(object.dryRun)
+        ? globalThis.Boolean(object.dryRun)
+        : isSet(object.dry_run)
+        ? globalThis.Boolean(object.dry_run)
+        : false,
+      exclude: globalThis.Array.isArray(object?.exclude)
+        ? object.exclude.map((e: any) => globalThis.String(e))
+        : [],
+    };
+  },
+
+  toJSON(message: Command_SyncDirTo): unknown {
+    const obj: any = {};
+    if (message.srcPath !== "") {
+      obj.srcPath = message.srcPath;
+    }
+    if (message.destId !== "") {
+      obj.destId = message.destId;
+    }
+    if (message.destPath !== "") {
+      obj.destPath = message.destPath;
+    }
+    if (message.delete !== false) {
+      obj.delete = message.delete;
+    }
+    if (message.checksum !== false) {
+      obj.checksum = message.checksum;
+    }
+    if (message.dryRun !== false) {
+      obj.dryRun = message.dryRun;
+    }
+    if (message.exclude?.length) {
+      obj.exclude = message.exclude;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Command_SyncDirTo>): Command_SyncDirTo {
+    return Command_SyncDirTo.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Command_SyncDirTo>): Command_SyncDirTo {
+    const message = createBaseCommand_SyncDirTo();
+    message.srcPath = object.srcPath ?? "";
+    message.destId = object.destId ?? "";
+    message.destPath = object.destPath ?? "";
+    message.delete = object.delete ?? false;
+    message.checksum = object.checksum ?? false;
+    message.dryRun = object.dryRun ?? false;
+    message.exclude = object.exclude?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseCommand_DeletePaths(): Command_DeletePaths {
+  return { paths: [] };
+}
+
+export const Command_DeletePaths: MessageFns<Command_DeletePaths> = {
+  encode(message: Command_DeletePaths, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.paths) {
+      writer.uint32(10).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Command_DeletePaths {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommand_DeletePaths();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.paths.push(reader.string());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Command_DeletePaths {
+    return { paths: globalThis.Array.isArray(object?.paths) ? object.paths.map((e: any) => globalThis.String(e)) : [] };
+  },
+
+  toJSON(message: Command_DeletePaths): unknown {
+    const obj: any = {};
+    if (message.paths?.length) {
+      obj.paths = message.paths;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Command_DeletePaths>): Command_DeletePaths {
+    return Command_DeletePaths.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Command_DeletePaths>): Command_DeletePaths {
+    const message = createBaseCommand_DeletePaths();
+    message.paths = object.paths?.map((e) => e) || [];
+    return message;
+  },
+};
+
 function createBaseCommand_TunnelStart(): Command_TunnelStart {
   return { target: "" };
 }
@@ -6908,6 +7935,12 @@ export const CommandResult: MessageFns<CommandResult> = {
       case "ok":
         CommandResult_Ok.encode(message.kind.ok, writer.uint32(194).fork()).join();
         break;
+      case "dirManifest":
+        CommandResult_DirManifestResult.encode(message.kind.dirManifest, writer.uint32(202).fork()).join();
+        break;
+      case "sessionSearch":
+        CommandResult_SessionSearchResult.encode(message.kind.sessionSearch, writer.uint32(210).fork()).join();
+        break;
     }
     return writer;
   },
@@ -7135,6 +8168,28 @@ export const CommandResult: MessageFns<CommandResult> = {
           message.kind = { $case: "ok", ok: CommandResult_Ok.decode(reader, reader.uint32()) };
           continue;
         }
+        case 25: {
+          if (tag !== 202) {
+            break;
+          }
+
+          message.kind = {
+            $case: "dirManifest",
+            dirManifest: CommandResult_DirManifestResult.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
+        case 26: {
+          if (tag !== 210) {
+            break;
+          }
+
+          message.kind = {
+            $case: "sessionSearch",
+            sessionSearch: CommandResult_SessionSearchResult.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7228,6 +8283,14 @@ export const CommandResult: MessageFns<CommandResult> = {
         ? { $case: "reduceResult", reduceResult: CommandResult_ReduceResult.fromJSON(object.reduce_result) }
         : isSet(object.ok)
         ? { $case: "ok", ok: CommandResult_Ok.fromJSON(object.ok) }
+        : isSet(object.dirManifest)
+        ? { $case: "dirManifest", dirManifest: CommandResult_DirManifestResult.fromJSON(object.dirManifest) }
+        : isSet(object.dir_manifest)
+        ? { $case: "dirManifest", dirManifest: CommandResult_DirManifestResult.fromJSON(object.dir_manifest) }
+        : isSet(object.sessionSearch)
+        ? { $case: "sessionSearch", sessionSearch: CommandResult_SessionSearchResult.fromJSON(object.sessionSearch) }
+        : isSet(object.session_search)
+        ? { $case: "sessionSearch", sessionSearch: CommandResult_SessionSearchResult.fromJSON(object.session_search) }
         : undefined,
     };
   },
@@ -7282,6 +8345,10 @@ export const CommandResult: MessageFns<CommandResult> = {
       obj.reduceResult = CommandResult_ReduceResult.toJSON(message.kind.reduceResult);
     } else if (message.kind?.$case === "ok") {
       obj.ok = CommandResult_Ok.toJSON(message.kind.ok);
+    } else if (message.kind?.$case === "dirManifest") {
+      obj.dirManifest = CommandResult_DirManifestResult.toJSON(message.kind.dirManifest);
+    } else if (message.kind?.$case === "sessionSearch") {
+      obj.sessionSearch = CommandResult_SessionSearchResult.toJSON(message.kind.sessionSearch);
     }
     return obj;
   },
@@ -7466,6 +8533,24 @@ export const CommandResult: MessageFns<CommandResult> = {
       case "ok": {
         if (object.kind?.ok !== undefined && object.kind?.ok !== null) {
           message.kind = { $case: "ok", ok: CommandResult_Ok.fromPartial(object.kind.ok) };
+        }
+        break;
+      }
+      case "dirManifest": {
+        if (object.kind?.dirManifest !== undefined && object.kind?.dirManifest !== null) {
+          message.kind = {
+            $case: "dirManifest",
+            dirManifest: CommandResult_DirManifestResult.fromPartial(object.kind.dirManifest),
+          };
+        }
+        break;
+      }
+      case "sessionSearch": {
+        if (object.kind?.sessionSearch !== undefined && object.kind?.sessionSearch !== null) {
+          message.kind = {
+            $case: "sessionSearch",
+            sessionSearch: CommandResult_SessionSearchResult.fromPartial(object.kind.sessionSearch),
+          };
         }
         break;
       }
@@ -8638,6 +9723,88 @@ export const CommandResult_Transfer: MessageFns<CommandResult_Transfer> = {
   },
 };
 
+function createBaseCommandResult_DirManifestResult(): CommandResult_DirManifestResult {
+  return { entries: [], rootExists: false };
+}
+
+export const CommandResult_DirManifestResult: MessageFns<CommandResult_DirManifestResult> = {
+  encode(message: CommandResult_DirManifestResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.entries) {
+      ManifestEntry.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.rootExists !== false) {
+      writer.uint32(16).bool(message.rootExists);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CommandResult_DirManifestResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommandResult_DirManifestResult();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.entries.push(ManifestEntry.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.rootExists = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CommandResult_DirManifestResult {
+    return {
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => ManifestEntry.fromJSON(e))
+        : [],
+      rootExists: isSet(object.rootExists)
+        ? globalThis.Boolean(object.rootExists)
+        : isSet(object.root_exists)
+        ? globalThis.Boolean(object.root_exists)
+        : false,
+    };
+  },
+
+  toJSON(message: CommandResult_DirManifestResult): unknown {
+    const obj: any = {};
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => ManifestEntry.toJSON(e));
+    }
+    if (message.rootExists !== false) {
+      obj.rootExists = message.rootExists;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CommandResult_DirManifestResult>): CommandResult_DirManifestResult {
+    return CommandResult_DirManifestResult.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CommandResult_DirManifestResult>): CommandResult_DirManifestResult {
+    const message = createBaseCommandResult_DirManifestResult();
+    message.entries = object.entries?.map((e) => ManifestEntry.fromPartial(e)) || [];
+    message.rootExists = object.rootExists ?? false;
+    return message;
+  },
+};
+
 function createBaseCommandResult_TunnelStarted(): CommandResult_TunnelStarted {
   return { tunnel: undefined };
 }
@@ -8894,6 +10061,66 @@ export const CommandResult_SessionTranscript: MessageFns<CommandResult_SessionTr
   fromPartial(object: DeepPartial<CommandResult_SessionTranscript>): CommandResult_SessionTranscript {
     const message = createBaseCommandResult_SessionTranscript();
     message.messages = object.messages?.map((e) => SessionMessage.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseCommandResult_SessionSearchResult(): CommandResult_SessionSearchResult {
+  return { hits: [] };
+}
+
+export const CommandResult_SessionSearchResult: MessageFns<CommandResult_SessionSearchResult> = {
+  encode(message: CommandResult_SessionSearchResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.hits) {
+      SessionSearchHit.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CommandResult_SessionSearchResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCommandResult_SessionSearchResult();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.hits.push(SessionSearchHit.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CommandResult_SessionSearchResult {
+    return {
+      hits: globalThis.Array.isArray(object?.hits) ? object.hits.map((e: any) => SessionSearchHit.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: CommandResult_SessionSearchResult): unknown {
+    const obj: any = {};
+    if (message.hits?.length) {
+      obj.hits = message.hits.map((e) => SessionSearchHit.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CommandResult_SessionSearchResult>): CommandResult_SessionSearchResult {
+    return CommandResult_SessionSearchResult.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CommandResult_SessionSearchResult>): CommandResult_SessionSearchResult {
+    const message = createBaseCommandResult_SessionSearchResult();
+    message.hits = object.hits?.map((e) => SessionSearchHit.fromPartial(e)) || [];
     return message;
   },
 };

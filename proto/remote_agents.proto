@@ -89,6 +89,28 @@ message SessionMessage {
   optional uint64 ts = 3;
 }
 
+// One full-text search hit over the local AI-chat history index (ctx-style:
+// a cited event inside a session, not a whole transcript).
+message SessionSearchHit {
+  string provider = 1;
+  string session_id = 2;
+  string title = 3;
+  // Role of the matched message: user | assistant | system.
+  string role = 4;
+  // Snippet around the best matching term (already truncated, fit for UI).
+  string snippet = 5;
+  // Unix ms of the matched message, if known (0 = unknown).
+  optional uint64 ts = 6;
+  // 0-based position of the message in the session transcript (for
+  // session_get { around_seq } windowing).
+  uint32 seq = 7;
+  // BM25 score of the matched message.
+  float score = 8;
+  // How many messages of this session matched the query.
+  uint32 match_count = 9;
+  optional string cwd = 10;
+}
+
 message FileMeta {
   string path = 1;
   uint64 size = 2;
@@ -273,6 +295,17 @@ message Command {
   message SessionGet {
     string provider = 1;
     string id = 2;
+    // When set, return only `window` messages *around* message #`around_seq`
+    // (cited context for a search hit) instead of the capped whole transcript.
+    optional uint32 around_seq = 3;
+    optional uint32 window = 4;
+  }
+  message SessionSearch {
+    string query = 1;
+    // Restrict to these providers (claude, opencode, cline, …); empty = all.
+    repeated string providers = 2;
+    // Max hits to return (per host); default 20.
+    optional uint32 limit = 3;
   }
   message SessionResume {
     string provider = 1;
@@ -360,6 +393,7 @@ message Command {
     SessionGet session_get = 16;
     SessionResume session_resume = 17;
     SessionTerminate session_terminate = 18;
+    SessionSearch session_search = 36;
     FileStat file_stat = 19;
     FileChunk file_chunk = 20;
     FileThumb file_thumb = 21;
@@ -432,6 +466,7 @@ message CommandResult {
     repeated string active = 2;
   }
   message SessionTranscript { repeated SessionMessage messages = 1; }
+  message SessionSearchResult { repeated SessionSearchHit hits = 1; }
   message MapResult {
     string job_id = 1;
     uint32 partition_id = 2;
@@ -473,6 +508,7 @@ message CommandResult {
     ReduceResult reduce_result = 23;
     Ok ok = 24;
     DirManifestResult dir_manifest = 25;
+    SessionSearchResult session_search = 26;
   }
 }
 
