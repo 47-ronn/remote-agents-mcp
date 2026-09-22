@@ -198,10 +198,30 @@ pub enum Command {
     /// List the host's provider conversations (metadata only).
     SessionList,
 
-    /// Fetch the full transcript of one provider session.
+    /// Fetch the transcript of one provider session. By default the capped
+    /// whole transcript; with `around_seq` only `window` messages around that
+    /// message (cited context for a [`SessionSearchHit`]).
     SessionGet {
         provider: String,
         id: String,
+        /// 0-based message position to center the window on (from a search hit).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        around_seq: Option<u32>,
+        /// Half-window size when `around_seq` is set (default 5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
+    },
+
+    /// Full-text search over the host's indexed provider-chat history
+    /// (BM25, ranked, cited snippets — see `session_index`).
+    SessionSearch {
+        query: String,
+        /// Restrict to these providers (claude, opencode, cline, …); empty = all.
+        #[serde(default)]
+        providers: Vec<String>,
+        /// Max hits to return; default 20.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
 
     /// Continue a provider session with a new prompt (resume context on the host
@@ -609,9 +629,16 @@ pub enum CommandResult {
         active: Vec<String>,
     },
 
-    /// Full transcript of one session.
+    /// Full transcript of one session (or a window around one message, when
+    /// `SessionGet` carried `around_seq`).
     SessionTranscript {
         messages: Vec<SessionMessage>,
+    },
+
+    /// Ranked, snippeted full-text search hits over the host's indexed
+    /// AI-chat history (response to `SessionSearch`).
+    SessionSearch {
+        hits: Vec<SessionSearchHit>,
     },
 
     // === Distributed compute (MapReduce, Phase 13) ===
@@ -844,6 +871,51 @@ mod tests {
         match back {
             Command::ReduceTask { inputs, .. } => assert_eq!(inputs.len(), 3),
             other => panic!("expected ReduceTask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_search_serde_roundtrip() {
+        let cmd = Command::SessionSearch {
+            query: "failed migration".into(),
+            providers: vec!["claude".into(), "opencode".into()],
+            limit: Some(10),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("session_search"));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        match back {
+            Command::SessionSearch { query, providers, limit } => {
+                assert_eq!(query, "failed migration");
+                assert_eq!(providers, vec!["claude".to_string(), "opencode".to_string()]);
+                assert_eq!(limit, Some(10));
+            }
+            other => panic!("expected SessionSearch, got {other:?}"),
+        }
+
+        // Old peers / minimal payloads: optional fields default.
+        let legacy: Command = serde_json::from_str(r#"{"cmd":"session_search","query":"q"}"#).unwrap();
+        match legacy {
+            Command::SessionSearch { query, providers, limit } => {
+                assert_eq!(query, "q");
+                assert!(providers.is_empty());
+                assert_eq!(limit, None);
+            }
+            other => panic!("expected SessionSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_get_window_defaults_to_none() {
+        let json = r#"{"cmd":"session_get","provider":"claude","id":"s"}"#;
+        let back: Command = serde_json::from_str(json).unwrap();
+        match back {
+            Command::SessionGet { provider, id, around_seq, window } => {
+                assert_eq!((provider.as_str(), id.as_str()), ("claude", "s"));
+                assert_eq!(around_seq, None);
+                assert_eq!(window, None);
+            }
+            other => panic!("expected SessionGet, got {other:?}"),
         }
     }
 

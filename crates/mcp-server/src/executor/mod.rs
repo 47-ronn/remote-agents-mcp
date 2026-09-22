@@ -235,14 +235,41 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::SessionList { sessions, active })
         }
 
-        Command::SessionGet { provider, id } => {
+        Command::SessionGet { provider, id, around_seq, window } => {
             let (provider, id) = (provider.clone(), id.clone());
+            let (around_seq, window) = (*around_seq, *window);
             let messages = tokio::task::spawn_blocking(move || {
-                crate::sessions::get_transcript(&provider, &id)
+                match around_seq {
+                    // Cited context for a search hit: a window around one
+                    // message instead of the capped whole transcript.
+                    Some(seq) => crate::sessions::windowed_transcript(
+                        &provider,
+                        &id,
+                        seq as usize,
+                        window.unwrap_or(5) as usize,
+                    ),
+                    None => crate::sessions::get_transcript(&provider, &id),
+                }
             })
             .await
             .map_err(|e| anyhow::anyhow!("transcript fetch failed: {e}"))??;
             Ok(CommandResult::SessionTranscript { messages })
+        }
+
+        Command::SessionSearch { query, providers, limit } => {
+            info!("Session search: {:?} ({} provider filter(s))", query, providers.len());
+            let (query, providers, limit) = (
+                query.clone(),
+                providers.clone(),
+                limit.as_ref().copied().unwrap_or(crate::session_index::DEFAULT_LIMIT as u32)
+                    as usize,
+            );
+            let hits = tokio::task::spawn_blocking(move || {
+                crate::session_index::search(&query, &providers, limit)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("session search failed: {e}"))??;
+            Ok(CommandResult::SessionSearch { hits })
         }
 
         Command::SessionResume { provider, id, prompt } => {

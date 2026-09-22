@@ -171,11 +171,13 @@ pub struct AgentInfo {
 }
 
 /// Metadata for one AI-provider conversation stored on a host (claude /
-/// opencode, and the read-only VS Code agents cline / roo / kilo). The full
-/// transcript is fetched lazily on demand (see SessionGet).
+/// opencode / codex, and the read-only agents cline / roo / kilo / zed /
+/// cursor / gemini / qwen / goose / continue). The full transcript is fetched
+/// lazily on demand (see SessionGet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
-    /// AI provider: `claude` | `opencode` | `cline` | `roo` | `kilo`.
+    /// AI provider: `claude` | `opencode` | `codex` | `cline` | `roo` |
+    /// `kilo` | `zed` | `cursor` | `gemini` | `qwen` | `goose` | `continue`.
     pub provider: String,
     /// Provider-native session id (claude: uuid; opencode: `ses_…`; vscode
     /// agents: the task-folder id).
@@ -209,6 +211,36 @@ pub struct SessionMessage {
     /// Timestamp (Unix ms), if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+}
+
+/// One full-text search hit over a host's indexed AI-chat history (ctx-style:
+/// a cited event inside a session, ranked and snippeted, not a whole
+/// transcript). Jump to the context with [`SessionGet`] `around_seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    /// AI provider the session belongs to.
+    pub provider: String,
+    /// Provider-native session id (feed to `SessionGet`).
+    pub session_id: String,
+    /// Session title.
+    pub title: String,
+    /// Role of the matched message: `user` | `assistant` | `system`.
+    pub role: String,
+    /// Snippet around the best matching term (already truncated for the UI).
+    pub snippet: String,
+    /// Timestamp of the matched message (Unix ms), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+    /// 0-based position of the message in the session transcript (for
+    /// `SessionGet` windowing).
+    pub seq: u32,
+    /// BM25 score of the matched message.
+    pub score: f32,
+    /// How many messages of this session matched the query.
+    pub match_count: u32,
+    /// Working directory / project of the session, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Metadata for one file on a host — used both as the `FileStat` result and as
