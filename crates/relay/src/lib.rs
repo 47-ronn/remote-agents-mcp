@@ -8,11 +8,12 @@ pub mod state;
 
 use axum::{
     extract::{ws::WebSocketUpgrade, ConnectInfo, Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use remote_agents_shared::room_key;
 use serde::Deserialize;
 use state::RelayState;
 use std::net::{IpAddr, SocketAddr};
@@ -44,6 +45,14 @@ struct WsQuery {
     token: Option<String>,
 }
 
+/// Query params accepted by the HTTP info endpoints (`/api/room/:room`,
+/// `/api/rooms`). The token may also travel in an `Authorization: Bearer`
+/// header, so panels don't have to put the secret in the URL.
+#[derive(Deserialize)]
+struct InfoQuery {
+    token: Option<String>,
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(room): Path<String>,
@@ -56,9 +65,16 @@ async fn ws_handler(
     // hole-punching. Prefer proxy headers (TLS is terminated by a proxy in the
     // recommended deployment), falling back to the direct TCP peer address.
     let client_ip = client_ip(&headers, peer);
+    // Rooms are keyed by hash(room, token): the token is the room's gate. A
+    // wrong-token host derives a different key and lands in its own (empty)
+    // room — it can never reach the real room's roster. Clients are unaffected
+    // (they already send room + token consistently on every connection).
+    let room_key = room_key(&room, q.token.as_deref().unwrap_or(""));
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| handler::handle_socket(socket, room, q.token, client_ip, state))
+        .on_upgrade(move |socket| {
+            handler::handle_socket(socket, room_key, room, q.token, client_ip, state)
+        })
 }
 
 /// Resolve the client IP: first `X-Forwarded-For` (leftmost), then `X-Real-IP`,
@@ -90,14 +106,28 @@ async fn health() -> impl IntoResponse {
 /// registry — but the self-hosted relay holds all rooms in shared state, so it
 /// can give operators a real fleet-wide view. `connections` counts raw sockets,
 /// `agents` counts distinct machines (one host may hold several terminals).
-async fn rooms_list(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+/// When the relay runs with a server token (`--token`) this operator endpoint
+/// requires it; otherwise it stays open but exposes only names + counts (never
+/// a roster). Rooms show their human names; a room appearing TWICE under one
+/// name means a mis-keyed token group that never reached the real room.
+async fn rooms_list(
+    Query(q): Query<InfoQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<RelayState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    if let Some(server) = &state.token {
+        match provided_token(&q, &headers) {
+            Some(t) if t == *server => {}
+            _ => return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token")),
+        }
+    }
     let mut rooms: Vec<_> = state
         .rooms
         .iter()
         .map(|e| {
             let room = e.value();
             serde_json::json!({
-                "room": e.key(),
+                "room": room.name,
                 "connections": room.agents.len(),
                 "agents": crate::routing::dedup_agents(room).len(),
                 "mcp_clients": room.mcp.len(),
@@ -106,21 +136,72 @@ async fn rooms_list(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
         .collect();
     // Stable ordering for clients/tests.
     rooms.sort_by(|a, b| a["room"].as_str().cmp(&b["room"].as_str()));
-    Json(serde_json::json!({ "rooms": rooms }))
+    Ok(Json(serde_json::json!({ "rooms": rooms })))
 }
 
+/// One room's deduped roster + observer count — the endpoint the panel polls.
+/// The caller MUST present the room token (query `?token=` or
+/// `Authorization: Bearer`): it both derives the token-addressed room key and,
+/// under a server token (`--token`), must equal it. A wrong token derives a
+/// different key → an empty roster, never the real room's metadata.
 async fn room_info(
     Path(room): Path<String>,
+    Query(q): Query<InfoQuery>,
+    headers: HeaderMap,
     State(state): State<Arc<RelayState>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, ApiError> {
+    let key = http_room_key(&state, &room, &q, &headers)?;
     // Dedup to one entry per machine (a host with several terminals is one
     // logical peer), carrying the relay-computed `connections` count — matching
     // the worker's `/info` so panels behave the same on either relay.
-    let (agents, mcp) = match state.rooms.get(&room) {
+    let (agents, mcp) = match state.rooms.get(&key) {
         Some(r) => (crate::routing::dedup_agents(r.value()), r.mcp.len()),
         None => (Vec::new(), 0),
     };
-    Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp }))
+    Ok(Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp })))
+}
+
+/// Extract the caller's token for the HTTP info endpoints: query param first,
+/// then `Authorization: Bearer <token>`.
+fn provided_token(q: &InfoQuery, headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = &q.token {
+        return Some(t.clone());
+    }
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
+}
+
+/// Small error type for the HTTP info endpoints (a full `Response` as the
+/// `Err` variant trips clippy's result-large-err; this is 2 words).
+struct ApiError(StatusCode, &'static str);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+    }
+}
+
+/// HTTP endpoints present the room token too: it is required to derive the
+/// room key (rooms are token-addressed), and when the relay runs with a server
+/// token (`--token`) the presented token must additionally equal it.
+fn http_room_key(
+    state: &RelayState,
+    room: &str,
+    q: &InfoQuery,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let Some(token) = provided_token(q, headers) else {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "token required to address a room"));
+    };
+    if let Some(server) = &state.token {
+        if token != *server {
+            return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token"));
+        }
+    }
+    Ok(room_key(room, &token))
 }
 
 #[cfg(test)]

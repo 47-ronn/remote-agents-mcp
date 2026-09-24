@@ -19,6 +19,25 @@ const NONCE_LEN: usize = 12;
 /// with no room for both the nonce and the tag cannot be a valid message.
 const TAG_LEN: usize = 16;
 
+/// Derive the internal room storage key from the room name and its token.
+///
+/// The relay keys rooms by this hash instead of the raw room name, which makes
+/// the token the room's actual gate: a host presenting a wrong token derives a
+/// DIFFERENT key and lands in its own (empty) room — it can never see the real
+/// room's roster, and no server-side secret or registry is needed. The relay is
+/// the only party that needs the mapping (clients keep sending `room` + `token`
+/// as before).
+///
+/// MUST stay in lock-step with the Cloudflare worker's `roomKey()`
+/// (worker/src/roomkey.ts) — same namespaced input, same SHA-256 lowercase hex.
+/// Known-answer tests on both sides pin the cross-language compatibility.
+pub fn room_key(room: &str, token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("remote-agents-room/v1:{}:{}", room, token));
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// A symmetric cipher derived from a shared passphrase.
 #[derive(Clone)]
 pub struct Cipher {
@@ -190,5 +209,24 @@ mod tests {
         let bytes = unsafe { ct.as_bytes_mut() };
         bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         assert!(c.decrypt_str(&ct).is_err());
+    }
+
+    /// Known-answer pin: the room key must be stable AND identical to the
+    /// Cloudflare worker's `roomKey()` (worker/src/roomkey.test.ts asserts the
+    /// same vector) — a Rust relay and the TS worker only interoperate while
+    /// both derive the same storage key from the same room + token.
+    #[test]
+    fn room_key_matches_worker_known_answer() {
+        assert_eq!(
+            room_key("iwejf", "secret"),
+            "6245a336fff2893dd0039b91661241fa593e66808d9ee14357ba0ab3fc077d8a"
+        );
+        // A wrong token MUST derive a different key (that's the whole point —
+        // the mis-keyed host lands in its own empty room, not the real one).
+        assert_ne!(room_key("iwejf", "secret"), room_key("iwejf", "wrong"));
+        // The room name is part of the key: same token, other room → other key.
+        assert_ne!(room_key("iwejf", "secret"), room_key("dev", "secret"));
+        // Empty token is deterministic (tokenless dev rooms still work).
+        assert_eq!(room_key("dev", ""), room_key("dev", ""));
     }
 }

@@ -264,6 +264,13 @@ export class Room implements DurableObject {
         return this.handleAuth(ws, msg);
 
       case 'list_agents':
+        // Only an AUTHENTICATED socket may list the room. Pre-auth frames used
+        // to get the full roster (the DO is token-addressed already, but this
+        // keeps protocol order: auth is the first frame, like the Rust relay).
+        if (!att.sessionId) {
+          this.sendError(ws, 'authenticate first (send an auth frame)');
+          return;
+        }
         this.send(ws, {
           type: 'agent_list',
           agents: this.dedupAgents(
@@ -275,6 +282,11 @@ export class Room implements DurableObject {
         return;
 
       case 'command': {
+        // Same rule as list_agents: no commands before a successful auth.
+        if (!att.sessionId) {
+          this.sendError(ws, 'authenticate first (send an auth frame)');
+          return;
+        }
         const targets = this.resolveTarget(msg.target);
         if (targets.length === 0) {
           this.send(ws, {
@@ -397,6 +409,17 @@ export class Room implements DurableObject {
 
   private handleAuth(ws: WebSocket, msg: Extract<ClientMessage, { type: 'auth' }>) {
     const att = this.att(ws);
+
+    // Optional server-wide token (the worker's AUTH_TOKEN secret, parity with
+    // the Rust relay's --token): when set, the auth frame must equal it —
+    // this is the loud-rejection gate. Defense in depth: the edge (index.ts)
+    // already refuses mismatching query tokens.
+    const serverToken = (this.env as { AUTH_TOKEN?: string } | undefined)?.AUTH_TOKEN;
+    if (serverToken && msg.token !== serverToken) {
+      this.send(ws, { type: 'auth_failed', reason: 'Invalid token' });
+      ws.close(1008, 'Invalid token');
+      return;
+    }
 
     // The auth token must equal the connection's query token (our clients send
     // the same value in both). An empty/absent query token only admits an empty

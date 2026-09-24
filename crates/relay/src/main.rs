@@ -44,9 +44,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.token.is_none() {
         tracing::warn!(
-            "running WITHOUT --token: room access is not gated at the relay (any \
-             token-consistent client can join a room and read its metadata). \
-             E2E encryption still protects payloads. Use --token in production."
+            "running WITHOUT --token: rooms are still token-addressed (a wrong-token \
+             host cannot see another token group's roster), but there is no single \
+             server secret — token strength is the only gate. Use --token in production \
+             for one shared secret + loud auth_failed on mismatch."
         );
     }
     let state = Arc::new(RelayState::new(cli.token).with_idle_timeout_secs(cli.idle_timeout_secs));

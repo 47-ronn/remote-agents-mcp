@@ -41,8 +41,12 @@ where
 }
 
 /// Drive a single accepted WebSocket connection to completion.
+///
+/// `room_key` is the token-derived storage key (the room's real identity);
+/// `room_name` is the human name kept for `/api/rooms`.
 pub async fn handle_socket(
     socket: WebSocket,
+    room_key: String,
     room_name: String,
     query_token: Option<String>,
     client_ip: IpAddr,
@@ -78,7 +82,7 @@ pub async fn handle_socket(
     };
 
     let session_id = Uuid::new_v4().to_string();
-    let room = state.room(&room_name);
+    let room = state.room(&room_key, &room_name);
 
     // Send auth_ok before handing the sink to the writer task.
     if sink
@@ -211,7 +215,7 @@ pub async fn handle_socket(
     // Drop any in-flight requests this session initiated; their results would
     // have nowhere to go now.
     room.pending.retain(|_, origin| origin != &session_id);
-    state.gc_room(&room_name);
+    state.gc_room(&room_key);
 }
 
 /// Auth parity with the Cloudflare worker, plus optional server-enforced token:

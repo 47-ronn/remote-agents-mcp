@@ -6,11 +6,21 @@
  */
 
 import { Room } from './room';
+import { roomKey } from './roomkey';
 
 export { Room };
 
 export interface Env {
   ROOM: DurableObjectNamespace;
+  /**
+   * Optional server-wide auth token (parity with the Rust relay's `--token`).
+   * When set, every connection's token (query string and auth frame) must
+   * equal it — a mismatch is rejected outright. Set via
+   * `wrangler secret put AUTH_TOKEN`. When unset, rooms are still
+   * token-addressed (see roomKey): a wrong token cannot reach another token
+   * group's room.
+   */
+  AUTH_TOKEN?: string;
 }
 
 export default {
@@ -52,8 +62,20 @@ export default {
         return json({ error: 'Expected WebSocket' }, 426);
       }
 
-      // Get or create Room Durable Object
-      const roomObjectId = env.ROOM.idFromName(roomId);
+      const token = url.searchParams.get('token') ?? '';
+
+      // Optional server-wide token (AUTH_TOKEN secret): a mismatching
+      // connection is rejected at the edge, before any DO is contacted.
+      if (env.AUTH_TOKEN && token !== env.AUTH_TOKEN) {
+        return json({ error: 'invalid token' }, 401);
+      }
+
+      // Rooms are token-addressed: the DO name is hash(room, token), so a
+      // wrong-token host lands in its own (empty) DO and can never reach the
+      // real room's roster. Clients are unaffected — they already send room +
+      // token consistently on every connection.
+      const key = await roomKey(roomId, token);
+      const roomObjectId = env.ROOM.idFromName(key);
       const roomObject = env.ROOM.get(roomObjectId);
 
       // Forward the WebSocket request to the Room
@@ -67,11 +89,23 @@ export default {
       );
     }
 
-    // Room info endpoint: /api/room/:roomId
+    // Room info endpoint: /api/room/:roomId — the caller MUST present the room
+    // token (query ?token=): it both addresses the token-keyed room and, under
+    // an AUTH_TOKEN secret, must equal it. Without a token this endpoint used
+    // to hand out any room's roster unauthenticated.
     const infoMatch = url.pathname.match(/^\/api\/room\/([^/]+)$/);
     if (infoMatch) {
       const roomId = infoMatch[1];
-      const roomObjectId = env.ROOM.idFromName(roomId);
+      const token = url.searchParams.get('token') ?? '';
+      if (!token) {
+        return json({ error: 'token required to address a room' }, 401);
+      }
+      if (env.AUTH_TOKEN && token !== env.AUTH_TOKEN) {
+        return json({ error: 'invalid token' }, 401);
+      }
+
+      const key = await roomKey(roomId, token);
+      const roomObjectId = env.ROOM.idFromName(key);
       const roomObject = env.ROOM.get(roomObjectId);
 
       const infoResponse = await roomObject.fetch(

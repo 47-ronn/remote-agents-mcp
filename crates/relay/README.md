@@ -20,7 +20,15 @@ remote-agent run --relay ws://RELAY_HOST:8080 --room dev --token secret
 REMOTE_AGENTS_RELAY=ws://RELAY_HOST:8080 remote-agents-mcp
 ```
 
-Endpoints: `GET /health`, `GET /api/room/:room`, `GET /ws/room/:room?token=…`.
+Endpoints: `GET /health`, `GET /api/room/:room?token=…`,
+`GET /api/rooms?token=…` (token required when the relay runs with `--token`),
+`GET /ws/room/:room?token=…`.
+
+**Room security model.** Rooms are keyed by `sha256(room + token)`: a host with
+a wrong (but self-consistent) token derives a different key and lands in its
+own empty room — it can never see another token group's roster. `/api/room/:room`
+always requires the room token; with `--token` set, that token must additionally
+equal the server-wide secret, and `/api/rooms` is gated by it too.
 
 ## Design
 
