@@ -36,6 +36,11 @@ pub struct McpSession {
 /// box); those collapse to one logical peer on read (see `routing::dedup_*`).
 #[derive(Default)]
 pub struct Room {
+    /// Human room name (as clients address it), kept for `/api/rooms`. The
+    /// map key itself is the token-derived room key (`room_key`), so two
+    /// token groups using the same name show as two entries — the visible
+    /// trace of a mis-keyed host that failed to reach the real room.
+    pub name: String,
     pub agents: DashMap<String, AgentSession>,
     pub mcp: DashMap<String, McpSession>,
     /// In-flight commands: `request_id → originating session id`. Lets a command
@@ -56,6 +61,9 @@ impl Room {
 
 /// Global relay state: all rooms plus the optional server auth token.
 pub struct RelayState {
+    /// Rooms keyed by the token-derived room key (`remote_agents_shared::
+    /// room_key`), NOT by the raw name — the token is the room's gate, so a
+    /// wrong-token client derives a different key and cannot reach the room.
     pub rooms: DashMap<String, Arc<Room>>,
     /// When set, every connection's auth token MUST equal this value.
     pub token: Option<String>,
@@ -104,11 +112,15 @@ impl RelayState {
         self.with_idle_timeout(d)
     }
 
-    /// Get or create a room by name.
-    pub fn room(&self, name: &str) -> Arc<Room> {
+    /// Get or create a room by its token-derived key, recording the human
+    /// room name (first writer wins) for `/api/rooms`.
+    pub fn room(&self, key: &str, name: &str) -> Arc<Room> {
         self.rooms
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(Room::default()))
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Room {
+                name: name.to_string(),
+                ..Default::default()
+            }))
             .clone()
     }
 
@@ -122,7 +134,7 @@ impl RelayState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remote_agents_shared::AgentMode;
+    use remote_agents_shared::{room_key, AgentMode};
 
     fn dummy_tx() -> Tx {
         mpsc::channel(OUTBOUND_CAP).0
@@ -175,14 +187,17 @@ mod tests {
     #[test]
     fn room_get_or_create_is_idempotent() {
         let state = RelayState::new(None);
-        let a = state.room("gpu");
-        let b = state.room("gpu");
-        // Same name → same shared Room, not a second instance.
+        let key = room_key("gpu", "");
+        let a = state.room(&key, "gpu");
+        let b = state.room(&key, "gpu");
+        // Same key → same shared Room, not a second instance.
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(state.rooms.len(), 1);
 
-        state.room("other");
+        state.room(&room_key("other", ""), "other");
         assert_eq!(state.rooms.len(), 2);
+        // The recorded display name is what /api/rooms shows.
+        assert_eq!(a.name, "gpu");
     }
 
     #[test]
@@ -207,20 +222,31 @@ mod tests {
         let state = RelayState::new(None);
 
         // Empty room is collected.
-        state.room("empty");
+        state.room(&room_key("empty", ""), "empty");
         assert_eq!(state.rooms.len(), 1);
-        state.gc_room("empty");
+        state.gc_room(&room_key("empty", ""));
         assert_eq!(state.rooms.len(), 0);
 
         // Occupied room survives GC.
-        let busy = state.room("busy");
+        let busy = state.room(&room_key("busy", ""), "busy");
         add_agent(&busy, "a1");
-        state.gc_room("busy");
+        state.gc_room(&room_key("busy", ""));
         assert_eq!(state.rooms.len(), 1);
 
         // After its last connection leaves, GC reclaims it.
         busy.agents.remove("a1");
-        state.gc_room("busy");
+        state.gc_room(&room_key("busy", ""));
         assert_eq!(state.rooms.len(), 0);
+    }
+
+    /// The room key is token-derived: two token groups using the same room name
+    /// map to DIFFERENT rooms (the mis-keyed host can never reach the real one).
+    #[test]
+    fn room_key_separates_token_groups() {
+        let state = RelayState::new(None);
+        let good = state.room(&room_key("iwejf", "secret"), "iwejf");
+        let bad = state.room(&room_key("iwejf", "wrong"), "iwejf");
+        assert!(!Arc::ptr_eq(&good, &bad));
+        assert_eq!(state.rooms.len(), 2);
     }
 }

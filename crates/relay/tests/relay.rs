@@ -37,7 +37,13 @@ async fn start_relay_with(state: Arc<RelayState>) -> u16 {
 }
 
 async fn connect(port: u16, room: &str) -> Ws {
-    let url = format!("ws://127.0.0.1:{}/ws/room/{}?token=secret", port, room);
+    connect_as(port, room, "secret").await
+}
+
+/// Connect with an explicit token (rooms are token-addressed, so hosts with
+/// different tokens land in different rooms even under the same name).
+async fn connect_as(port: u16, room: &str, token: &str) -> Ws {
+    let url = format!("ws://127.0.0.1:{}/ws/room/{}?token={}", port, room, token);
     let (ws, _) = connect_async(url).await.unwrap();
     ws
 }
@@ -105,11 +111,17 @@ fn agent_info(id: &str, tags: &[&str]) -> AgentInfo {
 }
 
 async fn auth(ws: &mut Ws, info: Option<AgentInfo>) -> String {
+    auth_as(ws, "secret", info).await
+}
+
+/// Authenticate with an explicit token (must match the connection's query
+/// token, or the relay's server token when one is configured).
+async fn auth_as(ws: &mut Ws, token: &str, info: Option<AgentInfo>) -> String {
     send(
         ws,
         &ClientMessage::Auth {
             room: "dev".into(),
-            token: "secret".into(),
+            token: token.into(),
             agent_info: info.map(Box::new),
         },
     )
@@ -275,9 +287,17 @@ async fn agents_learn_about_each_other() {
 
 /// Minimal dependency-free HTTP/1.1 GET; returns (status_code, body).
 async fn http_get(port: u16, path: &str) -> (u16, String) {
+    http_get_auth(port, path, None).await
+}
+
+/// Like `http_get`, optionally sending `Authorization: Bearer <token>`.
+async fn http_get_auth(port: u16, path: &str, bearer: Option<&str>) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).await.unwrap();
@@ -305,8 +325,9 @@ async fn health_endpoint_returns_ok() {
 async fn room_info_reports_connected_agents() {
     let port = start_relay().await;
 
-    // Unknown/empty room → zero agents, zero mcp clients.
-    let (status, body) = http_get(port, "/api/room/dev").await;
+    // Unknown/empty room → zero agents, zero mcp clients. The token addresses
+    // the room (rooms are token-keyed), so it is required on HTTP too.
+    let (status, body) = http_get(port, "/api/room/dev?token=secret").await;
     assert_eq!(status, 200);
     assert!(body.contains("\"agents\":[]"), "body: {body}");
     assert!(body.contains("\"mcp_clients\":0"));
@@ -315,7 +336,7 @@ async fn room_info_reports_connected_agents() {
     let mut agent = connect(port, "dev").await;
     auth(&mut agent, Some(agent_info("a1", &["backend"]))).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (_status, body) = http_get(port, "/api/room/dev").await;
+    let (_status, body) = http_get(port, "/api/room/dev?token=secret").await;
     assert!(body.contains("\"id\":\"a1\""), "body: {body}");
     assert!(body.contains("\"connections\":1"), "body: {body}");
 
@@ -324,9 +345,112 @@ async fn room_info_reports_connected_agents() {
     let mut agent_dup = connect(port, "dev").await;
     auth(&mut agent_dup, Some(agent_info("a1", &["backend"]))).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let (_status, body) = http_get(port, "/api/room/dev").await;
+    let (_status, body) = http_get(port, "/api/room/dev?token=secret").await;
     assert_eq!(body.matches("\"id\":\"a1\"").count(), 1, "deduped to one entry: {body}");
     assert!(body.contains("\"connections\":2"), "body: {body}");
+
+    // The token may travel in an Authorization: Bearer header instead of the
+    // query string (so panels don't have to put the secret in the URL).
+    let (status, body) = http_get_auth(port, "/api/room/dev", Some("secret")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"id\":\"a1\""), "bearer header must address the room: {body}");
+}
+
+/// Regression for the room-iwejf incident: a host with a WRONG (but
+/// self-consistent) token must not be able to see the real room's roster.
+/// Rooms are token-addressed (storage key = hash(room, token)), so the
+/// mis-keyed host derives a different room key and lands in its own empty
+/// room — invisible to the real one, and its roster is unreachable without
+/// the right token.
+#[tokio::test]
+async fn wrong_token_host_cannot_see_room_roster() {
+    let port = start_relay().await;
+
+    // The real room: an agent joins "iwejf" with the correct token.
+    let mut agent = connect(port, "iwejf").await;
+    auth(&mut agent, Some(agent_info("a1", &[]))).await;
+    assert!(matches!(recv(&mut agent).await, ServerMessage::AgentList { .. }));
+
+    // A mis-keyed host joins the SAME room name with a wrong-but-consistent
+    // token (query token == auth token, so the legacy consistency check alone
+    // would have admitted it — that was the hole).
+    let mut intruder = connect_as(port, "iwejf", "wrong").await;
+    auth_as(&mut intruder, "wrong", Some(agent_info("intruder", &[]))).await;
+    match recv(&mut intruder).await {
+        ServerMessage::AgentList { agents } => assert!(
+            agents.is_empty(),
+            "wrong-token host must see an empty room, got {agents:?}"
+        ),
+        other => panic!("expected empty agent_list, got {other:?}"),
+    }
+    // And the real room must not have the intruder leak into it.
+    assert!(
+        try_recv(&mut agent, 400).await.is_none(),
+        "wrong-token host must not leak join events into the real room"
+    );
+
+    // HTTP roster of the REAL room answers only to the right token…
+    let (status, body) = http_get(port, "/api/room/iwejf?token=secret").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"id\":\"a1\""), "body: {body}");
+    // …a wrong token derives a different room → it shows only the wrong-token
+    // group itself (the intruder), never the real room's hosts…
+    let (status, body) = http_get(port, "/api/room/iwejf?token=wrong").await;
+    assert_eq!(status, 200);
+    assert!(
+        !body.contains("\"id\":\"a1\""),
+        "wrong token must not expose the real roster: {body}"
+    );
+    // …and NO token at all is refused outright (the pre-fix hole: anyone could
+    // enumerate any room's hosts unauthenticated).
+    let (status, _) = http_get(port, "/api/room/iwejf").await;
+    assert_eq!(status, 401, "tokenless roster scrape must be refused");
+}
+
+/// With a server token (`--token`) everything is gated: WS auth must equal it
+/// (loud AuthFailed on mismatch, even self-consistent wrong tokens), and the
+/// HTTP info endpoints require the very same token (query or Bearer header).
+#[tokio::test]
+async fn server_token_gates_ws_and_http() {
+    let port = start_relay_with(Arc::new(RelayState::new(Some("srv".into())))).await;
+
+    // WS: a self-consistent wrong token is still rejected (the server token is
+    // the only thing that matters when configured).
+    let mut ws = connect_as(port, "dev", "wrong").await;
+    send(
+        &mut ws,
+        &ClientMessage::Auth { room: "dev".into(), token: "wrong".into(), agent_info: None },
+    )
+    .await;
+    match recv(&mut ws).await {
+        ServerMessage::AuthFailed { .. } => {}
+        other => panic!("expected auth_failed for a wrong server token, got {other:?}"),
+    }
+
+    // WS: the right token joins normally.
+    let mut agent = connect_as(port, "dev", "srv").await;
+    auth_as(&mut agent, "srv", Some(agent_info("a1", &[]))).await;
+    assert!(matches!(recv(&mut agent).await, ServerMessage::AgentList { .. }));
+
+    // HTTP roster: no token → 401; wrong token → 401; right token → roster.
+    let (status, _) = http_get(port, "/api/room/dev").await;
+    assert_eq!(status, 401);
+    let (status, _) = http_get(port, "/api/room/dev?token=wrong").await;
+    assert_eq!(status, 401);
+    let (status, body) = http_get(port, "/api/room/dev?token=srv").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"id\":\"a1\""), "body: {body}");
+    // Bearer header works as an alternative to the query param.
+    let (status, body) = http_get_auth(port, "/api/room/dev", Some("srv")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"id\":\"a1\""), "bearer must be accepted: {body}");
+
+    // The operator's /api/rooms listing is gated by the same token.
+    let (status, _) = http_get(port, "/api/rooms").await;
+    assert_eq!(status, 401);
+    let (status, body) = http_get(port, "/api/rooms?token=srv").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"room\":\"dev\""), "body: {body}");
 }
 
 /// The relay reflects the client's observed IP via `YourEndpoint` (so peers can

@@ -24,7 +24,7 @@ pub mod quic;
 #[cfg(feature = "udp")]
 pub mod udp_channel;
 
-pub use crypto::Cipher;
+pub use crypto::{Cipher, room_key};
 pub use protocol::*;
 pub use types::*;
 pub use udp::{

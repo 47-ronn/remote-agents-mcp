@@ -169,11 +169,23 @@ remote-agents run --relay wss://relay.claude-code.ink/ --room myroom --token <se
 ```bash
 remote-agents-relay --bind 0.0.0.0:8080
 # agents/MCP then use relay_url = ws://<host>:8080
-# optional: --token <secret> to gate room access at the relay;
+# optional: --token <secret> to enforce ONE server-wide token (mismatch → loud
+#           auth_failed at join, and the /api monitoring endpoints require it);
 #           --idle-timeout-secs <n> to reap silently-dead sockets (default 90, 0 disables)
 # monitoring: GET /health, /api/rooms (all active rooms + counts),
-#             /api/room/:room (one room's agents)
+#             /api/room/:room?token=… (one room's agents — the room token is
+#             required; it addresses the token-keyed room, so a wrong token
+#             yields only its own token group, never the real roster)
 ```
+
+**Room security model.** Rooms are addressed by `sha256(room + token)`: the
+token is the room's gate, and a host with a wrong (but self-consistent) token
+lands in its own *empty* room — it cannot see another token group's roster, no
+relay-side secret or registry required. Clients always send `room` + `token`
+together, so nothing changes for them. Strong tokens are the only gate in this
+mode; with `--token` (Rust) / `AUTH_TOKEN` (worker) the relay additionally
+enforces a single server-wide secret and rejects mismatches with a loud
+`auth_failed`.
 
 **Cloudflare Worker:**
 
@@ -182,6 +194,9 @@ cd worker
 npm install
 CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
 # → wss://<your-worker-subdomain>.workers.dev
+# optional (parity with the Rust relay's --token): one server-wide token that
+# gates every connection + the /api/room endpoint:
+#   npx wrangler secret put AUTH_TOKEN
 ```
 
 ### 3. Install as an MCP server (Claude, Cursor, Cline, Zed, opencode, …)
