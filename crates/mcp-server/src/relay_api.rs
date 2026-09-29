@@ -7,6 +7,7 @@ use anyhow::Result;
 use remote_agents_shared::{AgentInfo, AgentMode, Command, CommandResult};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// A fleet host that has a newer version available and is safe to update
 /// ("idle": connected and not `Disabled`). Surfaced so the orchestrator can
@@ -122,6 +123,81 @@ impl McpServer {
         let mut pool = self.connections.write().await;
         pool.connect(relay_url, room, token, key, agent_info, executor_state)
             .await
+    }
+
+    /// Join a room, retrying in the background if the relay is unreachable.
+    ///
+    /// The FIRST dial still happens inline (a reachable relay connects before
+    /// this returns, and the Ok message is the real connect message). On
+    /// failure this returns Err — but the room is NOT abandoned: a spawned
+    /// task keeps re-dialing with the same exponential backoff the reconnect
+    /// supervisor uses, so a transient outage at startup (relay restart,
+    /// network hiccup, firewall rule) cannot permanently disable remote
+    /// control for the whole MCP session. The earlier one-shot behavior
+    /// degraded to "local-only forever", which looked exactly like a
+    /// token/room mismatch while the relay was merely unreachable.
+    ///
+    /// Callers should treat the Err as "not connected YET": remote tools stay
+    /// enabled and start working once a retry lands (the pool answers
+    /// "Not connected to room" until then).
+    pub async fn join_room_with_retry(
+        self: &Arc<Self>,
+        relay_url: &str,
+        room: &str,
+        token: &str,
+        key: Option<&str>,
+        agent_info: Option<Box<AgentInfo>>,
+        executor_state: Option<Arc<crate::state::AgentState>>,
+    ) -> Result<String> {
+        // Clone for the inline attempt; the retry task keeps its own copy and
+        // re-clones per attempt (join_room consumes the Box).
+        let inline_info = agent_info.as_ref().map(|b| Box::new((**b).clone()));
+        match self
+            .join_room(relay_url, room, token, key, inline_info, executor_state.clone())
+            .await
+        {
+            Ok(msg) => Ok(msg),
+            Err(first) => {
+                let relay = Arc::clone(self);
+                let relay_url = relay_url.to_string();
+                let token = token.to_string();
+                let key = key.map(str::to_string);
+                let room_task = room.to_string();
+                let room = room_task.clone();
+                tokio::spawn(async move {
+                    let mut backoff = crate::relay_controller::RECONNECT_MIN;
+                    loop {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(crate::relay_controller::RECONNECT_MAX);
+                        let attempt_info =
+                            agent_info.as_ref().map(|b| Box::new((**b).clone()));
+                        match relay
+                            .join_room(
+                                &relay_url,
+                                &room,
+                                &token,
+                                key.as_deref(),
+                                attempt_info,
+                                executor_state.clone(),
+                            )
+                            .await
+                        {
+                            Ok(msg) => {
+                                info!("Connected to relay (background retry): {msg}");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Relay '{}' still unreachable ({}); retrying room '{}' in {:?}",
+                                    relay_url, e, room_task, backoff
+                                );
+                            }
+                        }
+                    }
+                });
+                Err(first)
+            }
+        }
     }
 
     /// Leave a room

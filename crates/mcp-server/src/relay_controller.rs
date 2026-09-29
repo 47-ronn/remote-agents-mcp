@@ -46,8 +46,10 @@ const LIST_AGENTS_WAIT: Duration = Duration::from_secs(3);
 /// than sit on `COMMAND_TIMEOUT`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Controller reconnect backoff bounds (mirrors the agent-side connection loop).
-const RECONNECT_MIN: Duration = Duration::from_secs(1);
-const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// Shared with the initial-join background retry (see `McpServer::
+/// join_room_with_retry`): the first dial and every reconnect use ONE policy.
+pub(crate) const RECONNECT_MIN: Duration = Duration::from_secs(1);
+pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = SplitSink<WsStream, Message>;
