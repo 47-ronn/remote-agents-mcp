@@ -1528,7 +1528,7 @@ pub async fn run_mcp_server(config: &Config) -> Result<()> {
             None
         };
         match relay
-            .join_room(
+            .join_room_with_retry(
                 &config.relay_url,
                 &config.room,
                 &config.token,
@@ -1540,13 +1540,22 @@ pub async fn run_mcp_server(config: &Config) -> Result<()> {
         {
             Ok(msg) => {
                 info!("Connected to relay: {}", msg);
-                (Some(relay), Some(config.room.clone()))
             }
             Err(e) => {
-                warn!("Failed to connect to relay: {}. Remote tools disabled.", e);
-                (None, None)
+                // Not fatal, and remote tools stay enabled: the background
+                // retry (see `join_room_with_retry`) keeps dialing with
+                // backoff, so this session picks the room up as soon as the
+                // relay becomes reachable. The old behavior here — dropping
+                // the relay and going local-only FOREVER after one failed
+                // startup dial — turned a transient outage into a silent
+                // session that looked like a token/room mismatch.
+                warn!(
+                    "Relay '{}' unreachable at startup ({}); retrying in the background",
+                    config.relay_url, e
+                );
             }
         }
+        (Some(relay), Some(config.room.clone()))
     } else {
         info!("No relay configured. Local-only mode.");
         (None, None)
