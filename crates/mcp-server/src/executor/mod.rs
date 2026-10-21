@@ -408,6 +408,50 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::Ok)
         }
 
+        // === Task chains (replicated follow-ups) ===
+        // Replica side of arming: persist the chain copy. The OWNER-side
+        // orchestration (consensus fan-out, watching, firing) lives in the
+        // connection layer, which can talk to peers — see chains.rs there.
+        Command::ChainArm { chain } => {
+            let chains = state.chains();
+            let chain = chain.as_ref().clone();
+            let stored = tokio::task::spawn_blocking(move || chains.upsert(&chain))
+                .await
+                .map_err(|e| anyhow::anyhow!("chain upsert failed: {e}"))??;
+            Ok(CommandResult::ChainAck {
+                chain_id: stored.chain_id.clone(),
+                ok: true,
+            })
+        }
+
+        Command::ChainAck { chain_id, .. } => {
+            // An ack only matters to the arming node's pending map; arriving
+            // here means this host was asked to ack its own chain — answer ok.
+            Ok(CommandResult::ChainAck { chain_id: chain_id.clone(), ok: true })
+        }
+
+        Command::ChainList => {
+            let chains = state.chains();
+            let list = tokio::task::spawn_blocking(move || chains.list())
+                .await
+                .map_err(|e| anyhow::anyhow!("chain list failed: {e}"))??;
+            Ok(CommandResult::ChainList { chains: list })
+        }
+
+        Command::ChainCancel { chain_id } => {
+            let chains = state.chains();
+            let cid = chain_id.clone();
+            // Idempotent: an unknown or already-terminal chain still answers Ok.
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                chains.transition(&cid, "armed", "cancelled")?;
+                chains.transition(&cid, "fired", "cancelled")?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("chain cancel failed: {e}"))??;
+            Ok(CommandResult::Ok)
+        }
+
         // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
         // Starting/stopping exposes a local service to the internet, so require
         // a write-capable mode. Listing is read-only. The work (download +

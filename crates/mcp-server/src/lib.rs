@@ -9,6 +9,7 @@
 //! - If provided → forward to remote agent via relay
 
 pub mod autonomous;
+pub mod chains;
 pub mod config;
 pub mod connection;
 pub mod daemon;

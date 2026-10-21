@@ -357,6 +357,27 @@ message Command {
     repeated string exclude = 7;
   }
   message DeletePaths { repeated string paths = 1; }
+  // Arm a task chain: when the source task (src_task on src_agent) reaches a
+  // terminal status, the OWNER host dispatches `prompt` to `dst_agent` with the
+  // source task's result as context. `owner` is the arming host's agent id;
+  // replicas confirm with ChainAck (consensus = majority of autonomous peers
+  // the owner could reach), then the chain survives the owner's restart.
+  message ChainArm {
+    string chain_id = 1;
+    string src_agent = 2;
+    string src_task = 3;
+    string dst_agent = 4;
+    string prompt = 5;
+    string owner = 6;
+    // Full replicated state (so re-arms / state sync carry firing info too).
+    string state = 7;
+    optional string fired_task = 8;
+    optional string note = 9;
+    uint64 created_at = 10;
+  }
+  message ChainAck { string chain_id = 1; bool ok = 2; }
+  message ChainList {}
+  message ChainCancel { string chain_id = 1; }
   message TunnelStart { string target = 1; }
   message TunnelList {}
   message TunnelStop { string id = 1; }
@@ -411,6 +432,10 @@ message Command {
     DirManifest dir_manifest = 33;
     SyncDirTo sync_dir_to = 34;
     DeletePaths delete_paths = 35;
+    ChainArm chain_arm = 37;
+    ChainAck chain_ack = 38;
+    ChainList chain_list = 39;
+    ChainCancel chain_cancel = 40;
   }
 }
 
@@ -480,6 +505,27 @@ message CommandResult {
     bool success = 3;
     optional string error = 4;
   }
+  // A replicated task chain (see Command.ChainArm). `state`: armed → waiting on
+  // the source task; fired → follow-up dispatched (fired_task on dst_agent);
+  // done → follow-up finished; cancelled.
+  message TaskChain {
+    string chain_id = 1;
+    string src_agent = 2;
+    string src_task = 3;
+    string dst_agent = 4;
+    string prompt = 5;
+    string owner = 6;
+    string state = 7; // armed | fired | done | cancelled
+    optional string fired_task = 8;
+    optional string note = 9;
+    uint64 created_at = 10;
+  }
+  message ChainListResult { repeated TaskChain chains = 1; }
+  // Replica's answer to ChainArm: persisted (ok) or rejected.
+  message ChainAckResult {
+    string chain_id = 1;
+    bool ok = 2;
+  }
   message Ok {}
 
   oneof kind {
@@ -509,6 +555,8 @@ message CommandResult {
     Ok ok = 24;
     DirManifestResult dir_manifest = 25;
     SessionSearchResult session_search = 26;
+    ChainAckResult chain_ack = 27;
+    ChainListResult chain_list = 28;
   }
 }
 

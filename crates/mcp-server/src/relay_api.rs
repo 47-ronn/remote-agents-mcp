@@ -258,8 +258,7 @@ impl McpServer {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Vec<(String, remote_agents_shared::CommandResult)>> {
-        let pool = self.connections.read().await;
-        pool.send_command(
+        self.send_raw(
             room,
             target,
             remote_agents_shared::Command::Exec {
@@ -269,6 +268,19 @@ impl McpServer {
             },
         )
         .await
+    }
+
+    /// Send an arbitrary command to a target and collect per-agent results.
+    /// Used by chain arming (ChainArm fan-out, TaskGet probing) and anything
+    /// else that needs a typed Command beyond exec's shell string.
+    pub async fn send_raw(
+        &self,
+        room: &str,
+        target: remote_agents_shared::Target,
+        command: remote_agents_shared::Command,
+    ) -> Result<Vec<(String, remote_agents_shared::CommandResult)>> {
+        let pool = self.connections.read().await;
+        pool.send_command(room, target, command).await
     }
 
     /// Execute a command across a fleet (single agent, all, or tagged),

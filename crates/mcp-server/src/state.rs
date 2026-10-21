@@ -26,6 +26,8 @@ pub struct AgentState {
     mode_path: Option<Arc<PathBuf>>,
     scheduler: Arc<Scheduler>,
     autonomous: Arc<AutonomousStore>,
+    /// Replicated task chains (owner copies + replicas), persisted in SQLite.
+    chains: Arc<crate::chains::ChainStore>,
     /// Receiver for outbound agent events; drained by the connection loop and
     /// pushed to the relay. Buffers while offline; survives reconnects.
     events_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
@@ -86,12 +88,14 @@ impl AgentState {
             config.autonomous.clone(),
             events_tx,
         ));
+        let chains = Arc::new(crate::chains::ChainStore::load(chains_path()));
         Self {
             config: Arc::new(config),
             mode: Arc::new(RwLock::new(mode)),
             mode_path,
             scheduler,
             autonomous,
+            chains,
             events_rx: Arc::new(Mutex::new(events_rx)),
             peers: Arc::new(RwLock::new(Vec::new())),
             transfers: Arc::new(TransferStore::default()),
@@ -141,6 +145,11 @@ impl AgentState {
     /// The shared autonomous task store/runner.
     pub fn autonomous(&self) -> Arc<AutonomousStore> {
         self.autonomous.clone()
+    }
+
+    /// The replicated task-chain store (owner copies + replicas).
+    pub fn chains(&self) -> Arc<crate::chains::ChainStore> {
+        self.chains.clone()
     }
 
     /// Current operating mode. For a persistent state this re-reads the shared
@@ -233,6 +242,13 @@ fn tasks_path() -> PathBuf {
     dirs::data_dir()
         .map(|p| p.join("remote-agents").join("tasks.db"))
         .unwrap_or_else(|| PathBuf::from("tasks.db"))
+}
+
+/// Path to the replicated task-chain database (SQLite).
+fn chains_path() -> PathBuf {
+    dirs::data_dir()
+        .map(|p| p.join("remote-agents").join("chains.db"))
+        .unwrap_or_else(|| PathBuf::from("chains.db"))
 }
 
 /// Parse the one-word mode file body into an [`AgentMode`] (matches the serde

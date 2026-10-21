@@ -402,6 +402,34 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             vec![],
         ),
         make_tool(
+            "chain_arm",
+            "Arm a replicated task chain: when the source task (src_task on src_agent) finishes, this host (the chain OWNER) dispatches `prompt` to dst_agent with the source result as context. The chain is replicated to autonomous peers with majority-ack consensus and survives owner restarts. Fire happens within ~10s of the source finishing.",
+            json!({
+                "src_agent": {"type": "string", "description": "Agent id running the source task"},
+                "src_task": {"type": "string", "description": "Source autonomous task id"},
+                "dst_agent": {"type": "string", "description": "Agent id to receive the follow-up"},
+                "prompt": {"type": "string", "description": "Follow-up prompt; the source result is prepended as context"}
+            }),
+            vec!["src_agent", "src_task", "dst_agent", "prompt"],
+        ),
+        make_tool(
+            "chain_list",
+            "List task chains stored on this host (owner copies and replicas), with state (armed/fired/done/cancelled) and consensus notes.",
+            json!({
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec![],
+        ),
+        make_tool(
+            "chain_cancel",
+            "Cancel a task chain by id (idempotent).",
+            json!({
+                "chain_id": {"type": "string", "description": "Chain id from chain_arm / chain_list"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["chain_id"],
+        ),
+        make_tool(
             "session_list",
             "List the host's AI-chat history sessions (claude / opencode / codex / cline / roo / \
              kilo / zed / cursor / gemini / qwen / goose / continue), newest first, with live flags.",
@@ -646,6 +674,7 @@ impl ServerHandler for McpHandler {
             "fleet_write" => return self.handle_fleet_write(args).await,
             "fleet_git" => return self.handle_fleet_git(args).await,
             "mapreduce" => return self.handle_mapreduce(args).await,
+            "chain_arm" => return self.handle_chain_arm(args).await,
             _ => {}
         }
 
@@ -852,6 +881,10 @@ impl McpHandler {
                 id: get_str_required("id")?,
             },
             "task_list" => Command::TaskList,
+            "chain_list" => Command::ChainList,
+            "chain_cancel" => Command::ChainCancel {
+                chain_id: get_str_required("chain_id")?,
+            },
             "session_list" => Command::SessionList,
             "session_get" => Command::SessionGet {
                 provider: get_str_required("provider")?,
@@ -995,6 +1028,124 @@ impl McpHandler {
             .as_ref()
             .ok_or_else(|| exec_error("Room not configured"))?;
         Ok((relay, room))
+    }
+
+    /// Arm a replicated task chain, owned by THIS host: persist locally, fan
+    /// `ChainArm` out to every autonomous peer, require a majority ack. The
+    /// connection loop's chain-owner tick (10s + on TaskCompleted) watches the
+    /// source task and fires the follow-up on `dst_agent` — no panel needed.
+    async fn handle_chain_arm(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, CallToolError> {
+        let get_str = |k: &str| -> Option<String> {
+            args.get(k).and_then(|v| v.as_str()).map(String::from)
+        };
+        let (Some(src_agent), Some(src_task), Some(dst_agent), Some(prompt)) = (
+            get_str("src_agent"),
+            get_str("src_task"),
+            get_str("dst_agent"),
+            get_str("prompt"),
+        ) else {
+            return Err(parse_error(
+                "chain_arm",
+                "src_agent, src_task, dst_agent and prompt are required",
+            ));
+        };
+
+        let owner = { self.state.read().await.config.id.clone() };
+        let chain = remote_agents_shared::TaskChain {
+            chain_id: uuid::Uuid::new_v4().to_string(),
+            src_agent,
+            src_task,
+            dst_agent,
+            prompt,
+            owner: owner.clone(),
+            state: "armed".into(),
+            fired_task: None,
+            note: None,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+
+        // Owner persists first (its own ack counts toward the quorum).
+        {
+            let chains = self.state.read().await.chains();
+            let c = chain.clone();
+            let stored = tokio::task::spawn_blocking(move || chains.upsert(&c))
+                .await
+                .map_err(|e| exec_error(format!("chain upsert failed: {e}")))?
+                .map_err(exec_error)?;
+            if stored.state != "armed" {
+                return Err(exec_error(format!(
+                    "chain {} is already {} — use chain_cancel first",
+                    chain.chain_id, stored.state
+                )));
+            }
+        }
+
+        // Replicate to autonomous peers. Without a relay (local-only MCP) a
+        // lone-host quorum stands.
+        let mut acks = 1usize;
+        let mut candidates = 1usize;
+        if self.has_relay() {
+            let (relay, room) = self.relay_room()?;
+            let peers: Vec<String> = relay
+                .list_agents(room)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.autonomous && p.id != owner)
+                .map(|p| p.id)
+                .collect();
+            candidates += peers.len();
+            for pid in peers {
+                match relay
+                    .send_raw(
+                        room,
+                        remote_agents_shared::Target::Agent { id: pid.clone() },
+                        remote_agents_shared::Command::ChainArm {
+                            chain: Box::new(chain.clone()),
+                        },
+                    )
+                    .await
+                {
+                    Ok(v) => {
+                        if v.iter().any(|(_, r)| {
+                            matches!(r, remote_agents_shared::CommandResult::ChainAck { ok: true, .. })
+                        }) {
+                            acks += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("chain {} replica {pid} did not ack: {e}", chain.chain_id)
+                    }
+                }
+            }
+        }
+
+        let met = crate::chains::consensus_met(candidates, acks);
+        let report = format!("consensus {acks}/{candidates} {}", if met { "ok" } else { "FAILED" });
+        {
+            let chains = self.state.read().await.chains();
+            let (id, note) = (chain.chain_id.clone(), report.clone());
+            let _ = tokio::task::spawn_blocking(move || chains.set_note(&id, &note)).await;
+        }
+        if !met {
+            let chains = self.state.read().await.chains();
+            let id = chain.chain_id.clone();
+            let _ = tokio::task::spawn_blocking(move || chains.transition(&id, "armed", "cancelled")).await;
+            return Err(exec_error(format!(
+                "chain {} not durable enough — cancelled ({report})",
+                chain.chain_id
+            )));
+        }
+        Ok(text_result(format!(
+            "chain {} armed ({report}); owner {}; fires ≤10s after the source task finishes",
+            chain.chain_id, chain.owner
+        )))
     }
 
     /// Handle fleet_read tool.
@@ -1407,6 +1558,33 @@ fn format_result(result: &CommandResult) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         CommandResult::Ok => "OK".to_string(),
+        CommandResult::ChainList { chains } => {
+            if chains.is_empty() {
+                return "No chains stored on this host".to_string();
+            }
+            chains
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} [{}] {}#{} -> {} ({}){}",
+                        c.chain_id,
+                        c.state,
+                        c.src_agent,
+                        c.src_task,
+                        c.dst_agent,
+                        c.owner,
+                        c.note
+                            .as_deref()
+                            .map(|n| format!(" | {n}"))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        CommandResult::ChainAck { chain_id, ok } => {
+            format!("chain {chain_id} ack: {}", if *ok { "ok" } else { "rejected" })
+        }
         CommandResult::Mode { mode } => format!("Mode set to {:?}", mode),
         CommandResult::Info { info } => {
             serde_json::to_string_pretty(info).unwrap_or_else(|_| format!("{:?}", info))

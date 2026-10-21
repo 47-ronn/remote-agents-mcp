@@ -389,6 +389,38 @@ pub struct AutonomousTask {
     pub exit_code: Option<i32>,
 }
 
+/// A replicated task chain: "when task `src_task` on `src_agent` finishes,
+/// dispatch `prompt` to `dst_agent` (with the source result as context)".
+/// The OWNER host (where the chain was armed) watches the source task and
+/// fires; replicas hold a copy so the chain survives the owner's restart
+/// (a recovering host re-adopts chains it owns, or fires ones whose source
+/// already finished — firing is idempotent, dedup by `chain_id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskChain {
+    /// Unique chain id (uuid, chosen by the arming node).
+    pub chain_id: String,
+    /// Agent id of the host running the source task.
+    pub src_agent: String,
+    /// Source autonomous task id.
+    pub src_task: String,
+    /// Agent id that receives the follow-up.
+    pub dst_agent: String,
+    /// Follow-up prompt; the source result is prepended as context on fire.
+    pub prompt: String,
+    /// Agent id of the host that armed the chain (fires it).
+    pub owner: String,
+    /// armed | fired | done | cancelled
+    pub state: String,
+    /// Follow-up task id on `dst_agent` once fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_task: Option<String>,
+    /// Free-form note (consensus report, firing errors, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Created timestamp (Unix ms).
+    pub created_at: u64,
+}
+
 /// Target for a command
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
