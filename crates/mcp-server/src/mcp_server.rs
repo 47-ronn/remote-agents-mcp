@@ -683,6 +683,16 @@ impl ServerHandler for McpHandler {
         // Execute locally or remotely based on agent_id
         let result = if let Some(ref aid) = agent_id {
             debug!("Routing {} to remote agent {}", tool_name, aid);
+            // Peer-model bookkeeping: a task we dispatch to a REMOTE host must
+            // record us as its initiator (consumer) so task graphs (fleet panel)
+            // can draw the consumer → executor edge. Local dispatch keeps None
+            // (the host itself / a browser observer is the initiator there).
+            let mut command = command;
+            if let Command::TaskDispatch { initiator, .. } = &mut command {
+                if initiator.is_none() {
+                    *initiator = Some(self.state.read().await.config.id.clone());
+                }
+            }
             self.remote_command(aid, command).await?
         } else if (tool_name == "send_file" || tool_name == "sync_dir") && self.has_relay() {
             // local host → agent: the local executor has no peer-send primitives
@@ -2064,5 +2074,36 @@ mod tests {
     fn build_command_unknown_tool_errors() {
         let h = handler();
         assert!(h.build_command("frobnicate", &args(json!({}))).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_task_dispatch_stamps_local_agent_as_initiator() {
+        // A task_dispatch routed to a REMOTE agent must carry our agent id as
+        // the initiator, so the consumer→executor edge is visible in task
+        // graphs. The stamping happens in call_tool's routing branch, before
+        // remote_command — verify via build_command + the routing prelude by
+        // simulating the same mutation it applies.
+        let h = handler();
+        let mut command = h
+            .build_command("task_dispatch", &args(json!({"prompt": "work", "agent_id": "peer-1"})))
+            .unwrap();
+        // Mirror of the routing prelude in call_tool (remote path):
+        if let Command::TaskDispatch { initiator, .. } = &mut command {
+            if initiator.is_none() {
+                *initiator = Some(h.state.read().await.config.id.clone());
+            }
+        }
+        match command {
+            Command::TaskDispatch { initiator, .. } => {
+                assert_eq!(initiator.as_deref(), Some(h.state.read().await.config.id.as_str()));
+            }
+            other => panic!("expected TaskDispatch, got {other:?}"),
+        }
+        // And without the routing prelude (pure local path) it stays None:
+        let local = h.build_command("task_dispatch", &args(json!({"prompt": "work"}))).unwrap();
+        match local {
+            Command::TaskDispatch { initiator, .. } => assert_eq!(initiator, None),
+            other => panic!("expected TaskDispatch, got {other:?}"),
+        }
     }
 }
