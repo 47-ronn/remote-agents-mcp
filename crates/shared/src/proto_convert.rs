@@ -581,6 +581,40 @@ impl From<proto::AutonomousTask> for crate::AutonomousTask {
     }
 }
 
+impl From<crate::TaskChain> for proto::command_result::TaskChain {
+    fn from(c: crate::TaskChain) -> Self {
+        proto::command_result::TaskChain {
+            chain_id: c.chain_id,
+            src_agent: c.src_agent,
+            src_task: c.src_task,
+            dst_agent: c.dst_agent,
+            prompt: c.prompt,
+            owner: c.owner,
+            state: c.state,
+            fired_task: c.fired_task,
+            note: c.note,
+            created_at: c.created_at,
+        }
+    }
+}
+
+impl From<proto::command_result::TaskChain> for crate::TaskChain {
+    fn from(c: proto::command_result::TaskChain) -> Self {
+        crate::TaskChain {
+            chain_id: c.chain_id,
+            src_agent: c.src_agent,
+            src_task: c.src_task,
+            dst_agent: c.dst_agent,
+            prompt: c.prompt,
+            owner: c.owner,
+            state: c.state,
+            fired_task: c.fired_task,
+            note: c.note,
+            created_at: c.created_at,
+        }
+    }
+}
+
 impl From<crate::DirEntry> for proto::DirEntry {
     fn from(d: crate::DirEntry) -> Self {
         proto::DirEntry {
@@ -791,6 +825,25 @@ impl TryFrom<crate::Command> for proto::Command {
                 })
             }
             D::DeletePaths { paths } => K::DeletePaths(p::DeletePaths { paths }),
+            D::ChainArm { chain } => K::ChainArm(p::ChainArm {
+                chain_id: chain.chain_id,
+                src_agent: chain.src_agent,
+                src_task: chain.src_task,
+                dst_agent: chain.dst_agent,
+                prompt: chain.prompt,
+                owner: chain.owner,
+                state: chain.state,
+                fired_task: chain.fired_task,
+                note: chain.note,
+                created_at: chain.created_at,
+            }),
+            D::ChainAck { chain_id, ok } => {
+                K::ChainAck(p::ChainAck { chain_id, ok })
+            }
+            D::ChainList => K::ChainList(p::ChainList {}),
+            D::ChainCancel { chain_id } => {
+                K::ChainCancel(p::ChainCancel { chain_id })
+            }
             D::TunnelStart { target } => K::TunnelStart(p::TunnelStart { target }),
             D::TunnelList => K::TunnelList(p::TunnelList {}),
             D::TunnelStop { id } => K::TunnelStop(p::TunnelStop { id }),
@@ -879,6 +932,23 @@ impl TryFrom<proto::Command> for crate::Command {
                 exclude: e.exclude,
             },
             K::DeletePaths(e) => D::DeletePaths { paths: e.paths },
+            K::ChainArm(e) => D::ChainArm {
+                chain: Box::new(crate::TaskChain {
+                    chain_id: e.chain_id,
+                    src_agent: e.src_agent,
+                    src_task: e.src_task,
+                    dst_agent: e.dst_agent,
+                    prompt: e.prompt,
+                    owner: e.owner,
+                    state: e.state,
+                    fired_task: e.fired_task,
+                    note: e.note,
+                    created_at: e.created_at,
+                }),
+            },
+            K::ChainAck(e) => D::ChainAck { chain_id: e.chain_id, ok: e.ok },
+            K::ChainList(_) => D::ChainList,
+            K::ChainCancel(e) => D::ChainCancel { chain_id: e.chain_id },
             K::TunnelStart(e) => D::TunnelStart { target: e.target },
             K::TunnelList(_) => D::TunnelList,
             K::TunnelStop(e) => D::TunnelStop { id: e.id },
@@ -968,6 +1038,12 @@ impl TryFrom<crate::CommandResult> for proto::CommandResult {
             }
             D::ReduceResult { job_id, output, success, error } => {
                 K::ReduceResult(p::ReduceResult { job_id, output, success, error })
+            }
+            D::ChainList { chains } => K::ChainList(p::ChainListResult {
+                chains: chains.into_iter().map(Into::into).collect(),
+            }),
+            D::ChainAck { chain_id, ok } => {
+                K::ChainAck(p::ChainAckResult { chain_id, ok })
             }
             D::Ok => K::Ok(p::Ok {}),
         };
@@ -1068,6 +1144,10 @@ impl TryFrom<proto::CommandResult> for crate::CommandResult {
                 success: e.success,
                 error: e.error,
             },
+            K::ChainList(e) => D::ChainList {
+                chains: e.chains.into_iter().map(Into::into).collect(),
+            },
+            K::ChainAck(e) => D::ChainAck { chain_id: e.chain_id, ok: e.ok },
             K::Ok(_) => D::Ok,
         })
     }
@@ -1403,6 +1483,14 @@ mod tests {
                 exclude: vec!["node_modules".into(), "/build".into()],
             },
             Command::DeletePaths { paths: vec!["/d/a".into(), "/d/b".into()] },
+            Command::ChainArm { chain: Box::new(crate::TaskChain {
+                chain_id: "ch1".into(), src_agent: "a".into(), src_task: "t".into(),
+                dst_agent: "b".into(), prompt: "go".into(), owner: "a".into(),
+                state: "armed".into(), fired_task: None, note: None, created_at: 7,
+            }) },
+            Command::ChainAck { chain_id: "ch1".into(), ok: true },
+            Command::ChainList,
+            Command::ChainCancel { chain_id: "ch1".into() },
             Command::TunnelStart { target: "http://localhost:3000".into() },
             Command::TunnelList,
             Command::TunnelStop { id: "t".into() },
@@ -1458,6 +1546,12 @@ mod tests {
             CommandResult::MapResult { job_id: "j".into(), partition_id: 0, output: "o".into(), success: true, error: None },
             CommandResult::MapResult { job_id: "j".into(), partition_id: 1, output: "".into(), success: false, error: Some("boom".into()) },
             CommandResult::ReduceResult { job_id: "j".into(), output: "o".into(), success: true, error: None },
+            CommandResult::ChainList { chains: vec![crate::TaskChain {
+                chain_id: "ch1".into(), src_agent: "a".into(), src_task: "t".into(),
+                dst_agent: "b".into(), prompt: "go".into(), owner: "a".into(),
+                state: "fired".into(), fired_task: Some("t2".into()), note: Some("consensus 3/3 ok".into()), created_at: 7,
+            }] },
+            CommandResult::ChainAck { chain_id: "ch1".into(), ok: true },
             CommandResult::Ok,
         ];
         for r in results {

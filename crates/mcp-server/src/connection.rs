@@ -16,8 +16,93 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, timeout};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+
+/// Recommended room-token length. The relay refuses shorter tokens by default
+/// (`--min-token-len`, default 32): the token is the room's only gate, and a
+/// short one is guessable online (the roster's empty-vs-populated answer
+/// confirms a correct guess).
+pub(crate) const MIN_SECURE_TOKEN_LEN: usize = 32;
+
+/// Warn once per connect when the configured token is (non-empty but) shorter
+/// than the recommended minimum.
+pub(crate) fn warn_short_token(token: &str) {
+    if !token.is_empty() && token.len() < MIN_SECURE_TOKEN_LEN {
+        warn!(
+            "room token is only {} chars — use ≥{} random characters \
+             (relays reject shorter tokens by default)",
+            token.len(),
+            MIN_SECURE_TOKEN_LEN
+        );
+    }
+}
+
+/// Build a WebSocket upgrade request with the room token in the Authorization
+/// header — the secret never appears in the URL, so proxy/access logs and
+/// browser histories stay clean. Empty tokens send no header (the auth frame
+/// still carries the token). Legacy relays that only read `?token=` reject
+/// this with `auth_failed`; callers retry once with the query-string form.
+pub(crate) fn ws_request(url: &str, token: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut req = url.into_client_request().context("invalid relay URL")?;
+    if !token.is_empty() {
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", token)
+                .parse()
+                .context("room token contains characters invalid in a header")?,
+        );
+    }
+    Ok(req)
+}
+
+/// Why a dial failed to authenticate.
+#[derive(Debug)]
+pub(crate) enum DialErr {
+    /// The relay answered `auth_failed` — wrong token, or a legacy relay that
+    /// only knows the query-string token (header mode not understood).
+    Auth(String),
+    /// Transport/handshake/timeout trouble.
+    Other(anyhow::Error),
+}
+
+/// Dial `url` and complete the auth handshake with `auth_bytes` (an encoded
+/// `ClientMessage::Auth`). The token rides in the Authorization header (see
+/// [`ws_request`]); the auth frame repeats it, as both relays expect.
+pub(crate) async fn dial_auth(
+    url: &str,
+    auth_bytes: Vec<u8>,
+    token: &str,
+) -> std::result::Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        String,
+    ),
+    DialErr,
+> {
+    let request = ws_request(url, token).map_err(DialErr::Other)?;
+    let (ws_stream, _) = connect_async(request).await.map_err(|e| DialErr::Other(e.into()))?;
+    let (mut write, mut read) = ws_stream.split();
+    write
+        .send(Message::Binary(auth_bytes))
+        .await
+        .map_err(|e| DialErr::Other(e.into()))?;
+    match timeout(Duration::from_secs(10), await_auth_verdict(&mut read)).await {
+        Err(_) => Err(DialErr::Other(anyhow::anyhow!("Auth timeout"))),
+        Ok(Err(e)) => {
+            // await_auth_verdict bails "Auth failed: {reason}" on an explicit
+            // auth_failed verdict — that is the legacy/wrong-token signal.
+            let msg = e.to_string();
+            if msg.starts_with("Auth failed") {
+                Err(DialErr::Auth(msg))
+            } else {
+                Err(DialErr::Other(e))
+            }
+        }
+        Ok(Ok(session_id)) => Ok((write.reunite(read).expect("split halves of one stream"), session_id)),
+    }
+}
 
 /// Reply to a peer command we initiated (decrypted result, or an error string).
 type ConnReply = std::result::Result<CommandResult, String>;
@@ -218,43 +303,44 @@ where
 }
 
 async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
-    // Build WebSocket URL
-    let ws_url = format!(
-        "{}/ws/room/{}?token={}",
-        config.relay_url, config.room, config.token
+    // Token-free URL: the room token travels in the Authorization header (and
+    // the auth frame), keeping it out of URLs → proxy/access logs.
+    let ws_base = format!(
+        "{}/ws/room/{}",
+        config.relay_url.trim_end_matches('/'),
+        config.room
     );
-
-    info!("Connecting to {}", ws_url);
-
-    // Connect
-    let (ws_stream, _response) = connect_async(&ws_url)
-        .await
-        .context("Failed to connect to relay")?;
-
-    info!("Connected to relay");
-
-    let (mut write, mut read) = ws_stream.split();
+    info!("Connecting to {}", ws_base);
+    warn_short_token(&config.token);
 
     // Build agent info (reflecting the current runtime mode)
     let agent_info = build_agent_info(config, state.mode().await);
 
-    // Send auth message
+    // Send auth — the frame repeats the token (both relays expect it).
     let auth_msg = ClientMessage::Auth {
         room: config.room.clone(),
         token: config.token.clone(),
         agent_info: Some(Box::new(agent_info.clone())),
     };
+    let auth_bytes = auth_msg.to_proto_bytes()?;
 
-    write
-        .send(Message::Binary(auth_msg.to_proto_bytes()?))
-        .await
-        .context("Failed to send auth")?;
+    // Dial + auth; a legacy relay that only knows `?token=` answers
+    // auth_failed for the header form — retry once with the query-string URL.
+    let (ws_stream, session_id) = match dial_auth(&ws_base, auth_bytes.clone(), &config.token).await {
+        Ok(pair) => pair,
+        Err(DialErr::Auth(reason)) => {
+            warn!("relay rejected header auth ({}); retrying with legacy ?token= URL", reason);
+            let legacy_url = format!("{}?token={}", ws_base, config.token);
+            match dial_auth(&legacy_url, auth_bytes, &config.token).await {
+                Ok(pair) => pair,
+                Err(DialErr::Auth(reason)) => bail!("{}", reason),
+                Err(DialErr::Other(e)) => return Err(e.context("Failed to connect to relay")),
+            }
+        }
+        Err(DialErr::Other(e)) => return Err(e.context("Failed to connect to relay")),
+    };
+    let (mut write, mut read) = ws_stream.split();
 
-    // Wait for the auth verdict, tolerating pre-auth broadcast frames (see
-    // `await_auth_verdict`).
-    let session_id = timeout(Duration::from_secs(10), await_auth_verdict(&mut read))
-        .await
-        .context("Auth timeout")??;
     info!("Authenticated with session ID: {}", session_id);
 
     info!("End-to-end payload encryption active (AES-GCM-256)");
@@ -312,6 +398,11 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
     health.tick().await; // consume the immediate first tick
     let mut alive = true;
     let mut commands_handled: u64 = 0;
+
+    // Task-chain owner tick: poll owned chains, fire finished ones. Also runs
+    // right after a TaskCompleted event for near-instant follow-ups.
+    let mut chain_tick = interval(Duration::from_secs(10));
+    chain_tick.tick().await; // consume the immediate first tick
 
     // Main loop
     loop {
@@ -390,6 +481,20 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                 if let Ok(bytes) = msg.to_proto_bytes() {
                     let _ = ws_tx.send(Message::Binary(bytes)).await;
                 }
+                // A finished local task may release owned chains — tick now.
+                // Spawned: the tick sends peer commands whose replies arrive
+                // on THIS loop — awaiting it inline would self-deadlock.
+                {
+                    let (st, tx2, pd) = (state.clone(), tx.clone(), pending.clone());
+                    tokio::spawn(async move { chain_owner_tick(&st, &tx2, &pd).await });
+                }
+            }
+
+            // Task-chain owner poll (recovery: sources finished while we were
+            // down / offline; also retries fire dispatches that failed).
+            _ = chain_tick.tick() => {
+                let (st, tx2, pd) = (state.clone(), tx.clone(), pending.clone());
+                tokio::spawn(async move { chain_owner_tick(&st, &tx2, &pd).await });
             }
 
             // Agent info update (e.g. mode change) - send UpdateAgent to relay.
@@ -1037,6 +1142,141 @@ async fn send_peer_command(
         _ => {
             pending.write().await.remove(&request_id);
             bail!("peer command timed out")
+        }
+    }
+}
+
+// === Task chains: owner-side orchestration =================================
+//
+// The OWNER of a chain (the host that armed it) replicates it to autonomous
+// peers for consensus, watches the source task, and fires the follow-up on
+// the destination host. Firing is guarded by an atomic armed→fired transition
+// in the owner's SQLite, so retries/restarts never double-fire from the owner.
+// Replicas are a durability net (and can re-push a chain to a restarted
+// owner); they never fire unless promoted to owner by the human re-arming.
+
+/// Owner tick: check every armed chain this host owns.
+/// - Source task on THIS host → read its terminal status straight from the
+///   autonomous store.
+/// - Source task on a PEER host → TaskGet over the relay (also covers the
+///   restart-recovery case: source finished while the owner was down).
+///
+/// Fire = atomic armed→fired transition + TaskDispatch on the destination.
+pub(crate) async fn chain_owner_tick(
+    state: &AgentState,
+    tx: &mpsc::Sender<ClientMessage>,
+    pending: &ConnPending,
+) {
+    let owner = state.config.id.clone();
+    let chains = state.chains();
+    let armed = match tokio::task::spawn_blocking(move || chains.armed_owned(&owner)).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            warn!("chain owner tick: list failed: {e}");
+            return;
+        }
+        Err(_) => return,
+    };
+
+    for chain in armed {
+        // 1) Resolve the source task's status.
+        let status = if chain.src_agent == state.config.id {
+            let store = state.autonomous();
+            let src = chain.src_task.clone();
+            tokio::task::spawn_blocking(move || store.get(&src))
+                .await
+                .ok()
+                .and_then(|r| r.ok().flatten())
+                .map(|t| {
+                    (
+                        t.status,
+                        t.result.unwrap_or_default(),
+                        t.error.unwrap_or_default(),
+                    )
+                })
+        } else {
+            let cipher = state.cipher();
+            let src_agent = chain.src_agent.clone();
+            let src_task = chain.src_task.clone();
+            match send_peer_command(&cipher, tx, pending, &src_agent, Command::TaskGet { id: src_task })
+                .await
+            {
+                Ok(CommandResult::Task { task }) => Some((
+                    task.status,
+                    task.result.unwrap_or_default(),
+                    task.error.unwrap_or_default(),
+                )),
+                Ok(_) => None,
+                Err(_) => continue, // source unreachable — retry next tick
+            }
+        };
+        let Some((status, result, error)) = status else { continue };
+        let terminal = matches!(
+            status,
+            remote_agents_shared::TaskStatus::Done | remote_agents_shared::TaskStatus::Failed
+        );
+        if !terminal {
+            continue;
+        }
+        let status_str = if status == remote_agents_shared::TaskStatus::Done {
+            "done"
+        } else {
+            "failed"
+        };
+        let output = if status_str == "done" { result } else { error };
+
+        // 2) Atomic armed→fired (idempotent; loses the race → another path fired).
+        let chains = state.chains();
+        let id = chain.chain_id.clone();
+        let won = match tokio::task::spawn_blocking(move || chains.transition(&id, "armed", "fired")).await {
+            Ok(Ok(w)) => w,
+            _ => false,
+        };
+        if !won {
+            continue;
+        }
+
+        // 3) Dispatch the follow-up on the destination host.
+        let prompt = crate::chains::follow_up_prompt(&chain, status_str, &output);
+        let cipher = state.cipher();
+        let dst = chain.dst_agent.clone();
+        let dispatch = if dst == state.config.id {
+            // Self destination: dispatch straight into the local store.
+            let store = state.autonomous();
+            let initiator = state.config.id.clone();
+            store
+                .dispatch(&prompt, Some(initiator))
+                .map(|id| CommandResult::TaskQueued { id })
+        } else {
+            send_peer_command(
+                &cipher,
+                tx,
+                pending,
+                &dst,
+                Command::TaskDispatch {
+                    prompt,
+                    initiator: Some(state.config.id.clone()),
+                },
+            )
+            .await
+        };
+
+        match dispatch {
+            Ok(CommandResult::TaskQueued { id: fired }) => {
+                info!("Chain {} fired: follow-up task {fired} on {dst}", chain.chain_id);
+                let chains = state.chains();
+                let (cid, fid) = (chain.chain_id.clone(), fired);
+                let _ = tokio::task::spawn_blocking(move || chains.set_fired_task(&cid, &fid)).await;
+            }
+            Ok(other) => {
+                warn!("Chain {}: unexpected dispatch result {:?}", chain.chain_id, other);
+            }
+            Err(e) => {
+                warn!("Chain {} dispatch failed: {e}", chain.chain_id);
+                let chains = state.chains();
+                let (cid, note) = (chain.chain_id.clone(), format!("fire error: {e}"));
+                let _ = tokio::task::spawn_blocking(move || chains.set_note(&cid, &note)).await;
+            }
         }
     }
 }

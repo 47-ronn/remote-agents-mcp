@@ -344,6 +344,28 @@ pub enum Command {
         paths: Vec<String>,
     },
 
+    // === Task chains (replicated follow-ups; see CommandResult::TaskChain) ===
+    /// Arm a task chain on the receiver: persist it (replica) so it survives
+    /// the owner's restart. The owner confirms consensus (majority of
+    /// autonomous peers acked) before relying on the chain.
+    ChainArm {
+        chain: Box<crate::types::TaskChain>,
+    },
+
+    /// Replica's answer to [`ChainArm`]: persisted or rejected.
+    ChainAck {
+        chain_id: String,
+        ok: bool,
+    },
+
+    /// List chains stored on this host (owner or replica).
+    ChainList,
+
+    /// Cancel a chain by id (owner or any replica; state → cancelled).
+    ChainCancel {
+        chain_id: String,
+    },
+
     // === Cloudflare quick tunnels (dev: expose a local port publicly) ===
     /// Start a Cloudflare quick tunnel to a local address (e.g.
     /// `http://localhost:3000`, or a bare port). Downloads `cloudflared` on
@@ -660,6 +682,18 @@ pub enum CommandResult {
         success: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    // === Task chains ===
+    /// The host's stored chains (owner and replica copies), for `ChainList`.
+    ChainList {
+        chains: Vec<crate::types::TaskChain>,
+    },
+
+    /// Replica's answer to [`Command::ChainArm`].
+    ChainAck {
+        chain_id: String,
+        ok: bool,
     },
 
     /// Generic success
