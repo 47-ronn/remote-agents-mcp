@@ -83,9 +83,24 @@ async fn ws_handler(
     // clients); the token-derived room key is computed post-auth in the
     // handler. A wrong token still derives a different key → isolated room.
     let provided = provided_token(q.token.as_ref(), &headers);
-    ws.max_message_size(MAX_WS_MESSAGE)
-        .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| {
+    // Echo a requested `bearer.*` subprotocol back in the 101 response — a
+    // browser WebSocket that offered subprotocols FAILS the handshake when
+    // the server selects none, and this subprotocol is the panel's
+    // out-of-URL token channel.
+    let bearer_protocols: Vec<String> = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| p.starts_with("bearer."))
+        .map(str::to_string)
+        .collect();
+    let mut ws = ws.max_message_size(MAX_WS_MESSAGE).max_frame_size(MAX_WS_MESSAGE);
+    if !bearer_protocols.is_empty() {
+        ws = ws.protocols(bearer_protocols);
+    }
+    ws.on_upgrade(move |socket| {
             handler::handle_socket(socket, room, provided, client_ip, gate_ip, state)
         })
 }
@@ -187,8 +202,12 @@ async fn room_info(
     Ok(Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp })))
 }
 
-/// Extract the caller's room token: `Authorization: Bearer` header first (so
-/// the secret need not travel in the URL), then the query param (legacy).
+/// Extract the caller's room token, in order of preference:
+/// 1. `Authorization: Bearer <token>` header (non-browser clients);
+/// 2. `Sec-WebSocket-Protocol: bearer.<base64url(token)>` — the ONLY header a
+///    browser `WebSocket` can set, so the panel can keep its token out of the
+///    URL (URLs land in proxy/access logs; subprotocols do not);
+/// 3. the query param (legacy).
 fn provided_token(query_token: Option<&String>, headers: &HeaderMap) -> Option<String> {
     if let Some(t) = headers
         .get("authorization")
@@ -197,7 +216,45 @@ fn provided_token(query_token: Option<&String>, headers: &HeaderMap) -> Option<S
     {
         return Some(t.to_string());
     }
+    if let Some(p) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bearer."))
+    {
+        if let Some(t) = b64url_decode(p) {
+            return Some(t);
+        }
+    }
     query_token.cloned()
+}
+
+/// Minimal URL-safe base64 decoder for the subprotocol-carried token (the
+/// room token is arbitrary printable ASCII; a strict standard alphabet
+/// decoder would reject `+/=`). Returns None on non-base64url input — the
+/// caller then falls through to the query param instead of failing closed on
+/// a subprotocol it does not understand.
+fn b64url_decode(s: &str) -> Option<String> {
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4 + 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &b in s.as_bytes() {
+        let v = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Compact error for the HTTP info endpoints (a full `Response` as the `Err`
@@ -304,5 +361,46 @@ mod tests {
         h.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
         // No usable header → TCP peer.
         assert_eq!(client_ip(&h, peer()), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    // base64url("A8q3skmiGv4Ybi2G05tMaSdma=Mo00") — a real-shaped room token
+    // (printable ASCII incl. '=' and '%'-style specials survive the encode).
+    #[test]
+    fn provided_token_from_subprotocol_header() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "sec-websocket-protocol",
+            "bearer.QThxM3NrbWlHdjRZYmkyRzA1dE1hU2RtYT1NbzAw".parse().unwrap(),
+        );
+        assert_eq!(
+            provided_token(None, &h).as_deref(),
+            Some("A8q3skmiGv4Ybi2G05tMaSdma=Mo00")
+        );
+    }
+
+    #[test]
+    fn provided_token_prefers_authorization_over_subprotocol() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer sekrit".parse().unwrap());
+        h.insert("sec-websocket-protocol", "bearer.Zm9v".parse().unwrap());
+        assert_eq!(provided_token(None, &h).as_deref(), Some("sekrit"));
+    }
+
+    #[test]
+    fn provided_token_falls_through_on_non_bearer_subprotocol() {
+        let mut h = HeaderMap::new();
+        h.insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
+        assert_eq!(
+            provided_token(Some(&"legacy".to_string()), &h).as_deref(),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn b64url_decode_rejects_invalid_and_non_utf8() {
+        assert_eq!(b64url_decode("Zm9v"), Some("foo".to_string())); // sanity
+        assert_eq!(b64url_decode(""), Some(String::new()));
+        assert_eq!(b64url_decode("!!!"), None); // not base64url
+        assert_eq!(b64url_decode("_w"), None); // 0xFF byte → invalid UTF-8
     }
 }
