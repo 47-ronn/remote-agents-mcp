@@ -5,6 +5,7 @@
 //! just a non-blocking send into those channels (the socket write happens in a
 //! dedicated per-connection writer task), which keeps routing lock-free of I/O.
 
+use crate::limiter::RateLimiter;
 use dashmap::DashMap;
 use remote_agents_shared::AgentInfo;
 use std::sync::Arc;
@@ -79,6 +80,20 @@ pub struct RelayState {
     /// (`send_raw`'s full-channel drop). Reaping on a stuck write frees routing
     /// and stops the drop storm.
     pub write_timeout: std::time::Duration,
+    /// Minimum room-token length when no server token is configured (the room
+    /// token is then the room's only gate, so a weak one is guessable). The
+    /// library default is lenient (0) to preserve the isolation semantics the
+    /// test-suite pins; the shipped binary defaults to 32 and offers
+    /// `--min-token-len` to change/disable it.
+    pub min_token_len: usize,
+    /// Per-IP connection budget + auth-failure bans (see `limiter`).
+    pub limiter: RateLimiter,
+    /// Key the limiter by `X-Forwarded-For`/`X-Real-IP` instead of the TCP
+    /// peer address. Set ONLY when the relay runs behind a reverse proxy that
+    /// overwrites those headers — then the peer is always the proxy and every
+    /// client would share one budget. Without it, the peer address is used and
+    /// cannot be spoofed.
+    pub trust_proxy: bool,
 }
 
 impl RelayState {
@@ -88,7 +103,30 @@ impl RelayState {
             token,
             idle_timeout: std::time::Duration::from_secs(90),
             write_timeout: std::time::Duration::from_secs(30),
+            min_token_len: 0,
+            limiter: RateLimiter::new(Default::default()),
+            trust_proxy: false,
         }
+    }
+
+    /// Enforce a minimum room-token length (0 = no minimum; applies only when
+    /// no server token is configured — a server token is then the gate and
+    /// room tokens are irrelevant to security).
+    pub fn with_min_token_len(mut self, n: usize) -> Self {
+        self.min_token_len = n;
+        self
+    }
+
+    /// Replace the per-IP rate limits (see `limiter::Limits`).
+    pub fn with_rate_limits(mut self, limits: crate::limiter::Limits) -> Self {
+        self.limiter = RateLimiter::new(limits);
+        self
+    }
+
+    /// Trust proxy headers when keying the limiter (see `RelayState::trust_proxy`).
+    pub fn with_trust_proxy(mut self, v: bool) -> Self {
+        self.trust_proxy = v;
+        self
     }
 
     /// Override the idle-reaper window (tests use a short value).

@@ -5,11 +5,12 @@
 //! blocks on socket I/O and a slow consumer is bounded (and dropped) rather than
 //! stalling the room.
 
+use crate::limiter::ct_eq;
 use crate::routing::{dedup_agents, resolve_targets};
 use crate::state::{AgentSession, McpSession, RelayState, Room, Tx, OUTBOUND_CAP};
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
-use remote_agents_shared::{AgentInfo, ClientMessage, Endpoint, ServerMessage};
+use remote_agents_shared::{room_key, AgentInfo, ClientMessage, Endpoint, ServerMessage};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -42,14 +43,18 @@ where
 
 /// Drive a single accepted WebSocket connection to completion.
 ///
-/// `room_key` is the token-derived storage key (the room's real identity);
-/// `room_name` is the human name kept for `/api/rooms`.
+/// `room_name` is the human name from the URL path. `provided_token` is the
+/// room token presented out-of-band (Authorization header, legacy query param)
+/// if any; when `None`, the auth frame's token IS the room token and the
+/// token-derived storage key is computed from it after auth. `client_ip` is
+/// the reflected address (proxy-aware); `gate_ip` keys the abuse limiter (the
+/// TCP peer unless `--trust-proxy`, so it cannot be spoofed).
 pub async fn handle_socket(
     socket: WebSocket,
-    room_key: String,
     room_name: String,
-    query_token: Option<String>,
+    provided_token: Option<String>,
     client_ip: IpAddr,
+    gate_ip: IpAddr,
     state: Arc<RelayState>,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -61,17 +66,18 @@ pub async fn handle_socket(
         Some(Ok(Message::Binary(b))) => b,
         _ => return,
     };
-    let agent_info = match ClientMessage::from_proto_bytes(&first) {
+    let (auth_frame_token, agent_info) = match ClientMessage::from_proto_bytes(&first) {
         Ok(ClientMessage::Auth {
             token, agent_info, ..
         }) => {
-            if !auth_ok(&state, query_token.as_deref(), &token) {
+            if !auth_ok(&state, provided_token.as_deref(), &token) {
+                state.limiter.record_failure(gate_ip);
                 let _ = sink.send(bin(&ServerMessage::AuthFailed {
                     reason: "invalid token".to_string(),
                 })).await;
                 return;
             }
-            agent_info
+            (token, agent_info)
         }
         _ => {
             let _ = sink.send(bin(&ServerMessage::Error {
@@ -81,8 +87,35 @@ pub async fn handle_socket(
         }
     };
 
+    // The EFFECTIVE room token: the out-of-band one (header/query) wins — it
+    // is what legacy clients keyed the room with — else the auth frame's. The
+    // storage key derives from it either way, so a host presenting a wrong
+    // token still lands in its own (empty) room.
+    let effective_token = provided_token.unwrap_or(auth_frame_token);
+
+    // Minimum token length, enforced only in room-token mode (no `--token`):
+    // there the token is the room's only gate, and a short one is guessable.
+    if state.token.is_none() && state.min_token_len > 0 && effective_token.len() < state.min_token_len
+    {
+        state.limiter.record_failure(gate_ip);
+        let _ = sink
+            .send(bin(&ServerMessage::AuthFailed {
+                reason: format!(
+                    "room token too short: {} chars < {} required \
+                     (start the relay with --min-token-len 0 for dev/tokenless rooms)",
+                    effective_token.len(),
+                    state.min_token_len
+                ),
+            }))
+            .await;
+        return;
+    }
+
+    let key = room_key(&room_name, &effective_token);
     let session_id = Uuid::new_v4().to_string();
-    let room = state.room(&room_key, &room_name);
+    let room = state.room(&key, &room_name);
+    // A successful auth clears the IP's failure streak in the limiter.
+    state.limiter.record_success(gate_ip);
 
     // Send auth_ok before handing the sink to the writer task.
     if sink
@@ -92,7 +125,7 @@ pub async fn handle_socket(
         .await
         .is_err()
     {
-        state.gc_room(&room_name);
+        state.gc_room(&key);
         return;
     }
 
@@ -215,20 +248,26 @@ pub async fn handle_socket(
     // Drop any in-flight requests this session initiated; their results would
     // have nowhere to go now.
     room.pending.retain(|_, origin| origin != &session_id);
-    state.gc_room(&room_key);
+    state.gc_room(&key);
 }
 
 /// Auth parity with the Cloudflare worker, plus optional server-enforced token:
-/// - if a server token is configured, the auth token must equal it;
-/// - otherwise, the auth token must equal the connection's query token. Our
-///   clients always send the same value in both, so legit connections are
-///   unaffected; an empty/absent query token now only admits an empty auth token
-///   (previously it admitted ANY auth token — an open-access hole).
-fn auth_ok(state: &RelayState, query_token: Option<&str>, auth_token: &str) -> bool {
+/// - if a server token is configured, the auth token must equal it (compared
+///   in constant time — no early exit a network observer could time);
+/// - otherwise, when the token was presented out-of-band (legacy query param
+///   or Authorization header) the auth frame must repeat the same value;
+/// - with no out-of-band token at all (header-mode clients) the auth frame IS
+///   the room token — there is nothing to cross-check, and the room key
+///   derives from it (isolation is unchanged: a wrong token lands in its own
+///   empty room).
+fn auth_ok(state: &RelayState, provided_token: Option<&str>, auth_token: &str) -> bool {
     if let Some(server) = &state.token {
-        return auth_token == server;
+        return ct_eq(auth_token, server);
     }
-    query_token.unwrap_or("") == auth_token
+    match provided_token {
+        Some(p) => ct_eq(p, auth_token),
+        None => true,
+    }
 }
 
 /// Route one client message. Returns `Break` to close the connection.
@@ -483,16 +522,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_ok_query_token_when_no_server_token() {
+    fn auth_ok_out_of_band_token_when_no_server_token() {
         let s = RelayState::new(None);
-        assert!(auth_ok(&s, Some("q"), "q")); // query must equal auth
+        assert!(auth_ok(&s, Some("q"), "q")); // query/header must equal auth
         assert!(!auth_ok(&s, Some("q"), "x")); // mismatch rejected
-        // Empty/absent query no longer admits an arbitrary auth token (the
+        // An empty out-of-band token only admits an empty auth token (the
         // closed open-access hole): it must also be empty.
         assert!(!auth_ok(&s, Some(""), "whatever"));
-        assert!(!auth_ok(&s, None, "whatever"));
-        assert!(auth_ok(&s, Some(""), "")); // empty == empty (token-less dev)
-        assert!(auth_ok(&s, None, "")); // absent query == empty auth
+        // NO out-of-band token (header-mode client): the auth frame IS the
+        // token — allowed, and the room key derives from it (isolation holds).
+        assert!(auth_ok(&s, None, "whatever"));
+        assert!(auth_ok(&s, None, ""));
     }
 }
 

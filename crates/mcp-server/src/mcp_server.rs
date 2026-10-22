@@ -1064,10 +1064,7 @@ impl McpHandler {
             state: "armed".into(),
             fired_task: None,
             note: None,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            created_at: crate::autonomous::now_ms(),
         };
 
         // Owner persists first (its own ack counts toward the quorum).
@@ -1101,27 +1098,31 @@ impl McpHandler {
                 .map(|p| p.id)
                 .collect();
             candidates += peers.len();
-            for pid in peers {
-                match relay
-                    .send_raw(
-                        room,
-                        remote_agents_shared::Target::Agent { id: pid.clone() },
-                        remote_agents_shared::Command::ChainArm {
-                            chain: Box::new(chain.clone()),
-                        },
-                    )
-                    .await
-                {
-                    Ok(v) => {
-                        if v.iter().any(|(_, r)| {
-                            matches!(r, remote_agents_shared::CommandResult::ChainAck { ok: true, .. })
-                        }) {
-                            acks += 1;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("chain {} replica {pid} did not ack: {e}", chain.chain_id)
-                    }
+            // Replicate to all peers CONCURRENTLY: the arm is a user-facing
+            // tool call — sequential fan-out would pay the sum (or one dead
+            // peer's full timeout) instead of the max.
+            let futs = peers.into_iter().map(|pid| {
+                let arm = remote_agents_shared::Command::ChainArm {
+                    chain: Box::new(chain.clone()),
+                };
+                async move {
+                    let res = relay
+                        .send_raw(room, remote_agents_shared::Target::Agent { id: pid.clone() }, arm)
+                        .await;
+                    (pid, res)
+                }
+            });
+            for (pid, res) in futures::future::join_all(futs).await {
+                let acked = matches!(
+                    res,
+                    Ok(v) if v.iter().any(|(_, r)| {
+                        matches!(r, remote_agents_shared::CommandResult::ChainAck { ok: true, .. })
+                    })
+                );
+                if acked {
+                    acks += 1;
+                } else {
+                    tracing::debug!("chain {}: replica {pid} did not ack", chain.chain_id);
                 }
             }
         }

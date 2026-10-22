@@ -13,6 +13,7 @@ pub mod chains;
 pub mod config;
 pub mod connection;
 pub mod daemon;
+pub mod db_util;
 pub mod exclude;
 pub mod executor;
 pub mod files;

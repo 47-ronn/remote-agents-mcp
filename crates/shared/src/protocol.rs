@@ -352,12 +352,6 @@ pub enum Command {
         chain: Box<crate::types::TaskChain>,
     },
 
-    /// Replica's answer to [`ChainArm`]: persisted or rejected.
-    ChainAck {
-        chain_id: String,
-        ok: bool,
-    },
-
     /// List chains stored on this host (owner or replica).
     ChainList,
 

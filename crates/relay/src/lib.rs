@@ -3,12 +3,15 @@
 //! server on an ephemeral port.
 
 pub mod handler;
+pub mod limiter;
 pub mod routing;
 pub mod state;
 
+pub use limiter::{ct_eq, Limits, RateLimiter, Verdict};
+
 use axum::{
     extract::{ws::WebSocketUpgrade, ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -47,7 +50,7 @@ struct WsQuery {
 
 /// Query params accepted by the HTTP info endpoints (`/api/room/:room`,
 /// `/api/rooms`). The token may also travel in an `Authorization: Bearer`
-/// header, so panels don't have to put the secret in the URL.
+/// header (preferred), so panels don't have to put the secret in the URL.
 #[derive(Deserialize)]
 struct InfoQuery {
     token: Option<String>,
@@ -65,15 +68,25 @@ async fn ws_handler(
     // hole-punching. Prefer proxy headers (TLS is terminated by a proxy in the
     // recommended deployment), falling back to the direct TCP peer address.
     let client_ip = client_ip(&headers, peer);
-    // Rooms are keyed by hash(room, token): the token is the room's gate. A
-    // wrong-token host derives a different key and lands in its own (empty)
-    // room — it can never reach the real room's roster. Clients are unaffected
-    // (they already send room + token consistently on every connection).
-    let room_key = room_key(&room, q.token.as_deref().unwrap_or(""));
+    // The limiter key: the TCP peer unless the operator opted into trusting
+    // proxy headers (behind a proxy every client shares the peer address, but
+    // a direct client could spoof X-Forwarded-For to dodge per-IP budgets).
+    let gate_ip = if state.trust_proxy { client_ip } else { peer.ip() };
+    // Abuse gate: per-IP connection budget + auth-failure bans. Denied before
+    // the upgrade, so a guess-flood never reaches the auth handshake.
+    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+        return rate_limited(retry_after).into_response();
+    }
+    // The room token, presented out-of-band: Authorization header preferred
+    // (keeps the secret out of URLs → proxy/access logs), query param as the
+    // legacy fallback. `None` means the auth frame carries it (header-mode
+    // clients); the token-derived room key is computed post-auth in the
+    // handler. A wrong token still derives a different key → isolated room.
+    let provided = provided_token(q.token.as_ref(), &headers);
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
         .on_upgrade(move |socket| {
-            handler::handle_socket(socket, room_key, room, q.token, client_ip, state)
+            handler::handle_socket(socket, room, provided, client_ip, gate_ip, state)
         })
 }
 
@@ -113,12 +126,20 @@ async fn health() -> impl IntoResponse {
 async fn rooms_list(
     Query(q): Query<InfoQuery>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<RelayState>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, HttpErr> {
+    let gate_ip = if state.trust_proxy { client_ip(&headers, peer) } else { peer.ip() };
+    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+        return Err(rate_limited(retry_after));
+    }
     if let Some(server) = &state.token {
-        match provided_token(&q, &headers) {
-            Some(t) if t == *server => {}
-            _ => return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token")),
+        match provided_token(q.token.as_ref(), &headers) {
+            Some(t) if ct_eq(&t, server) => {}
+            _ => {
+                state.limiter.record_failure(gate_ip);
+                return Err(HttpErr(StatusCode::UNAUTHORIZED, "invalid token".to_string(), None));
+            }
         }
     }
     let mut rooms: Vec<_> = state
@@ -148,9 +169,14 @@ async fn room_info(
     Path(room): Path<String>,
     Query(q): Query<InfoQuery>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<Arc<RelayState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    let key = http_room_key(&state, &room, &q, &headers)?;
+) -> Result<Json<serde_json::Value>, HttpErr> {
+    let gate_ip = if state.trust_proxy { client_ip(&headers, peer) } else { peer.ip() };
+    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+        return Err(rate_limited(retry_after));
+    }
+    let key = http_room_key(&state, &room, &q, &headers, gate_ip)?;
     // Dedup to one entry per machine (a host with several terminals is one
     // logical peer), carrying the relay-computed `connections` count — matching
     // the worker's `/info` so panels behave the same on either relay.
@@ -161,45 +187,85 @@ async fn room_info(
     Ok(Json(serde_json::json!({ "agents": agents, "mcp_clients": mcp })))
 }
 
-/// Extract the caller's token for the HTTP info endpoints: query param first,
-/// then `Authorization: Bearer <token>`.
-fn provided_token(q: &InfoQuery, headers: &HeaderMap) -> Option<String> {
-    if let Some(t) = &q.token {
-        return Some(t.clone());
-    }
-    headers
+/// Extract the caller's room token: `Authorization: Bearer` header first (so
+/// the secret need not travel in the URL), then the query param (legacy).
+fn provided_token(query_token: Option<&String>, headers: &HeaderMap) -> Option<String> {
+    if let Some(t) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t.to_string())
+    {
+        return Some(t.to_string());
+    }
+    query_token.cloned()
 }
 
-/// Small error type for the HTTP info endpoints (a full `Response` as the
-/// `Err` variant trips clippy's result-large-err; this is 2 words).
-struct ApiError(StatusCode, &'static str);
+/// Compact error for the HTTP info endpoints (a full `Response` as the `Err`
+/// variant trips clippy's result-large-err; this is 3 words). Converts into a
+/// JSON error response, optionally with a `Retry-After` header.
+struct HttpErr(StatusCode, String, Option<u32>);
 
-impl IntoResponse for ApiError {
+impl IntoResponse for HttpErr {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+        let HttpErr(status, msg, retry_after) = self;
+        match retry_after {
+            Some(secs) => (
+                status,
+                [(header::RETRY_AFTER, secs.to_string())],
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response(),
+            None => (status, Json(serde_json::json!({ "error": msg }))).into_response(),
+        }
     }
+}
+
+/// 429 with a `Retry-After` header, per the limiter's verdict.
+fn rate_limited(retry_after: std::time::Duration) -> HttpErr {
+    HttpErr(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate limited; retry later".to_string(),
+        Some(retry_after.as_secs().max(1) as u32),
+    )
 }
 
 /// HTTP endpoints present the room token too: it is required to derive the
 /// room key (rooms are token-addressed), and when the relay runs with a server
-/// token (`--token`) the presented token must additionally equal it.
+/// token (`--token`) the presented token must additionally equal it (constant
+/// time). In room-token mode a minimum length may be enforced — a short token
+/// is guessable, and this endpoint's empty-vs-populated roster would confirm
+/// a correct guess.
 fn http_room_key(
     state: &RelayState,
     room: &str,
     q: &InfoQuery,
     headers: &HeaderMap,
-) -> Result<String, ApiError> {
-    let Some(token) = provided_token(q, headers) else {
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "token required to address a room"));
+    gate_ip: IpAddr,
+) -> Result<String, HttpErr> {
+    let Some(token) = provided_token(q.token.as_ref(), headers) else {
+        return Err(HttpErr(
+            StatusCode::UNAUTHORIZED,
+            "token required to address a room".to_string(),
+            None,
+        ));
     };
     if let Some(server) = &state.token {
-        if token != *server {
-            return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid token"));
+        if !ct_eq(&token, server) {
+            state.limiter.record_failure(gate_ip);
+            return Err(HttpErr(StatusCode::UNAUTHORIZED, "invalid token".to_string(), None));
         }
+    } else if state.min_token_len > 0 && token.len() < state.min_token_len {
+        state.limiter.record_failure(gate_ip);
+        return Err(HttpErr(
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "room token too short: {} chars < {} required \
+                 (start the relay with --min-token-len 0 for dev/tokenless rooms)",
+                token.len(),
+                state.min_token_len
+            ),
+            None,
+        ));
     }
     Ok(room_key(room, &token))
 }

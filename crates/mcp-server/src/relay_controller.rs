@@ -1,6 +1,8 @@
 //! Connection pool management for relay servers
 
-use crate::connection::{authenticated_answer, authenticated_offer};
+use crate::connection::{
+    authenticated_answer, authenticated_offer, dial_auth, warn_short_token, DialErr,
+};
 use crate::relay_udp::{SignalMessage, UdpTransport};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -25,7 +27,7 @@ use futures::stream::{SplitSink, SplitStream};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 /// Overall backstop for collecting replies to a command.
@@ -57,27 +59,23 @@ type WsRead = SplitStream<WsStream>;
 
 /// Dial the relay and authenticate, returning the split halves + session id.
 /// Returns `None` on any failure (the supervisor loop retries with backoff).
+/// The token rides in the Authorization header when the URL has no
+/// `?token=` (legacy URLs carry it in the query instead).
 async fn redial(
     ws_url: &str,
     room: &str,
     token: &str,
     agent_info: Option<Box<AgentInfo>>,
 ) -> Option<(WsWrite, WsRead, String)> {
-    let (ws, _) = connect_async(ws_url).await.ok()?;
-    let (mut write, mut read) = ws.split();
     let auth = ClientMessage::Auth {
         room: room.to_string(),
         token: token.to_string(),
         agent_info,
     };
-    write.send(Message::Binary(auth.to_proto_bytes().ok()?)).await.ok()?;
-    let resp = timeout(Duration::from_secs(10), read.next()).await.ok()??.ok()?;
-    if let Message::Binary(b) = resp {
-        if let Ok(ServerMessage::AuthOk { session_id }) = ServerMessage::from_proto_bytes(&b) {
-            return Some((write, read, session_id));
-        }
-    }
-    None
+    let auth_bytes = auth.to_proto_bytes().ok()?;
+    let (ws, session_id) = dial_auth(ws_url, auth_bytes, token).await.ok()?;
+    let (write, read) = ws.split();
+    Some((write, read, session_id))
 }
 
 /// One reply from one agent for a request: Ok(result) or Err(error string).
@@ -152,15 +150,41 @@ impl ConnectionPool {
 
         ensure_crypto_provider();
         let cipher = Cipher::for_transport(token, key);
+        warn_short_token(token);
 
-        let ws_url = format!("{}/ws/room/{}?token={}", relay_url, room, token);
-        info!("Connecting to {}", ws_url);
+        // Token-free URL: the room token travels in the Authorization header
+        // (and the auth frame), keeping it out of URLs → proxy/access logs.
+        let ws_base = format!("{}/ws/room/{}", relay_url.trim_end_matches('/'), room);
+        info!("Connecting to {}", ws_base);
 
-        let (ws_stream, _) = connect_async(&ws_url)
-            .await
-            .context("Failed to connect to relay")?;
-
-        let (mut write, mut read) = ws_stream.split();
+        // (ws, session_id, ws_url_for_redials):
+        let ((write, read), session_id, ws_url) = {
+            // Send auth — peer model: we join as a peer carrying our agent_info.
+            let auth_msg = ClientMessage::Auth {
+                room: room.to_string(),
+                token: token.to_string(),
+                agent_info: agent_info.clone(),
+            };
+            let auth_bytes = auth_msg.to_proto_bytes()?;
+            match dial_auth(&ws_base, auth_bytes.clone(), token).await {
+                Ok((ws, session_id)) => (ws.split(), session_id, ws_base.clone()),
+                Err(DialErr::Auth(reason)) => {
+                    // A legacy relay that only knows `?token=`: retry once with
+                    // the query-string form and keep using it for redials.
+                    warn!("relay rejected header auth ({}); retrying with legacy ?token= URL", reason);
+                    let legacy_url = format!("{}?token={}", ws_base, token);
+                    match dial_auth(&legacy_url, auth_bytes, token).await {
+                        Ok((ws, session_id)) => (ws.split(), session_id, legacy_url),
+                        Err(DialErr::Auth(reason)) => bail!("{}", reason),
+                        Err(DialErr::Other(e)) => {
+                            return Err(e.context("Failed to connect to relay"))
+                        }
+                    }
+                }
+                Err(DialErr::Other(e)) => return Err(e.context("Failed to connect to relay")),
+            }
+        };
+        info!("Connected to room '{}' with session '{}'", room, session_id);
 
         // Create channels
         let (tx, mut rx) = mpsc::channel::<ClientMessage>(32);
@@ -200,27 +224,6 @@ impl ConnectionPool {
 
         // Keep a copy of our identity to re-send on every reconnect.
         let agent_info_redial = agent_info.clone();
-
-        // Send auth — peer model: we join as a peer carrying our agent_info.
-        let auth_msg = ClientMessage::Auth {
-            room: room.to_string(),
-            token: token.to_string(),
-            agent_info,
-        };
-
-        write
-            .send(Message::Binary(auth_msg.to_proto_bytes()?))
-            .await
-            .context("Failed to send auth")?;
-
-        // Wait for the auth verdict, tolerating pre-auth broadcast frames (see
-        // `connection::await_auth_verdict`).
-        let session_id =
-            timeout(Duration::from_secs(10), crate::connection::await_auth_verdict(&mut read))
-                .await
-                .context("Auth timeout")??;
-
-        info!("Connected to room '{}' with session '{}'", room, session_id);
 
         // Set session ID on UDP transport
         udp_transport.set_session_id(session_id.clone()).await;

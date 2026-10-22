@@ -1855,7 +1855,7 @@ fn parse_iso_ms(s: &str) -> Option<u64> {
         .map(|dt| dt.timestamp_millis() as u64)
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= n {
         s.to_string()

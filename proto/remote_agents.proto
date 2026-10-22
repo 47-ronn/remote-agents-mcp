@@ -375,7 +375,8 @@ message Command {
     optional string note = 9;
     uint64 created_at = 10;
   }
-  message ChainAck { string chain_id = 1; bool ok = 2; }
+  // (Replica acks ride CommandResult::ChainAck; there is no Command form —
+  // the arming node sends ChainArm and reads the result.)
   message ChainList {}
   message ChainCancel { string chain_id = 1; }
   message TunnelStart { string target = 1; }
@@ -433,7 +434,6 @@ message Command {
     SyncDirTo sync_dir_to = 34;
     DeletePaths delete_paths = 35;
     ChainArm chain_arm = 37;
-    ChainAck chain_ack = 38;
     ChainList chain_list = 39;
     ChainCancel chain_cancel = 40;
   }

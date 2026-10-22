@@ -48,6 +48,43 @@ async fn connect_as(port: u16, room: &str, token: &str) -> Ws {
     ws
 }
 
+/// Connect presenting the token ONLY via the Authorization header (no query
+/// param) — the token-out-of-URL form.
+async fn connect_bearer(port: u16, room: &str, token: &str) -> Ws {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = format!("ws://127.0.0.1:{}/ws/room/{}", port, room);
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (ws, _) = connect_async(req).await.unwrap();
+    ws
+}
+
+/// Connect with no token anywhere (URL/header); the auth frame's token is the
+/// room token on the Rust relay.
+async fn connect_plain(port: u16, room: &str) -> Ws {
+    let url = format!("ws://127.0.0.1:{}/ws/room/{}", port, room);
+    let (ws, _) = connect_async(url).await.unwrap();
+    ws
+}
+
+/// Attempt a WS connection; on handshake failure return the HTTP status.
+async fn try_connect_as(port: u16, room: &str, token: &str) -> Result<Ws, u16> {
+    let url = format!("ws://127.0.0.1:{}/ws/room/{}?token={}", port, room, token);
+    match connect_async(url).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(e) => {
+            if let tokio_tungstenite::tungstenite::Error::Http(resp) = e {
+                Err(resp.status().as_u16())
+            } else {
+                Err(0)
+            }
+        }
+    }
+}
+
 async fn send(ws: &mut Ws, msg: &ClientMessage) {
     ws.send(Message::Binary(msg.to_proto_bytes().unwrap())).await.unwrap();
 }
@@ -1083,4 +1120,192 @@ async fn list_agents_reports_connection_count_for_duplicate_sockets() {
         }
         other => panic!("expected agent_list, got {:?}", other),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Security hardening: token transport, minimum length, per-IP rate limiting.
+// ---------------------------------------------------------------------------
+
+/// The room token may travel in the Authorization header (or only in the auth
+/// frame) instead of the URL query — keeping it out of proxy/access logs.
+/// All three presentations must address the SAME token-keyed room.
+#[tokio::test]
+async fn header_and_auth_frame_tokens_join_the_query_token_room() {
+    let port = start_relay().await;
+
+    // Reference member: token in the query string (legacy form).
+    let mut legacy = connect(port, "hdr").await;
+    auth(&mut legacy, Some(agent_info("legacy", &[]))).await;
+    let _ = recv(&mut legacy).await; // initial (empty) AgentList
+
+    // Header form: no query param, Bearer token + auth frame.
+    let mut hdr = connect_bearer(port, "hdr", "secret").await;
+    auth_as(&mut hdr, "secret", Some(agent_info("hdr", &[]))).await;
+    match recv(&mut hdr).await {
+        ServerMessage::AgentList { agents } => {
+            assert_eq!(agents.len(), 1, "header client must see the query client");
+            assert_eq!(agents[0].id, "legacy");
+        }
+        other => panic!("header client expected agent_list, got {:?}", other),
+    }
+
+    // Auth-frame-only form: no query, no header — the auth frame's token IS
+    // the room token (room key derives from it).
+    let mut frame = connect_plain(port, "hdr").await;
+    auth_as(&mut frame, "secret", Some(agent_info("frame", &[]))).await;
+    match recv(&mut frame).await {
+        ServerMessage::AgentList { agents } => {
+            assert_eq!(agents.len(), 2, "auth-frame client must see both peers");
+        }
+        other => panic!("auth-frame client expected agent_list, got {:?}", other),
+    }
+
+    // And an auth-frame-only client with a DIFFERENT token lands in its own
+    // (empty) room — isolation is preserved for the new form too.
+    let mut other = connect_plain(port, "hdr").await;
+    auth_as(&mut other, "different", Some(agent_info("other", &[]))).await;
+    match recv(&mut other).await {
+        ServerMessage::AgentList { agents } => assert!(agents.is_empty()),
+        other => panic!("expected empty agent_list, got {:?}", other),
+    }
+
+    // The legacy member saw both joins (peer awareness).
+    let _ = recv(&mut legacy).await; // hdr joined
+    let _ = recv(&mut legacy).await; // frame joined
+    assert!(
+        try_recv(&mut legacy, 300).await.is_none(),
+        "mis-tokened client must not leak into the real room"
+    );
+}
+
+/// With a minimum token length enforced (no server token configured), short
+/// tokens are refused — on every presentation path — while a long one joins.
+/// With a server token configured, room-token length is exempt (the server
+/// token is the gate).
+#[tokio::test]
+async fn short_tokens_rejected_when_min_len_enforced() {
+    let state = Arc::new(RelayState::new(None).with_min_token_len(32));
+    let port = start_relay_with(state).await;
+    let long = "long-enough-token-0123456789abcdef0123456789abcdef";
+
+    // Query form: too short → auth_failed (not a silent isolated room: the
+    // relay refuses to even mint a guessable room).
+    let mut ws = connect_as(port, "dev", "short").await;
+    send(&mut ws, &ClientMessage::Auth { room: "dev".into(), token: "short".into(), agent_info: None }).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AuthFailed { .. }), "short query token");
+
+    // Header form: too short → auth_failed.
+    let mut ws = connect_bearer(port, "dev", "short").await;
+    send(&mut ws, &ClientMessage::Auth { room: "dev".into(), token: "short".into(), agent_info: None }).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AuthFailed { .. }), "short header token");
+
+    // Auth-frame-only form: too short → auth_failed.
+    let mut ws = connect_plain(port, "dev").await;
+    send(&mut ws, &ClientMessage::Auth { room: "dev".into(), token: "short".into(), agent_info: None }).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AuthFailed { .. }), "short auth-frame token");
+
+    // Empty token (tokenless dev room) is also under the minimum.
+    let mut ws = connect_as(port, "dev", "").await; // ?token= → empty
+    send(&mut ws, &ClientMessage::Auth { room: "dev".into(), token: "".into(), agent_info: None }).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AuthFailed { .. }), "empty token under min");
+
+    // A long enough token joins normally.
+    let mut ws = connect_as(port, "dev", long).await;
+    auth_as(&mut ws, long, Some(agent_info("ok", &[]))).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AgentList { .. }), "long token joins");
+
+    // HTTP roster: short token → 401 with a clear reason.
+    let (status, body) = http_get(port, "/api/room/dev?token=short").await;
+    assert_eq!(status, 401);
+    assert!(body.contains("too short"), "body: {body}");
+    // …and the long token still addresses the room.
+    let (status, body) = http_get(port, &format!("/api/room/dev?token={long}")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"id\":\"ok\""), "body: {body}");
+
+    // Server-token mode: room tokens are irrelevant (the server token gates),
+    // so the minimum does not apply.
+    let state = Arc::new(
+        RelayState::new(Some("srv".into())).with_min_token_len(32),
+    );
+    let port = start_relay_with(state).await;
+    let mut ws = connect_as(port, "dev", "x").await; // short room/query token…
+    auth_as(&mut ws, "srv", Some(agent_info("a1", &[]))).await; // …auth = server token
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AgentList { .. }), "server-token mode exempts room-token length");
+}
+
+/// The per-IP connection budget: over-budget handshakes (WS and HTTP info)
+/// are refused with 429 + Retry-After; /health stays open.
+#[tokio::test]
+async fn connection_budget_returns_429_when_exceeded() {
+    use remote_agents_relay::Limits;
+    let state = Arc::new(
+        RelayState::new(None).with_rate_limits(Limits {
+            max_conns: 3,
+            conn_window: Duration::from_millis(200),
+            ..Default::default()
+        }),
+    );
+    let port = start_relay_with(state).await;
+
+    // Three connections fit the budget…
+    let mut a = connect(port, "dev").await;
+    auth(&mut a, Some(agent_info("a", &[]))).await;
+    let _ = connect(port, "dev").await;
+    let _ = connect(port, "dev").await;
+
+    // …the fourth is refused before the upgrade (HTTP 429).
+    match try_connect_as(port, "dev", "secret").await {
+        Err(429) => {}
+        Err(s) => panic!("expected 429, got {s}"),
+        Ok(_) => panic!("4th connection must be rate limited"),
+    }
+    // The HTTP info endpoint shares the budget…
+    let (status, _) = http_get(port, "/api/room/dev?token=secret").await;
+    assert_eq!(status, 429, "HTTP info must share the per-IP budget");
+    // …but /health stays open (ungated liveness probe).
+    let (status, _) = http_get(port, "/health").await;
+    assert_eq!(status, 200);
+
+    // After the window drains, the IP is allowed again.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let _ = try_connect_as(port, "dev", "secret").await.expect("budget recovers after the window");
+}
+
+/// Repeated failed authentications ban the IP: further connections (even with
+/// the CORRECT token) are refused for the ban duration, then allowed again.
+#[tokio::test]
+async fn auth_failures_ban_the_ip_then_recover() {
+    use remote_agents_relay::Limits;
+    let state = Arc::new(
+        RelayState::new(Some("srv".into())).with_rate_limits(Limits {
+            max_failures: 2,
+            failure_window: Duration::from_secs(60),
+            ban_duration: Duration::from_millis(150),
+            ..Default::default()
+        }),
+    );
+    let port = start_relay_with(state).await;
+
+    // Two failures fit; the third within the window trips the ban.
+    for _ in 0..3 {
+        let mut ws = connect_as(port, "dev", "bad").await;
+        send(&mut ws, &ClientMessage::Auth { room: "dev".into(), token: "bad".into(), agent_info: None }).await;
+        assert!(matches!(recv(&mut ws).await, ServerMessage::AuthFailed { .. }));
+    }
+
+    // Now even the CORRECT token is refused at the door (429 before upgrade).
+    match try_connect_as(port, "dev", "srv").await {
+        Err(429) => {}
+        Err(s) => panic!("expected 429 while banned, got {s}"),
+        Ok(_) => panic!("banned IP must not connect, even with the right token"),
+    }
+    let (status, _) = http_get(port, "/api/room/dev?token=srv").await;
+    assert_eq!(status, 429, "banned IP is blocked on HTTP too");
+
+    // The ban is finite: after it lifts, the correct token works again.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut ws = try_connect_as(port, "dev", "srv").await.expect("connect after ban expiry");
+    auth_as(&mut ws, "srv", Some(agent_info("back", &[]))).await;
+    assert!(matches!(recv(&mut ws).await, ServerMessage::AgentList { .. }));
 }
