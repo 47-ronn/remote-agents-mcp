@@ -1,5 +1,6 @@
 import type { AgentInfo, ClientMessage, ServerMessage, Target, UdpOffer, UdpAnswer, UdpChannelResult } from './types';
 import { decodeClientMessage, encodeServerMessage } from './wire';
+import { constTimeEq } from './gate';
 
 /** Reap a socket after this long with no inbound frame. Agents ping every 30s
  * (PING_INTERVAL in connection.rs), so 90s = three missed pings — a socket
@@ -155,7 +156,13 @@ export class Room implements DurableObject {
     const url = new URL(request.url);
 
     if (request.headers.get('Upgrade') === 'websocket') {
-      const token = url.searchParams.get('token') || '';
+      // The room token: Authorization header (preferred) or the legacy query
+      // param — exactly how the edge resolved it for DO routing, so the
+      // consistency check in handleAuth compares against the same value.
+      const header = request.headers.get('authorization');
+      const bearer =
+        header && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
+      const token = bearer ?? url.searchParams.get('token') ?? '';
       // Cloudflare exposes the client's public IP here; reflected later via
       // your_endpoint for UDP hole-punching.
       const clientIp = request.headers.get('CF-Connecting-IP') || '';
@@ -413,18 +420,21 @@ export class Room implements DurableObject {
     // Optional server-wide token (the worker's AUTH_TOKEN secret, parity with
     // the Rust relay's --token): when set, the auth frame must equal it —
     // this is the loud-rejection gate. Defense in depth: the edge (index.ts)
-    // already refuses mismatching query tokens.
+    // already refuses mismatching tokens. Compared in constant time.
     const serverToken = (this.env as { AUTH_TOKEN?: string } | undefined)?.AUTH_TOKEN;
-    if (serverToken && msg.token !== serverToken) {
+    if (serverToken && !constTimeEq(msg.token, serverToken)) {
+      this.reportAuthFailure(att.clientIp);
       this.send(ws, { type: 'auth_failed', reason: 'Invalid token' });
       ws.close(1008, 'Invalid token');
       return;
     }
 
-    // The auth token must equal the connection's query token (our clients send
-    // the same value in both). An empty/absent query token only admits an empty
-    // auth token — it no longer admits an arbitrary one (closed open-access hole).
+    // The auth token must equal the connection's out-of-band token (our
+    // clients send the same value in both). An empty/absent out-of-band token
+    // only admits an empty auth token — it no longer admits an arbitrary one
+    // (closed open-access hole).
     if (msg.token !== att.token) {
+      this.reportAuthFailure(att.clientIp);
       this.send(ws, { type: 'auth_failed', reason: 'Invalid token' });
       ws.close(1008, 'Invalid token');
       return;
@@ -476,6 +486,19 @@ export class Room implements DurableObject {
       this.broadcastToMcp({ type: 'agent_joined', agent: merged });
       this.broadcastToAgents({ type: 'agent_joined', agent: merged }, agentInfo.id);
     }
+  }
+
+  /** Report a failed authentication to the (optional) per-IP Gate DO so it
+   *  counts toward an auth-failure ban. Fire-and-forget: best-effort, never
+   *  blocks or breaks the auth path. */
+  private reportAuthFailure(clientIp?: string) {
+    if (!clientIp) return;
+    const gate = (this.env as { GATE?: DurableObjectNamespace } | undefined)?.GATE;
+    if (!gate) return;
+    void gate
+      .get(gate.idFromName('ip:' + clientIp))
+      .fetch('https://gate/auth-failure', { method: 'POST' })
+      .catch(() => {});
   }
 
   private resolveTarget(target: Target): [WebSocket, Attachment][] {

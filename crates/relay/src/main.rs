@@ -3,10 +3,10 @@
 //! switch to it by pointing `relay_url` at `ws://<host>:<port>`.
 
 use clap::Parser;
-use remote_agents_relay::{router, state::RelayState};
+use remote_agents_relay::{router, state::RelayState, Limits};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -30,6 +30,29 @@ struct Cli {
     /// three missed pings. Set 0 to disable (rely on TCP keepalive instead).
     #[arg(long, default_value_t = 90)]
     idle_timeout_secs: u64,
+
+    /// Minimum room-token length when no --token is configured: the room token
+    /// is then the room's ONLY gate, and a short/weak one is guessable online
+    /// (the roster answers "empty vs populated", confirming a correct guess).
+    /// Shorter tokens — including empty dev-token rooms — are rejected.
+    /// Default 32; set 0 to disable for token-less dev rooms.
+    #[arg(long, default_value_t = 32)]
+    min_token_len: usize,
+
+    /// Max new connections per IP per 10 s (WebSocket upgrades plus HTTP info
+    /// calls), as abuse gating against online token guessing: over-budget IPs
+    /// get 429 + Retry-After, and repeated failed auths ban the IP for 5 min.
+    /// Generous for legit fleets (a mass reconnect behind one NAT fits); 0
+    /// disables the connection budget.
+    #[arg(long, default_value_t = 60)]
+    conn_rate: usize,
+
+    /// Trust X-Forwarded-For / X-Real-IP when attributing connections for the
+    /// per-IP limiter. Set ONLY behind a reverse proxy you control (otherwise
+    /// every client shares the proxy's address); without it the TCP peer
+    /// address is used and cannot be spoofed.
+    #[arg(long, default_value_t = false)]
+    trust_proxy: bool,
 }
 
 #[tokio::main]
@@ -50,12 +73,42 @@ async fn main() -> anyhow::Result<()> {
              for one shared secret + loud auth_failed on mismatch."
         );
     }
-    let state = Arc::new(RelayState::new(cli.token).with_idle_timeout_secs(cli.idle_timeout_secs));
+    let state = Arc::new(
+        RelayState::new(cli.token)
+            .with_idle_timeout_secs(cli.idle_timeout_secs)
+            .with_min_token_len(cli.min_token_len)
+            .with_rate_limits(Limits {
+                max_conns: cli.conn_rate,
+                ..Default::default()
+            })
+            .with_trust_proxy(cli.trust_proxy),
+    );
+
+    if state.token.is_none() {
+        if state.min_token_len > 0 {
+            info!(
+                "enforcing minimum room-token length: {} chars \
+                 (shorter/empty tokens rejected; --min-token-len 0 to disable)",
+                state.min_token_len
+            );
+        } else {
+            warn!(
+                "--min-token-len 0: short/empty room tokens are ACCEPTED — the \
+                 token is each room's only gate; use long random tokens"
+            );
+        }
+    }
+    if state.limiter.limits().max_conns == 0 {
+        warn!("--conn-rate 0: per-IP connection budget disabled (auth-failure bans stay active)");
+    }
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
     info!(
-        "relay listening on ws://{}/ws/room/:room (idle reap {}s)",
-        cli.bind, cli.idle_timeout_secs
+        "relay listening on ws://{}/ws/room/:room (idle reap {}s, conn budget {}/10s per IP{})",
+        cli.bind,
+        cli.idle_timeout_secs,
+        state.limiter.limits().max_conns,
+        if cli.trust_proxy { ", trusting proxy headers" } else { "" }
     );
     axum::serve(
         listener,

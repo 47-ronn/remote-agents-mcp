@@ -13,7 +13,7 @@ use crate::config::AutonomousConfig;
 use anyhow::{bail, Context, Result};
 use remote_agents_shared::{AgentEvent, AutonomousTask, TaskStatus};
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -353,18 +353,15 @@ fn status_from(s: &str) -> TaskStatus {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-fn open_db(path: &PathBuf) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    Connection::open(path).context("open tasks db")
+fn open_db(path: &Path) -> Result<Connection> {
+    crate::db_util::open_db(path)
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {

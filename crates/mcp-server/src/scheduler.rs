@@ -12,7 +12,7 @@ use cron::Schedule as CronSchedule;
 use remote_agents_shared::ScheduledTask;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -240,11 +240,8 @@ impl Scheduler {
     }
 }
 
-fn open_db(path: &PathBuf) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    Connection::open(path).context("open sqlite db")
+fn open_db(path: &Path) -> Result<Connection> {
+    crate::db_util::open_db(path)
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {

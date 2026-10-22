@@ -172,10 +172,17 @@ remote-agents-relay --bind 0.0.0.0:8080
 # optional: --token <secret> to enforce ONE server-wide token (mismatch → loud
 #           auth_failed at join, and the /api monitoring endpoints require it);
 #           --idle-timeout-secs <n> to reap silently-dead sockets (default 90, 0 disables)
+# hardening: --min-token-len <n> minimum room-token length in room-token mode
+#           (default 32; 0 disables — for token-less dev rooms);
+#           --conn-rate <n> max connections/IP/10s (default 60; 0 disables;
+#           failed auths also ban an IP for 5 min after 10 per minute);
+#           --trust-proxy key the limiter by X-Forwarded-For/X-Real-IP
+#           (ONLY behind a reverse proxy you control)
 # monitoring: GET /health, /api/rooms (all active rooms + counts),
-#             /api/room/:room?token=… (one room's agents — the room token is
-#             required; it addresses the token-keyed room, so a wrong token
-#             yields only its own token group, never the real roster)
+#             /api/room/:room (one room's agents — the room token is required,
+#             via Authorization: Bearer or ?token=…; it addresses the
+#             token-keyed room, so a wrong token yields only its own token
+#             group, never the real roster)
 ```
 
 **Room security model.** Rooms are addressed by `sha256(room + token)`: the
@@ -187,6 +194,32 @@ mode; with `--token` (Rust) / `AUTH_TOKEN` (worker) the relay additionally
 enforces a single server-wide secret and rejects mismatches with a loud
 `auth_failed`.
 
+**Hardening (all on by default):**
+
+- **Token out of URLs.** Clients send the room token in the
+  `Authorization: Bearer` header (and the auth frame), not the query string —
+  it never reaches proxy/access logs. Old relays that only read `?token=` are
+  detected (their `auth_failed`) and retried once with the legacy URL.
+- **Minimum token length.** Without a server token the room token is the
+  room's *only* gate, so both relays refuse tokens shorter than 32 chars
+  (including empty dev tokens): a short token is guessable online, and the
+  roster's empty-vs-populated answer would confirm a correct guess.
+  Rust: `--min-token-len <n>` (`0` disables, for token-less dev rooms).
+  Worker: `MIN_TOKEN_LEN` var (default `32`; `"0"` disables). With
+  `--token`/`AUTH_TOKEN` set, room-token length is not enforced (the server
+  token is the gate).
+- **Per-IP rate limiting.** Max 60 new connections per IP per 10 s
+  (WS upgrades + HTTP info calls; `429` + `Retry-After` when over) and a
+  5-minute ban after 10 failed auths per IP per minute — online token
+  guessing is cut off instead of running unthrottled.
+  Rust: `--conn-rate <n>` (`0` disables the budget) and `--trust-proxy`
+  (key the limiter by `X-Forwarded-For` ONLY behind a reverse proxy you
+  control; otherwise the unspoofable TCP peer address is used).
+  Worker: the `Gate` Durable Object (one instance per client IP; binding and
+  migration ship in `wrangler.jsonc`).
+- **Constant-time token comparison** on both relays (no early-exit that a
+  network observer could time into a prefix oracle).
+
 **Cloudflare Worker:**
 
 ```bash
@@ -197,6 +230,10 @@ CLOUDFLARE_API_TOKEN=<token> npx wrangler deploy
 # optional (parity with the Rust relay's --token): one server-wide token that
 # gates every connection + the /api/room endpoint:
 #   npx wrangler secret put AUTH_TOKEN
+# hardening (parity with the Rust relay): MIN_TOKEN_LEN var (default 32; "0"
+# disables for dev/tokenless rooms) and the Gate Durable Object — per-IP
+# connection budget + auth-failure bans (binding + migration ship in
+# wrangler.jsonc; `npx wrangler deploy` applies them)
 ```
 
 ### 3. Install as an MCP server (Claude, Cursor, Cline, Zed, opencode, …)

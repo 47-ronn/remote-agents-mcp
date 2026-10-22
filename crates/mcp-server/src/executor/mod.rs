@@ -424,12 +424,6 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             })
         }
 
-        Command::ChainAck { chain_id, .. } => {
-            // An ack only matters to the arming node's pending map; arriving
-            // here means this host was asked to ack its own chain — answer ok.
-            Ok(CommandResult::ChainAck { chain_id: chain_id.clone(), ok: true })
-        }
-
         Command::ChainList => {
             let chains = state.chains();
             let list = tokio::task::spawn_blocking(move || chains.list())

@@ -482,19 +482,13 @@ async fn connect_and_run(config: &Config, state: &AgentState) -> Result<()> {
                     let _ = ws_tx.send(Message::Binary(bytes)).await;
                 }
                 // A finished local task may release owned chains — tick now.
-                // Spawned: the tick sends peer commands whose replies arrive
-                // on THIS loop — awaiting it inline would self-deadlock.
-                {
-                    let (st, tx2, pd) = (state.clone(), tx.clone(), pending.clone());
-                    tokio::spawn(async move { chain_owner_tick(&st, &tx2, &pd).await });
-                }
+                spawn_chain_tick(state, &tx, &pending);
             }
 
             // Task-chain owner poll (recovery: sources finished while we were
             // down / offline; also retries fire dispatches that failed).
             _ = chain_tick.tick() => {
-                let (st, tx2, pd) = (state.clone(), tx.clone(), pending.clone());
-                tokio::spawn(async move { chain_owner_tick(&st, &tx2, &pd).await });
+                spawn_chain_tick(state, &tx, &pending);
             }
 
             // Agent info update (e.g. mode change) - send UpdateAgent to relay.
@@ -1155,6 +1149,22 @@ async fn send_peer_command(
 // Replicas are a durability net (and can re-push a chain to a restarted
 // owner); they never fire unless promoted to owner by the human re-arming.
 
+/// Spawn a chain-owner tick off the select loop. The tick sends peer commands
+/// whose replies arrive on THIS loop — awaiting it inline would self-deadlock.
+/// Coalesced: if a tick is already in flight, skip (the next 10s tick covers).
+fn spawn_chain_tick(state: &AgentState, tx: &mpsc::Sender<ClientMessage>, pending: &ConnPending) {
+    if TICK_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let (st, tx2, pd) = (state.clone(), tx.clone(), pending.clone());
+    tokio::spawn(async move {
+        chain_owner_tick(&st, &tx2, &pd).await;
+        TICK_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+static TICK_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Owner tick: check every armed chain this host owns.
 /// - Source task on THIS host → read its terminal status straight from the
 ///   autonomous store.
@@ -1179,74 +1189,28 @@ pub(crate) async fn chain_owner_tick(
     };
 
     for chain in armed {
-        // 1) Resolve the source task's status.
-        let status = if chain.src_agent == state.config.id {
-            let store = state.autonomous();
-            let src = chain.src_task.clone();
-            tokio::task::spawn_blocking(move || store.get(&src))
-                .await
-                .ok()
-                .and_then(|r| r.ok().flatten())
-                .map(|t| {
-                    (
-                        t.status,
-                        t.result.unwrap_or_default(),
-                        t.error.unwrap_or_default(),
-                    )
-                })
-        } else {
-            let cipher = state.cipher();
-            let src_agent = chain.src_agent.clone();
-            let src_task = chain.src_task.clone();
-            match send_peer_command(&cipher, tx, pending, &src_agent, Command::TaskGet { id: src_task })
-                .await
-            {
-                Ok(CommandResult::Task { task }) => Some((
-                    task.status,
-                    task.result.unwrap_or_default(),
-                    task.error.unwrap_or_default(),
-                )),
-                Ok(_) => None,
-                Err(_) => continue, // source unreachable — retry next tick
-            }
-        };
-        let Some((status, result, error)) = status else { continue };
-        let terminal = matches!(
-            status,
-            remote_agents_shared::TaskStatus::Done | remote_agents_shared::TaskStatus::Failed
-        );
-        if !terminal {
+        let Some((status_str, output)) = resolve_src_status(state, tx, pending, &chain).await else {
             continue;
-        }
-        let status_str = if status == remote_agents_shared::TaskStatus::Done {
-            "done"
-        } else {
-            "failed"
         };
-        let output = if status_str == "done" { result } else { error };
 
-        // 2) Atomic armed→fired (idempotent; loses the race → another path fired).
-        let chains = state.chains();
-        let id = chain.chain_id.clone();
-        let won = match tokio::task::spawn_blocking(move || chains.transition(&id, "armed", "fired")).await {
-            Ok(Ok(w)) => w,
-            _ => false,
-        };
-        if !won {
-            continue;
-        }
-
-        // 3) Dispatch the follow-up on the destination host.
-        let prompt = crate::chains::follow_up_prompt(&chain, status_str, &output);
+        // Dispatch the follow-up on the destination host, then claim armed→fired
+        // TOGETHER with the follow-up id (one atomic statement — no crash window
+        // between "fired" and its fired_task). Losing the claim means another
+        // path already fired; skip.
+        let prompt = crate::chains::follow_up_prompt(&chain, &status_str, &output);
         let cipher = state.cipher();
         let dst = chain.dst_agent.clone();
         let dispatch = if dst == state.config.id {
-            // Self destination: dispatch straight into the local store.
+            // Self destination: dispatch straight into the local store (the
+            // insert is a blocking SQLite write — keep it off the runtime).
             let store = state.autonomous();
             let initiator = state.config.id.clone();
-            store
-                .dispatch(&prompt, Some(initiator))
-                .map(|id| CommandResult::TaskQueued { id })
+            let p = prompt;
+            match tokio::task::spawn_blocking(move || store.dispatch(&p, Some(initiator))).await {
+                Ok(Ok(id)) => Ok(CommandResult::TaskQueued { id }),
+                Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            }
         } else {
             send_peer_command(
                 &cipher,
@@ -1263,10 +1227,24 @@ pub(crate) async fn chain_owner_tick(
 
         match dispatch {
             Ok(CommandResult::TaskQueued { id: fired }) => {
-                info!("Chain {} fired: follow-up task {fired} on {dst}", chain.chain_id);
                 let chains = state.chains();
-                let (cid, fid) = (chain.chain_id.clone(), fired);
-                let _ = tokio::task::spawn_blocking(move || chains.set_fired_task(&cid, &fid)).await;
+                let cid = chain.chain_id.clone();
+                let won = {
+                    let fid = fired.clone();
+                    tokio::task::spawn_blocking(move || chains.fire(&cid, &fid))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or(false)
+                };
+                if won {
+                    info!("Chain {} fired: follow-up task {fired} on {dst}", chain.chain_id);
+                } else {
+                    warn!(
+                        "Chain {}: follow-up {fired} dispatched but chain was not armed anymore (already fired elsewhere)",
+                        chain.chain_id
+                    );
+                }
             }
             Ok(other) => {
                 warn!("Chain {}: unexpected dispatch result {:?}", chain.chain_id, other);
@@ -1278,6 +1256,56 @@ pub(crate) async fn chain_owner_tick(
                 let _ = tokio::task::spawn_blocking(move || chains.set_note(&cid, &note)).await;
             }
         }
+    }
+}
+
+/// Resolve a chain's source task to its terminal (status_str, output), or
+/// None while it's still running / unreachable / non-terminal. Local sources
+/// read straight from the autonomous store; peer sources get one TaskGet with
+/// a short probe timeout so one dead host can't stall the whole tick (the
+/// generic peer-command timeout is 60s; the tick retries every 10s anyway).
+async fn resolve_src_status(
+    state: &AgentState,
+    tx: &mpsc::Sender<ClientMessage>,
+    pending: &ConnPending,
+    chain: &remote_agents_shared::TaskChain,
+) -> Option<(String, String)> {
+    let task = if chain.src_agent == state.config.id {
+        let store = state.autonomous();
+        let src = chain.src_task.clone();
+        tokio::task::spawn_blocking(move || store.get(&src))
+            .await
+            .ok()
+            .and_then(|r| r.ok().flatten())?
+    } else {
+        let cipher = state.cipher();
+        let src_agent = chain.src_agent.clone();
+        let id = chain.src_task.clone();
+        let probe = send_peer_command(&cipher, tx, pending, &src_agent, Command::TaskGet { id });
+        match timeout(Duration::from_secs(10), probe).await {
+            Ok(Ok(CommandResult::Task { task })) => task,
+            Ok(Ok(other)) => {
+                warn!("chain {}: TaskGet on {} returned {:?}", chain.chain_id, chain.src_agent, other);
+                return None;
+            }
+            Ok(Err(e)) => {
+                warn!("chain {}: source {} unreachable: {}", chain.chain_id, chain.src_agent, e);
+                return None; // retry next tick
+            }
+            Err(_) => {
+                warn!("chain {}: source {} probe timed out", chain.chain_id, chain.src_agent);
+                return None;
+            }
+        }
+    };
+    match task.status {
+        remote_agents_shared::TaskStatus::Done => {
+            Some(("done".into(), task.result.unwrap_or_default()))
+        }
+        remote_agents_shared::TaskStatus::Failed => {
+            Some(("failed".into(), task.error.unwrap_or_default()))
+        }
+        _ => None, // queued / running
     }
 }
 

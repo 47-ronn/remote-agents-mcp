@@ -11,21 +11,41 @@
 //! - Replicas hold the chain so a restarted owner re-adopts it on startup
 //!   (re-arm from replicas) — and as a safety net, any replica noticing the
 //!   source finished while the chain is still `armed` may fire it; firing is
-//!   idempotent (the destination dedups by chain_id via the prompt marker and
-//!   the owner marks `fired` before dispatching, replicas follow via ChainArm
-//!   state updates).
+//!   idempotent (the owner marks `fired` before dispatching, replicas follow
+//!   via ChainArm state updates).
 //!
 //! Deliberately simple: no Raft, no leases. Conflicts are bounded by
 //! "fire at most once per chain_id" on the destination side and by the
 //! majority-ack arming, which guarantees at least one live copy while a
 //! majority of autonomous hosts is up.
+//!
+//! State machine (stringly on the wire/SQLite, ranked here): armed → fired →
+//! done, any → cancelled. `done` is not set anywhere yet — the follow-up's
+//! completion doesn't flow back; see the transition matrix in tests.
 
 use anyhow::{Context, Result};
 use remote_agents_shared::TaskChain;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::warn;
+
+/// Column list shared by every SELECT — positional order for `row_to_chain`.
+const CHAIN_COLS: &str =
+    "chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at";
+
+/// Monotonic rank of a chain state. Terminal states share the top rank so a
+/// `done` copy can replace a `cancelled` one (and vice versa) — both mean
+/// "no further transitions possible". Unknown/garbage states rank LOWEST so a
+/// corrupt replica copy can never overwrite a live state.
+fn state_rank(s: &str) -> i64 {
+    match s {
+        "armed" => 0,
+        "fired" => 1,
+        "done" | "cancelled" => 2,
+        _ => i64::MIN,
+    }
+}
 
 pub struct ChainStore {
     db: Mutex<Connection>,
@@ -34,14 +54,16 @@ pub struct ChainStore {
 impl ChainStore {
     /// Open (or create) the chain store next to the autonomous tasks DB.
     pub fn load(path: PathBuf) -> Self {
-        let conn = match open_db(&path) {
+        let conn = match crate::db_util::open_db(&path) {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to open chains DB ({:?}): {}; using in-memory", path, e);
                 Connection::open_in_memory().expect("in-memory sqlite")
             }
         };
-        let _ = init_schema(&conn);
+        if let Err(e) = init_schema(&conn) {
+            warn!("chain schema init failed: {e}");
+        }
         Self { db: Mutex::new(conn) }
     }
 
@@ -53,112 +75,101 @@ impl ChainStore {
     /// the earlier state. Allowed transitions: a new row takes anything; an
     /// existing row only moves to the SAME or a LATER state, or updates
     /// non-state fields while keeping the local state. Returns the chain as
-    /// stored AFTER the call.
+    /// stored AFTER the call (for a stale incoming copy that keeps the local
+    /// state, the local `fired_task` is re-read, not assumed).
     pub fn upsert(&self, incoming: &TaskChain) -> Result<TaskChain> {
-        let conn = self.db.lock().unwrap();
-        let existing: Option<(String,)> = conn
-            .query_row(
-                "SELECT state FROM task_chains WHERE chain_id = ?1",
-                [&incoming.chain_id],
-                |r| Ok((r.get::<_, String>(0)?,)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
+        {
+            let conn = self.db.lock().unwrap();
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM task_chains WHERE chain_id = ?1",
+                    [&incoming.chain_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let local_state = existing.clone();
 
-        let rank = |s: &str| -> i64 {
-            match s {
-                "armed" => 0,
-                "fired" => 1,
-                "done" | "cancelled" => 2,
-                _ => 0,
-            }
-        };
+            let take_incoming =
+                existing.is_none_or(|local| state_rank(&incoming.state) >= state_rank(&local));
 
-        let effective = match &existing {
-            None => incoming.clone(),
-            Some((local_state,)) if rank(&incoming.state) >= rank(local_state) => incoming.clone(),
-            // Incoming is STALE (earlier state than local): keep local state,
-            // still refresh descriptive fields (prompt/owner/note may update).
-            Some((local_state,)) => {
+            let effective = if take_incoming {
+                incoming.clone()
+            } else {
+                // Incoming is STALE (earlier state than local): keep the local
+                // state, still refresh descriptive fields (prompt/owner/note).
                 let mut kept = incoming.clone();
-                kept.state = local_state.clone();
-                kept.fired_task = None; // local row's fired_task stays authoritative
+                kept.state = local_state.unwrap_or_default();
                 kept
-            }
-        };
+            };
 
-        conn.execute(
-            "INSERT INTO task_chains (chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(chain_id) DO UPDATE SET
-               src_agent = excluded.src_agent,
-               src_task = excluded.src_task,
-               dst_agent = excluded.dst_agent,
-               prompt = excluded.prompt,
-               owner = excluded.owner,
-               state = excluded.state,
-               note = COALESCE(excluded.note, task_chains.note)",
-            rusqlite::params![
-                effective.chain_id,
-                effective.src_agent,
-                effective.src_task,
-                effective.dst_agent,
-                effective.prompt,
-                effective.owner,
-                effective.state,
-                effective.fired_task,
-                effective.note,
-                effective.created_at as i64,
-            ],
-        )
-        .context("upsert task chain")?;
-        Ok(effective)
+            conn.execute(
+                "INSERT INTO task_chains (chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(chain_id) DO UPDATE SET
+                   src_agent = excluded.src_agent,
+                   src_task = excluded.src_task,
+                   dst_agent = excluded.dst_agent,
+                   prompt = excluded.prompt,
+                   owner = excluded.owner,
+                   state = excluded.state,
+                   note = COALESCE(excluded.note, task_chains.note)",
+                rusqlite::params![
+                    effective.chain_id,
+                    effective.src_agent,
+                    effective.src_task,
+                    effective.dst_agent,
+                    effective.prompt,
+                    effective.owner,
+                    effective.state,
+                    effective.fired_task,
+                    effective.note,
+                    effective.created_at as i64,
+                ],
+            )
+            .context("upsert task chain")?;
+        }
+        // The row's fired_task is authoritative (a stale replay must not clear
+        // it), so report what's actually stored.
+        self.get(&incoming.chain_id)?
+            .context("chain vanished during upsert")
     }
 
     /// All chains stored here (owner copies AND replicas).
     pub fn list(&self) -> Result<Vec<TaskChain>> {
-        let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at
-             FROM task_chains ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map([], row_to_chain)?;
-        let mut out = Vec::new();
-        for c in rows {
-            out.push(c?);
-        }
-        Ok(out)
+        self.query_many(&format!(
+            "SELECT {CHAIN_COLS} FROM task_chains ORDER BY created_at DESC"
+        ), [])
     }
 
     /// Chains this host OWNS and that are still armed (waiting to fire).
     pub fn armed_owned(&self, owner: &str) -> Result<Vec<TaskChain>> {
-        let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at
-             FROM task_chains WHERE owner = ?1 AND state = 'armed'",
-        )?;
-        let rows = stmt.query_map([owner], row_to_chain)?;
-        let mut out = Vec::new();
-        for c in rows {
-            out.push(c?);
-        }
-        Ok(out)
+        self.query_many(
+            &format!("SELECT {CHAIN_COLS} FROM task_chains WHERE owner = ?1 AND state = 'armed'"),
+            [owner],
+        )
     }
 
     pub fn get(&self, chain_id: &str) -> Result<Option<TaskChain>> {
         let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT chain_id, src_agent, src_task, dst_agent, prompt, owner, state, fired_task, note, created_at
-             FROM task_chains WHERE chain_id = ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHAIN_COLS} FROM task_chains WHERE chain_id = ?1"
+        ))?;
         let mut rows = stmt.query_map([chain_id], row_to_chain)?;
         match rows.next() {
             Some(c) => Ok(Some(c?)),
             None => Ok(None),
         }
+    }
+
+    fn query_many<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<Vec<TaskChain>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, row_to_chain)?;
+        let mut out = Vec::new();
+        for c in rows {
+            out.push(c?);
+        }
+        Ok(out)
     }
 
     /// Transition a chain's state (armed → fired → done, or → cancelled).
@@ -173,14 +184,17 @@ impl ChainStore {
         Ok(n == 1)
     }
 
-    /// Set the fired follow-up task id (after a successful dispatch).
-    pub fn set_fired_task(&self, chain_id: &str, task_id: &str) -> Result<()> {
+    /// Fire a chain in one atomic statement: claim `armed → fired` AND record
+    /// the follow-up task id together, so a crash between the two writes can
+    /// never leave a `fired` row without its `fired_task`. Returns false if
+    /// the chain wasn't armed (someone else fired it first).
+    pub fn fire(&self, chain_id: &str, fired_task: &str) -> Result<bool> {
         let conn = self.db.lock().unwrap();
-        conn.execute(
-            "UPDATE task_chains SET fired_task = ?2 WHERE chain_id = ?1",
-            rusqlite::params![chain_id, task_id],
+        let n = conn.execute(
+            "UPDATE task_chains SET state = 'fired', fired_task = ?2 WHERE chain_id = ?1 AND state = 'armed'",
+            rusqlite::params![chain_id, fired_task],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Record a note (consensus report, firing error, …).
@@ -209,13 +223,6 @@ fn row_to_chain(row: &rusqlite::Row) -> rusqlite::Result<TaskChain> {
     })
 }
 
-fn open_db(path: &std::path::Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    Connection::open(path).with_context(|| format!("open chain db {:?}", path))
-}
-
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS task_chains (
@@ -233,6 +240,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
         [],
     )
     .context("create task_chains schema")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chains_owner_state ON task_chains(owner, state)",
+        [],
+    )
+    .context("create task_chains index")?;
     Ok(())
 }
 
@@ -248,17 +260,9 @@ pub fn follow_up_prompt(chain: &TaskChain, src_status: &str, src_output: &str) -
         src = chain.src_agent,
         task = chain.src_task,
         status = src_status,
-        ctx = truncate(ctx, 4000),
+        ctx = crate::sessions::truncate(ctx, 4000),
         prompt = chain.prompt,
     )
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n).collect::<String>() + "…"
-    }
 }
 
 /// Count consensus: `acks` includes the owner itself (it persists locally
@@ -299,15 +303,44 @@ mod tests {
         assert_eq!(store.armed_owned("a").unwrap().len(), 1);
         assert_eq!(store.armed_owned("b").unwrap().len(), 0);
 
-        // Idempotent transition: armed -> fired exactly once.
-        assert!(store.transition("c1", "armed", "fired").unwrap());
-        assert!(!store.transition("c1", "armed", "fired").unwrap());
+        // Fire claims armed -> fired exactly once and records the follow-up
+        // task atomically (transition() alone would not set fired_task).
+        assert!(store.fire("c1", "ft-1").unwrap());
+        assert!(!store.fire("c1", "ft-2").unwrap());
         assert_eq!(store.armed_owned("a").unwrap().len(), 0);
 
         // A STALE replica replay (`armed` copy arriving after the chain fired
-        // locally) must NOT resurrect the fired chain.
+        // locally) must NOT resurrect the fired chain — and must not clear the
+        // recorded fired_task either.
+        let mut stale = chain("armed");
+        stale.fired_task = None;
+        let stored = store.upsert(&stale).unwrap();
+        assert_eq!(stored.state, "fired");
+        assert_eq!(stored.fired_task.as_deref(), Some("ft-1"));
+    }
+
+    #[test]
+    fn fire_claims_armed_and_records_task_atomically() {
+        let dir = std::env::temp_dir().join(format!("chains-{}-{}", std::process::id(), now_ns()));
+        let store = ChainStore::load(dir.join("c.db"));
         store.upsert(&chain("armed")).unwrap();
-        assert_eq!(store.get("c1").unwrap().unwrap().state, "fired");
+        assert!(store.fire("c1", "ft-9").unwrap());
+        // Second fire loses the race — no overwrite.
+        assert!(!store.fire("c1", "ft-10").unwrap());
+        let c = store.get("c1").unwrap().unwrap();
+        assert_eq!(c.state, "fired");
+        assert_eq!(c.fired_task.as_deref(), Some("ft-9"));
+    }
+
+    #[test]
+    fn garbage_state_never_overwrites_live_state() {
+        let dir = std::env::temp_dir().join(format!("chains-{}-{}", std::process::id(), now_ns()));
+        let store = ChainStore::load(dir.join("c.db"));
+        store.upsert(&chain("armed")).unwrap();
+        // A corrupt replica copy with an unknown state must not rank above
+        // (or below) anything — the local state wins.
+        store.upsert(&chain("FIRE")).unwrap();
+        assert_eq!(store.get("c1").unwrap().unwrap().state, "armed");
     }
 
     #[test]

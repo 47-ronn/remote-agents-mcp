@@ -837,9 +837,6 @@ impl TryFrom<crate::Command> for proto::Command {
                 note: chain.note,
                 created_at: chain.created_at,
             }),
-            D::ChainAck { chain_id, ok } => {
-                K::ChainAck(p::ChainAck { chain_id, ok })
-            }
             D::ChainList => K::ChainList(p::ChainList {}),
             D::ChainCancel { chain_id } => {
                 K::ChainCancel(p::ChainCancel { chain_id })
@@ -946,7 +943,6 @@ impl TryFrom<proto::Command> for crate::Command {
                     created_at: e.created_at,
                 }),
             },
-            K::ChainAck(e) => D::ChainAck { chain_id: e.chain_id, ok: e.ok },
             K::ChainList(_) => D::ChainList,
             K::ChainCancel(e) => D::ChainCancel { chain_id: e.chain_id },
             K::TunnelStart(e) => D::TunnelStart { target: e.target },
@@ -1488,7 +1484,6 @@ mod tests {
                 dst_agent: "b".into(), prompt: "go".into(), owner: "a".into(),
                 state: "armed".into(), fired_task: None, note: None, created_at: 7,
             }) },
-            Command::ChainAck { chain_id: "ch1".into(), ok: true },
             Command::ChainList,
             Command::ChainCancel { chain_id: "ch1".into() },
             Command::TunnelStart { target: "http://localhost:3000".into() },
