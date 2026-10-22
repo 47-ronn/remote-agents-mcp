@@ -49,6 +49,19 @@ function minTokenLen(env: Env): number {
 function roomToken(request: Request, url: URL): string {
   const h = request.headers.get('authorization');
   if (h && h.startsWith('Bearer ')) return h.slice('Bearer '.length);
+  const sp = request.headers.get('sec-websocket-protocol');
+  if (sp) {
+    // `bearer.<base64url(token)>`: the only header a browser WebSocket can
+    // set, so the panel can keep its token out of the URL.
+    const bearer = sp.split(',').map((p) => p.trim()).find((p) => p.startsWith('bearer.'));
+    if (bearer) {
+      try {
+        return atob(bearer.slice('bearer.'.length).replace(/-/g, '+').replace(/_/g, '/'));
+      } catch {
+        // fall through to the query param
+      }
+    }
+  }
   return url.searchParams.get('token') ?? '';
 }
 
@@ -175,10 +188,16 @@ export default {
       // Forward the WebSocket request to the Room
       const newUrl = new URL(request.url);
       newUrl.pathname = '/ws';
+      // Strip the `bearer.*` subprotocol before forwarding to the DO: the DO's
+      // WebSocketPair never negotiates subprotocols, and a browser that
+      // offered one fails the handshake unless the server selects it. The
+      // token itself already travels via the resolved `token` above.
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete('sec-websocket-protocol');
 
       return roomObject.fetch(
         new Request(newUrl.toString(), {
-          headers: request.headers,
+          headers: fwdHeaders,
         })
       );
     }
