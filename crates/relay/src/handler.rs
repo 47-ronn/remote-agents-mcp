@@ -72,6 +72,13 @@ pub async fn handle_socket(
         }) => {
             if !auth_ok(&state, provided_token.as_deref(), &token) {
                 state.limiter.record_failure(gate_ip);
+                // Deliberately NO token value and NO IP in the message: logs
+                // never carry secrets or client addresses, only the opaque
+                // per-uptime actor tag.
+                tracing::warn!(
+                    "auth failed (token mismatch) actor={}",
+                    state.actor(gate_ip)
+                );
                 let _ = sink.send(bin(&ServerMessage::AuthFailed {
                     reason: "invalid token".to_string(),
                 })).await;
@@ -98,6 +105,13 @@ pub async fn handle_socket(
     if state.token.is_none() && state.min_token_len > 0 && effective_token.len() < state.min_token_len
     {
         state.limiter.record_failure(gate_ip);
+        // Only the LENGTH is logged — never the token itself, never the IP.
+        tracing::warn!(
+            "auth failed (room token too short: {} < {} chars) actor={}",
+            effective_token.len(),
+            state.min_token_len,
+            state.actor(gate_ip)
+        );
         let _ = sink
             .send(bin(&ServerMessage::AuthFailed {
                 reason: format!(
@@ -305,11 +319,17 @@ fn handle_client_msg(
             target,
             payload,
         } => {
-            info!("Received command {} from {} targeting {:?}", request_id, session_id, target);
+            // Routing detail (request/target metadata) is DEBUG, not INFO: the
+            // relay's visible log must not profile who-commands-whom; payloads
+            // are E2E-encrypted and are never logged at any level.
+            debug!(
+                "Received command {} from {} targeting {:?}",
+                request_id, session_id, target
+            );
             let targets = resolve_targets(room, &target);
-            info!("Resolved {} targets for command {}", targets.len(), request_id);
+            debug!("Resolved {} targets for command {}", targets.len(), request_id);
             if targets.is_empty() {
-                info!("No targets found for command {}, sending error", request_id);
+                debug!("No targets found for command {}, sending error", request_id);
                 send_to(
                     self_tx,
                     &ServerMessage::CommandError {
@@ -323,7 +343,7 @@ fn handle_client_msg(
                 room.pending
                     .insert(request_id.clone(), session_id.to_string());
                 for (agent_name, tx) in &targets {
-                    info!("Sending command {} to agent {}", request_id, agent_name);
+                    debug!("Sending command {} to agent {}", request_id, agent_name);
                     send_raw(
                         tx,
                         &ServerMessage::Command {

@@ -55,6 +55,28 @@ describe('gateAttempt (connection budget)', () => {
     expect(gateAttempt(a, T0).allowed).toBe(false);
     expect(gateAttempt(b, T0).allowed).toBe(true);
   });
+
+  it('denials carry increasing nth for log dedup, restarting after recovery', () => {
+    const s = newGateState();
+    gateAttempt(s, T0); // budget used up (MAX_CONNS == 1 in spirit; with the
+    // real MAX_CONNS the loop below is what matters)
+    const full = newGateState();
+    for (let i = 0; i < MAX_CONNS; i++) expect(gateAttempt(full, T0).nth).toBe(0);
+    for (const expectN of [1, 2, 3]) {
+      const v = gateAttempt(full, T0);
+      expect(v.allowed).toBe(false);
+      expect(v.nth).toBe(expectN);
+    }
+    // after the window drains the sequence restarts
+    const later = T0 + CONN_WINDOW_MS + 1;
+    const v2 = gateAttempt(full, later);
+    expect(v2.allowed).toBe(true);
+    expect(v2.nth).toBe(0);
+    for (let i = 1; i < MAX_CONNS; i++) gateAttempt(full, later); // refill budget
+    const v3 = gateAttempt(full, later);
+    expect(v3.allowed).toBe(false);
+    expect(v3.nth).toBe(1);
+  });
 });
 
 describe('recordFailure (auth-failure ban)', () => {

@@ -59,6 +59,10 @@ pub enum Verdict {
     Deny {
         /// How long the caller should wait before retrying.
         retry_after: Duration,
+        /// Sequence number of this denial for the source (1st, 2nd, …). Lets
+        /// callers log the FIRST denial and then only every Nth, so a flood
+        /// produces a visible signal without flooding the journal itself.
+        nth: u64,
     },
 }
 
@@ -67,6 +71,7 @@ struct IpWindows {
     conns: VecDeque<Instant>,
     failures: VecDeque<Instant>,
     banned_until: Option<Instant>,
+    denials: u64,
 }
 
 /// Hard ceiling on tracked IPs. Beyond it, previously unseen IPs are not
@@ -119,8 +124,10 @@ impl RateLimiter {
         // Active ban first.
         if let Some(until) = w.banned_until {
             if now < until {
+                w.denials += 1;
                 return Verdict::Deny {
                     retry_after: until - now,
+                    nth: w.denials,
                 };
             }
             w.banned_until = None;
@@ -140,8 +147,13 @@ impl RateLimiter {
                 .map(|t| l.conn_window.saturating_sub(now.saturating_duration_since(*t)))
                 .unwrap_or(l.conn_window)
                 .max(Duration::from_millis(1));
-            return Verdict::Deny { retry_after };
+            w.denials += 1;
+            return Verdict::Deny {
+                retry_after,
+                nth: w.denials,
+            };
         }
+        w.denials = 0; // recovered: a later denial is a fresh sequence
         Verdict::Allow
     }
 
@@ -168,6 +180,17 @@ impl RateLimiter {
         if w.failures.len() > l.max_failures {
             w.banned_until = Some(now + l.ban_duration);
             w.failures.clear();
+            // Loud on purpose: a tripped ban is an attack signal the operator
+            // must see. No IP in the message — logs never carry client
+            // addresses (see `actor_tag`); correlation uses the limiter's own
+            // accounting, not the log line.
+            tracing::warn!(
+                "auth-failure threshold exceeded: banning this source for {:?} \
+                 ({} failures within {:?})",
+                l.ban_duration,
+                w.failures.len() + l.max_failures + 1,
+                l.failure_window
+            );
         }
     }
 
@@ -210,6 +233,19 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Pseudonymize a client IP for logs: an 8-hex tag of `salt || ip`. The salt is
+/// random per relay process, so tags are stable within an uptime (an operator
+/// can correlate events from one actor, or tell two actors apart) but cannot
+/// be reversed to an address — the relay's logs must never contain client IPs
+/// or message contents, only these opaque actor tags.
+pub fn actor_tag(salt: u128, ip: IpAddr) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    salt.hash(&mut h);
+    ip.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +264,22 @@ mod tests {
     }
 
     #[test]
+    fn actor_tag_is_stable_within_salt_and_opaque_across_salts() {
+        use std::net::Ipv4Addr;
+        let a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        // Same salt + ip → same tag (correlatable within one uptime).
+        assert_eq!(actor_tag(42, a), actor_tag(42, a));
+        // Different ips → different tags (actors distinguishable).
+        assert_ne!(actor_tag(42, a), actor_tag(42, b));
+        // Different salt → different tag (not reversible / not trackable
+        // across restarts).
+        assert_ne!(actor_tag(42, a), actor_tag(43, a));
+        // And no tag ever contains the address itself.
+        assert!(!actor_tag(42, a).contains("203"));
+    }
+
+    #[test]
     fn connection_budget_denies_over_limit_then_recovers() {
         let l = RateLimiter::new(Limits {
             max_conns: 3,
@@ -239,7 +291,7 @@ mod tests {
             assert_eq!(l.gate_connection(ip(1)), Verdict::Allow);
         }
         match l.gate_connection(ip(1)) {
-            Verdict::Deny { retry_after } => assert!(retry_after <= Duration::from_millis(80)),
+            Verdict::Deny { retry_after, .. } => assert!(retry_after <= Duration::from_millis(80)),
             v => panic!("4th attempt must be denied, got {v:?}"),
         }
         // A different IP has its own budget.
@@ -278,7 +330,7 @@ mod tests {
         assert_eq!(l.gate_connection(ip(4)), Verdict::Allow); // 2 == max, not over
         l.record_failure(ip(4)); // 3rd within window → banned
         match l.gate_connection(ip(4)) {
-            Verdict::Deny { retry_after } => assert!(retry_after <= Duration::from_millis(120)),
+            Verdict::Deny { retry_after, .. } => assert!(retry_after <= Duration::from_millis(120)),
             v => panic!("banned IP must be denied, got {v:?}"),
         }
         // Success clears a streak before it becomes a ban.
@@ -304,6 +356,31 @@ mod tests {
         l.record_failure(ip(6)); // first one expired → streak is 1, not 2
         l.record_failure(ip(6)); // now 2 == max, still no ban
         assert_eq!(l.gate_connection(ip(6)), Verdict::Allow);
+    }
+
+    #[test]
+    fn denial_sequence_numbers_dedup_log_spam() {
+        let l = RateLimiter::new(Limits {
+            max_conns: 1,
+            conn_window: Duration::from_millis(500),
+            max_failures: 0,
+            ..Default::default()
+        });
+        assert_eq!(l.gate_connection(ip(8)), Verdict::Allow);
+        // Denials carry increasing nth (1, 2, 3…) so callers log only the
+        // first and every Nth; after recovery the sequence restarts at 1.
+        for expect in [1u64, 2, 3] {
+            match l.gate_connection(ip(8)) {
+                Verdict::Deny { nth, .. } => assert_eq!(nth, expect),
+                v => panic!("expected denial #{expect}, got {v:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(550));
+        assert_eq!(l.gate_connection(ip(8)), Verdict::Allow); // window drained
+        match l.gate_connection(ip(8)) {
+            Verdict::Deny { nth, .. } => assert_eq!(nth, 1, "sequence restarts after recovery"),
+            v => panic!("expected denial after re-exceed, got {v:?}"),
+        }
     }
 
     #[test]

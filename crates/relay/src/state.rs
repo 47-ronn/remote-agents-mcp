@@ -8,6 +8,7 @@
 use crate::limiter::RateLimiter;
 use dashmap::DashMap;
 use remote_agents_shared::AgentInfo;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -94,6 +95,10 @@ pub struct RelayState {
     /// client would share one budget. Without it, the peer address is used and
     /// cannot be spoofed.
     pub trust_proxy: bool,
+    /// Per-process random salt for [`crate::limiter::actor_tag`] — lets logs
+    /// correlate events from one actor without ever containing the client IP
+    /// (irreversible; rotates on restart by design).
+    pub(crate) actor_salt: u128,
 }
 
 impl RelayState {
@@ -106,7 +111,15 @@ impl RelayState {
             min_token_len: 0,
             limiter: RateLimiter::new(Default::default()),
             trust_proxy: false,
+            actor_salt: uuid::Uuid::new_v4().as_u128(),
         }
+    }
+
+    /// Opaque, per-uptime pseudonym of a client address for log lines. The
+    /// relay's logs must never contain client IPs or message contents; this
+    /// keeps events correlatable (one tag = one actor) without disclosure.
+    pub fn actor(&self, ip: IpAddr) -> String {
+        crate::limiter::actor_tag(self.actor_salt, ip)
     }
 
     /// Enforce a minimum room-token length (0 = no minimum; applies only when

@@ -490,8 +490,10 @@ export class Room implements DurableObject {
 
   /** Report a failed authentication to the (optional) per-IP Gate DO so it
    *  counts toward an auth-failure ban. Fire-and-forget: best-effort, never
-   *  blocks or breaks the auth path. */
+   *  blocks or breaks the auth path. The log line carries no address and no
+   *  token — relay logs never contain client IPs or secrets. */
   private reportAuthFailure(clientIp?: string) {
+    console.warn('auth failed (token mismatch)');
     if (!clientIp) return;
     const gate = (this.env as { GATE?: DurableObjectNamespace } | undefined)?.GATE;
     if (!gate) return;
