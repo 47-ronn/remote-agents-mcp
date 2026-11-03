@@ -73,8 +73,19 @@ async fn ws_handler(
     // a direct client could spoof X-Forwarded-For to dodge per-IP budgets).
     let gate_ip = if state.trust_proxy { client_ip } else { peer.ip() };
     // Abuse gate: per-IP connection budget + auth-failure bans. Denied before
-    // the upgrade, so a guess-flood never reaches the auth handshake.
-    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+    // the upgrade, so a guess-flood never reaches the auth handshake. Only the
+    // first and every 100th denial are logged (the limiter's `nth`), so a
+    // flood stays visible without flooding the journal. No client IP in the
+    // message — logs never carry addresses, only the opaque actor tag.
+    if let Verdict::Deny { retry_after, nth } = state.limiter.gate_connection(gate_ip) {
+        if nth == 1 || nth.is_multiple_of(100) {
+            tracing::warn!(
+                "rate-limited connection attempt (denial #{}, retry after {:?}) actor={}",
+                nth,
+                retry_after,
+                state.actor(gate_ip)
+            );
+        }
         return rate_limited(retry_after).into_response();
     }
     // The room token, presented out-of-band: Authorization header preferred
@@ -145,7 +156,15 @@ async fn rooms_list(
     State(state): State<Arc<RelayState>>,
 ) -> Result<Json<serde_json::Value>, HttpErr> {
     let gate_ip = if state.trust_proxy { client_ip(&headers, peer) } else { peer.ip() };
-    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+    if let Verdict::Deny { retry_after, nth } = state.limiter.gate_connection(gate_ip) {
+        if nth == 1 || nth.is_multiple_of(100) {
+            tracing::warn!(
+                "rate-limited rooms listing (denial #{}, retry after {:?}) actor={}",
+                nth,
+                retry_after,
+                state.actor(gate_ip)
+            );
+        }
         return Err(rate_limited(retry_after));
     }
     if let Some(server) = &state.token {
@@ -153,6 +172,10 @@ async fn rooms_list(
             Some(t) if ct_eq(&t, server) => {}
             _ => {
                 state.limiter.record_failure(gate_ip);
+                tracing::warn!(
+                    "auth failed on rooms listing (bad server token) actor={}",
+                    state.actor(gate_ip)
+                );
                 return Err(HttpErr(StatusCode::UNAUTHORIZED, "invalid token".to_string(), None));
             }
         }
@@ -188,7 +211,15 @@ async fn room_info(
     State(state): State<Arc<RelayState>>,
 ) -> Result<Json<serde_json::Value>, HttpErr> {
     let gate_ip = if state.trust_proxy { client_ip(&headers, peer) } else { peer.ip() };
-    if let Verdict::Deny { retry_after } = state.limiter.gate_connection(gate_ip) {
+    if let Verdict::Deny { retry_after, nth } = state.limiter.gate_connection(gate_ip) {
+        if nth == 1 || nth.is_multiple_of(100) {
+            tracing::warn!(
+                "rate-limited room info request (denial #{}, retry after {:?}) actor={}",
+                nth,
+                retry_after,
+                state.actor(gate_ip)
+            );
+        }
         return Err(rate_limited(retry_after));
     }
     let key = http_room_key(&state, &room, &q, &headers, gate_ip)?;
@@ -309,10 +340,21 @@ fn http_room_key(
     if let Some(server) = &state.token {
         if !ct_eq(&token, server) {
             state.limiter.record_failure(gate_ip);
+            tracing::warn!(
+                "auth failed on room info (bad server token) actor={}",
+                state.actor(gate_ip)
+            );
             return Err(HttpErr(StatusCode::UNAUTHORIZED, "invalid token".to_string(), None));
         }
     } else if state.min_token_len > 0 && token.len() < state.min_token_len {
         state.limiter.record_failure(gate_ip);
+        // Only the length, never the token value or the client address.
+        tracing::warn!(
+            "auth failed on room info (room token too short: {} < {} chars) actor={}",
+            token.len(),
+            state.min_token_len,
+            state.actor(gate_ip)
+        );
         return Err(HttpErr(
             StatusCode::UNAUTHORIZED,
             format!(

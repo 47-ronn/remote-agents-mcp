@@ -220,6 +220,19 @@ enforces a single server-wide secret and rejects mismatches with a loud
 - **Constant-time token comparison** on both relays (no early-exit that a
   network observer could time into a prefix oracle).
 
+**Privacy — what the relay logs.** Neither relay ever writes client IP
+addresses, room tokens, or message contents to its logs. Command payloads are
+end-to-end encrypted and never logged at any level; command *routing* detail
+(request/target metadata) is `debug`, not `info`. Security events (auth
+failures, too-short tokens, rate-limit denials, auth-failure bans) ARE logged
+so attacks are visible — but sources appear only as an opaque, irreversible
+per-uptime actor tag (`actor=<8 hex>`), never an address, and token rejections
+log only the length, never the value. Denials log the first and every 100th
+event so a flood can't flood the journal. One caveat by design: the UDP
+hole-punching signaling (`udp_offer`/`your_endpoint`) shows each peer its own
+observed endpoint within the same token-gated room — that is required for
+NAT traversal and never crosses rooms.
+
 **Cloudflare Worker:**
 
 ```bash

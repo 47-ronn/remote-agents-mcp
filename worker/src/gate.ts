@@ -30,10 +30,12 @@ export interface GateState {
   fails: number[];
   /** Epoch ms until which the IP is banned; 0 = not banned. */
   bannedUntil: number;
+  /** Denial sequence (dedupes log spam: log the 1st and every Nth). */
+  denials: number;
 }
 
 export function newGateState(): GateState {
-  return { conns: [], fails: [], bannedUntil: 0 };
+  return { conns: [], fails: [], bannedUntil: 0, denials: 0 };
 }
 
 /** Constant-time string equality for secrets: no early exit that a network
@@ -55,6 +57,10 @@ function prune(list: number[], now: number, window: number): void {
 export interface Verdict {
   allowed: boolean;
   retryAfterSec: number;
+  /** Sequence number of this denial for the source (1, 2, …); 0 when
+   *  allowed. Lets the edge log only the first and every Nth denial, so a
+   *  flood stays visible without flooding the logs. */
+  nth: number;
 }
 
 /**
@@ -65,29 +71,40 @@ export function gateAttempt(s: GateState, now: number): Verdict {
   prune(s.conns, now, CONN_WINDOW_MS);
   prune(s.fails, now, FAIL_WINDOW_MS);
   if (s.bannedUntil > now) {
-    return { allowed: false, retryAfterSec: Math.ceil((s.bannedUntil - now) / 1000) };
+    s.denials += 1;
+    return {
+      allowed: false,
+      retryAfterSec: Math.ceil((s.bannedUntil - now) / 1000),
+      nth: s.denials,
+    };
   }
   s.conns.push(now);
   if (s.conns.length > MAX_CONNS) {
     const oldest = s.conns[0];
+    s.denials += 1;
     return {
       allowed: false,
       retryAfterSec: Math.max(1, Math.ceil((oldest + CONN_WINDOW_MS - now) / 1000)),
+      nth: s.denials,
     };
   }
-  return { allowed: true, retryAfterSec: 0 };
+  s.denials = 0; // recovered: a later denial is a fresh sequence
+  return { allowed: true, retryAfterSec: 0, nth: 0 };
 }
 
 /** Record a failed authentication; too many within FAIL_WINDOW_MS bans the IP. */
-export function recordFailure(s: GateState, now: number): { banned: boolean } & Verdict {
+export function recordFailure(
+  s: GateState,
+  now: number
+): { banned: boolean } & Verdict {
   prune(s.fails, now, FAIL_WINDOW_MS);
   s.fails.push(now);
   if (s.fails.length > MAX_FAILS) {
     s.bannedUntil = now + BAN_MS;
     s.fails = [];
-    return { banned: true, allowed: false, retryAfterSec: Math.ceil(BAN_MS / 1000) };
+    return { banned: true, allowed: false, retryAfterSec: Math.ceil(BAN_MS / 1000), nth: 0 };
   }
-  return { banned: false, allowed: true, retryAfterSec: 0 };
+  return { banned: false, allowed: true, retryAfterSec: 0, nth: 0 };
 }
 
 /** Clear the failure streak after a successful authentication. */

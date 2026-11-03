@@ -71,12 +71,12 @@ function roomToken(request: Request, url: URL): string {
 async function gateAttempt(
   env: Env,
   ip: string
-): Promise<{ allowed: boolean; retryAfterSec: number } | null> {
+): Promise<{ allowed: boolean; retryAfterSec: number; nth: number } | null> {
   if (!env.GATE) return null;
   try {
     const id = env.GATE.idFromName('ip:' + ip);
     const r = await env.GATE.get(id).fetch('https://gate/attempt', { method: 'POST' });
-    return (await r.json()) as { allowed: boolean; retryAfterSec: number };
+    return (await r.json()) as { allowed: boolean; retryAfterSec: number; nth: number };
   } catch {
     return null;
   }
@@ -143,8 +143,12 @@ export default {
 
       // Abuse gate first: per-IP connection budget + active bans are enforced
       // BEFORE the auth handshake, so a guess-flood never reaches it.
+      // Logged WITHOUT the client address — relay logs never carry IPs.
       const gate = await gateAttempt(env, clientIp(request));
       if (gate && !gate.allowed) {
+        if (gate.nth === 1 || gate.nth % 100 === 0) {
+          console.warn(`rate-limited connection attempt (denial #${gate.nth})`);
+        }
         return json({ error: 'rate limited; retry later' }, 429, {
           'Retry-After': String(Math.max(1, gate.retryAfterSec)),
         });
@@ -153,10 +157,12 @@ export default {
       const token = roomToken(request, url);
 
       // Minimum room-token length (room-token mode only): a short token is
-      // the room's only gate and is guessable online.
+      // the room's only gate and is guessable online. Only the length is
+      // logged — never the token value, never the client address.
       if (!env.AUTH_TOKEN) {
         const min = minTokenLen(env);
         if (min > 0 && token.length < min) {
+          console.warn(`auth failed (room token too short: ${token.length} < ${min} chars)`);
           return json(
             { error: `room token too short: ${token.length} chars < ${min} required (set MIN_TOKEN_LEN=0 for dev/tokenless rooms)` },
             401
@@ -166,10 +172,13 @@ export default {
 
       // Optional server-wide token (AUTH_TOKEN secret): a mismatching
       // connection is rejected at the edge, before any DO is contacted, and
-      // counts toward the IP's auth-failure ban.
+      // counts toward the IP's auth-failure ban. (Constant-time compare; the
+      // log line carries no token and no address.)
       if (env.AUTH_TOKEN && !constTimeEq(token, env.AUTH_TOKEN)) {
         const f = await gateFailure(env, clientIp(request));
+        console.warn('auth failed (bad server token)');
         if (f?.banned) {
+          console.warn('auth-failure threshold exceeded: source banned');
           return json({ error: 'rate limited; retry later' }, 429, {
             'Retry-After': String(Math.max(1, f.retryAfterSec)),
           });
@@ -209,9 +218,13 @@ export default {
     const infoMatch = url.pathname.match(/^\/api\/room\/([^/]+)$/);
     if (infoMatch) {
       // The roster's empty-vs-populated answer doubles as a guess-verification
-      // oracle, so info calls share the per-IP connection budget.
+      // oracle, so info calls share the per-IP connection budget. Logs carry
+      // no client address and no token.
       const gate = await gateAttempt(env, clientIp(request));
       if (gate && !gate.allowed) {
+        if (gate.nth === 1 || gate.nth % 100 === 0) {
+          console.warn(`rate-limited room info request (denial #${gate.nth})`);
+        }
         return json({ error: 'rate limited; retry later' }, 429, {
           'Retry-After': String(Math.max(1, gate.retryAfterSec)),
         });
@@ -225,6 +238,7 @@ export default {
       if (!env.AUTH_TOKEN) {
         const min = minTokenLen(env);
         if (min > 0 && token.length < min) {
+          console.warn(`auth failed on room info (room token too short: ${token.length} < ${min} chars)`);
           return json(
             { error: `room token too short: ${token.length} chars < ${min} required (set MIN_TOKEN_LEN=0 for dev/tokenless rooms)` },
             401
@@ -233,7 +247,9 @@ export default {
       }
       if (env.AUTH_TOKEN && !constTimeEq(token, env.AUTH_TOKEN)) {
         const f = await gateFailure(env, clientIp(request));
+        console.warn('auth failed on room info (bad server token)');
         if (f?.banned) {
+          console.warn('auth-failure threshold exceeded: source banned');
           return json({ error: 'rate limited; retry later' }, 429, {
             'Retry-After': String(Math.max(1, f.retryAfterSec)),
           });
