@@ -35,3 +35,5 @@ logs/
 
 # npm wrapper: downloaded binary
 npm/bin/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
