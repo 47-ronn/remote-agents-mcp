@@ -491,6 +491,20 @@ fn opencode_message(m: &serde_json::Value) -> Option<SessionMessage> {
             .and_then(|t| t.get("created"))
             .and_then(|c| c.as_u64());
         let parts = m.get("content").and_then(|p| p.as_array());
+        // v2 assistant replies usually carry an EMPTY flat `text` — the actual
+        // answer lives in `content` parts of type "text" (tool calls use
+        // "tool", thinking uses "reasoning"; neither is shown). Join them the
+        // same way the v1 branch joins `parts`.
+        if text.trim().is_empty() {
+            if let Some(ps) = parts {
+                text = ps
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+        }
         // Tool this turn is still waiting on, if any.
         let pending = parts
             .and_then(|ps| {
@@ -2182,6 +2196,24 @@ mod tests {
         // v2 "idle" markers (no recognized role / no text) are dropped.
         let idle = serde_json::json!({"type": "idle", "text": "", "time": {"created": 1u64}});
         assert!(opencode_message(&idle).is_none());
+
+        // v2 assistant reply: flat `text` EMPTY, the answer is in a content
+        // part of type "text" (reasoning/tool parts stay hidden).
+        let reply = serde_json::json!({
+            "type": "assistant",
+            "text": "",
+            "time": {"created": 1793866000002u64},
+            "content": [
+                {"type": "reasoning", "text": "внутренние размышления"},
+                {"type": "tool", "name": "exec", "state": {"status": "completed"}},
+                {"type": "text", "text": "Готово: найдено 3 совпадения"},
+                {"type": "text", "text": "подробности ниже"}
+            ]
+        });
+        let rm = opencode_message(&reply).unwrap();
+        assert_eq!(rm.role, "assistant");
+        assert_eq!(rm.text, "Готово: найдено 3 совпадения\nподробности ниже");
+        assert_eq!(rm.waiting, None);
 
         // v2 PENDING question: empty text, the question tool part carries the
         // prompt → visible turn + `waiting` marker (the "needs you" signal).
