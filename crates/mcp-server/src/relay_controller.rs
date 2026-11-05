@@ -1,15 +1,16 @@
 //! Connection pool management for relay servers
 
 use crate::connection::{
-    authenticated_answer, authenticated_offer, dial_auth, warn_short_token, DialErr,
+    authenticated_answer, authenticated_offer, dial_auth, merge_dest_session, warn_short_token,
+    DialErr,
 };
 use crate::relay_udp::{SignalMessage, UdpTransport};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
     AgentEvent, AgentInfo, AutonomousTask, Cipher, ClientMessage, Command,
-    CommandResult, ManifestEntry, ServerMessage, Target, TaskStatus, UdpFrame,
+    CommandResult, ManifestEntry, ServerMessage, Target, TaskStatus, TransferVia, UdpFrame,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -260,8 +261,16 @@ impl ConnectionPool {
             let shared_udp = shared.clone();
             let mut rx_in = udp_inbound_rx;
             tokio::spawn(async move {
+                // One task per frame (mirrors the agent side): a slow frame —
+                // a FileData disk write, a long-running command — must not
+                // stall the drain of every other frame behind it, which is
+                // what made the controller-as-destination look wedged during
+                // an inbound transfer.
                 while let Some((peer_session, data)) = rx_in.recv().await {
-                    handle_controller_udp_inbound(&peer_session, &data, &shared_udp).await;
+                    let shared = shared_udp.clone();
+                    tokio::spawn(async move {
+                        handle_controller_udp_inbound(&peer_session, &data, &shared).await;
+                    });
                 }
             });
         }
@@ -603,11 +612,6 @@ impl ConnectionPool {
                 );
             }
             info!("Sending command {} to target via WS (envelope {} bytes)", request_id, envelope.len());
-            // Debug: log to file
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
-                use std::io::Write;
-                let _ = writeln!(f, "[{}] Sending command {} via WS ({} bytes)", chrono::Utc::now(), request_id, envelope.len());
-            }
             if let Err(e) = conn
                 .shared
                 .tx
@@ -624,18 +628,8 @@ impl ConnectionPool {
         }
 
         info!("Waiting for replies to command {}, expected={}", request_id, expected);
-        // Debug: log to file
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
-            use std::io::Write;
-            let _ = writeln!(f, "[{}] Waiting for replies to {}, expected={}", chrono::Utc::now(), request_id, expected);
-        }
         let collected = collect_replies(reply_rx, expected, single, COMMAND_TIMEOUT).await;
         info!("Collected {} successes, {} errors for command {}", collected.0.len(), collected.1.len(), request_id);
-        // Debug: log to file
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/mcp_debug.log") {
-            use std::io::Write;
-            let _ = writeln!(f, "[{}] Collected {} successes, {} errors for {}", chrono::Utc::now(), collected.0.len(), collected.1.len(), request_id);
-        }
 
         // Single cleanup covering every exit path; late replies are then dropped.
         conn.shared.pending.write().await.remove(&request_id);
@@ -895,9 +889,10 @@ async fn send_file_slice(
 /// not polling for a solid minute, as a sync that succeeded instantly. Probing
 /// with `GetInfo` on a short budget turns that into a synchronous, named error.
 ///
-/// `GetInfo` also returns the authoritative mode and session id, so this
-/// subsumes the old cached-mode-then-refresh dance: the cache can lag a remote
-/// `set_mode`, and we are paying for a round trip regardless.
+/// `GetInfo` gives the authoritative mode (the roster cache can lag a remote
+/// `set_mode`); the session id for the direct-UDP fast path comes from the
+/// roster, where the relay assigned it — agents report `session_id: None` in
+/// GetInfo because they never learn their relay session.
 async fn preflight_dest(
     shared: &HandlerShared,
     dest_id: &str,
@@ -934,7 +929,24 @@ async fn preflight_dest(
         );
     }
 
-    Ok(info.session_id)
+    // The session to dial the direct channel with comes from the ROSTER, not
+    // from the GetInfo reply: the relay assigns session ids and agents never
+    // learn theirs, so `info.session_id` is always None (see the executor's
+    // GetInfo and `build_agent_info`). Trusting it made EVERY controller-sourced
+    // transfer silently fall back to the slow relay path while the healthy
+    // direct channel sat idle — measured ~1 MB/s through the relay vs a direct
+    // QUIC channel that was up the whole time, with liveness probes starved
+    // behind the base64 slice flood on the same relay connection ("NOT
+    // RESPONDING" during transfers). Re-read AFTER the probe so a session that
+    // changed while we waited is picked up.
+    let roster = shared
+        .agents
+        .read()
+        .await
+        .iter()
+        .find(|a| a.id == dest_id)
+        .and_then(|a| a.session_id.clone());
+    Ok(merge_dest_session(roster, info.session_id))
 }
 
 async fn begin_send_file(
@@ -960,6 +972,13 @@ async fn begin_send_file(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, size);
+    // Observability: which transport this transfer actually rides. Refreshed
+    // inside the task once a freshly-offered channel has punched.
+    let via = match dest_session.as_deref() {
+        Some(s) => shared.udp_transport.channel_via(s).await.unwrap_or(TransferVia::Relay),
+        None => TransferVia::Relay,
+    };
+    store.set_via(&transfer_id, via);
 
     // Best-effort: open a direct UDP channel before streaming so chunks take the
     // fast path. Failure is fine — send_peer_command falls back to the relay.
@@ -987,6 +1006,10 @@ async fn begin_send_file(
         if let Some(session) = &dest_session_task {
             if shared.udp_transport.has_udp_channel(session).await {
                 sec.max_transfer_size = 0;
+                store.set_via(
+                    &tid,
+                    shared.udp_transport.channel_via(session).await.unwrap_or(TransferVia::Relay),
+                );
             }
         }
         // Each slice is pushed to the destination as raw bytes over a direct UDP
@@ -1022,10 +1045,14 @@ async fn begin_send_file(
     Ok(transfer_id)
 }
 
-/// Send one command to a peer agent over the relay and await its single reply.
-/// Used by the folder-sync source for its small control messages (the manifest
-/// query and the delete batch); the file bytes themselves still take the UDP
-/// fast path via [`send_file_slice`].
+/// Send one command to a single peer and await its single reply. Used by the
+/// folder-sync source for its small control messages (the manifest query and
+/// the delete batch) and by the liveness preflight; the file bytes themselves
+/// take the fast path via [`send_file_slice`].
+/// Prefers the direct UDP channel (like `dispatch`), so control traffic —
+/// liveness probes especially — keeps working even while the relay WS is
+/// congested by a transfer that fell back to it (the "NOT RESPONDING during a
+/// transfer" failure mode). Replies resolve the pending map over either path.
 /// `budget` bounds the wait for the reply. Control messages that do real work
 /// (manifest walk, delete batch) get the full [`COMMAND_TIMEOUT`]; liveness
 /// probes pass [`PROBE_TIMEOUT`] so a wedged peer fails fast instead of parking
@@ -1043,17 +1070,51 @@ async fn send_peer_command(
     let envelope = cmd
         .encrypt(&shared.cipher)
         .map_err(|e| anyhow::anyhow!("encrypt command: {e}"))?;
-    if let Err(e) = shared
-        .tx
-        .send(ClientMessage::Command {
-            request_id: request_id.clone(),
-            target: Target::Agent { id: dest_id.to_string() },
-            payload: envelope,
-        })
-        .await
-    {
-        shared.pending.write().await.remove(&request_id);
-        return Err(e.into());
+
+    let mut sent_via_udp = false;
+    let udp_session = {
+        let agents = shared.agents.read().await;
+        agents
+            .iter()
+            .find(|a| a.id == dest_id)
+            .and_then(|a| a.session_id.clone())
+    };
+    if let Some(session) = &udp_session {
+        if shared.udp_transport.has_udp_channel(session).await {
+            let frame = UdpFrame::Command {
+                request_id: request_id.clone(),
+                from_session: String::new(),
+                payload: envelope.clone(),
+            };
+            if let Ok(true) = shared.udp_transport.send_via_udp(session, &frame.to_bytes()).await {
+                sent_via_udp = true;
+                debug!("Sent control command {} via UDP to {}", request_id, session);
+            }
+        }
+    }
+    if !sent_via_udp {
+        // The relay caps a WS frame at ~1 MiB — fail loudly instead of the
+        // relay silently dropping it (same guard as `dispatch`).
+        if crate::connection::relay_payload_too_large(envelope.len()) {
+            shared.pending.write().await.remove(&request_id);
+            bail!(
+                "command too large for relay ({} bytes); no direct UDP channel \
+                 was available — use a smaller payload",
+                envelope.len()
+            );
+        }
+        if let Err(e) = shared
+            .tx
+            .send(ClientMessage::Command {
+                request_id: request_id.clone(),
+                target: Target::Agent { id: dest_id.to_string() },
+                payload: envelope,
+            })
+            .await
+        {
+            shared.pending.write().await.remove(&request_id);
+            return Err(e.into());
+        }
     }
 
     let (mut ok, mut err) = collect_replies(reply_rx, 1, true, budget).await;
@@ -1122,6 +1183,13 @@ async fn begin_sync_dir(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, 0);
+    // Observability: refreshed inside `run_sync` once the channel state is
+    // re-checked after the punch wait.
+    let via = match dest_session.as_deref() {
+        Some(s) => shared.udp_transport.channel_via(s).await.unwrap_or(TransferVia::Relay),
+        None => TransferVia::Relay,
+    };
+    store.set_via(&transfer_id, via);
 
     // Best-effort: open a direct UDP channel before streaming so files take the
     // fast path. Failure is fine — slices fall back to the relay.
@@ -1202,40 +1270,53 @@ async fn run_sync(
     if let Some(session) = &dest_session {
         if shared.udp_transport.has_udp_channel(session).await {
             sec.max_transfer_size = 0;
+            store.set_via(
+                transfer_id,
+                shared.udp_transport.channel_via(session).await.unwrap_or(TransferVia::Relay),
+            );
         }
     }
     let chunk = sec.transfer_chunk_size;
 
-    // 4. Stream each changed file on the shared channel.
-    for entry in &plan.to_transfer {
-        let src_file = join_dest(&src_path, &entry.rel_path);
-        let dest_file = join_remote(&dest_path, &entry.rel_path);
-        let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway: keeps stream_file's progress() a no-op on the folder status
-        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
-            let shared = shared.clone();
-            let dest_session = dest_session.clone();
-            let dest_file = dest_file.clone();
-            let tid = file_tid.clone();
-            async move {
-                send_file_slice(
-                    &shared,
-                    dest_id,
-                    dest_session.as_deref(),
-                    &tid,
-                    &dest_file,
-                    offset,
-                    raw,
-                    eof,
-                    sha,
-                )
-                .await
-            }
-        };
-        crate::transfer::stream_file(store, &src_file, &file_tid, &sec, chunk, entry.size, send)
+    // 4. Stream the changed files, several at a time (the per-file eof
+    //    round-trip — hash + ack — no longer serializes the whole tree).
+    let files: Vec<crate::transfer::TreeFile> = plan
+        .to_transfer
+        .iter()
+        .map(|e| crate::transfer::TreeFile {
+            src: join_dest(&src_path, &e.rel_path),
+            dest: join_remote(&dest_path, &e.rel_path),
+            rel: e.rel_path.clone(),
+            size: e.size,
+        })
+        .collect();
+    let send = |f: &crate::transfer::TreeFile,
+                offset: u64,
+                raw: Vec<u8>,
+                eof: bool,
+                sha: Option<String>| {
+        let (shared, dest_id, dest_session) =
+            (shared.clone(), dest_id.to_string(), dest_session.clone());
+        let tid = uuid::Uuid::new_v4().to_string(); // throwaway: the receiver ignores it
+        let dest_file = f.dest.clone();
+        async move {
+            send_file_slice(
+                &shared, &dest_id, dest_session.as_deref(), &tid, &dest_file, offset, raw, eof,
+                sha,
+            )
             .await
-            .with_context(|| format!("sync file {}", entry.rel_path))?;
-        store.file_done(transfer_id, entry.size);
-    }
+        }
+    };
+    crate::transfer::stream_tree(
+        store,
+        transfer_id,
+        files,
+        chunk,
+        &sec,
+        crate::transfer::SYNC_PARALLEL_FILES,
+        send,
+    )
+    .await?;
 
     // 5. Delete destination extras (additive default → only when requested).
     if delete && !plan.to_delete.is_empty() {
@@ -2075,5 +2156,89 @@ mod tests {
         let cipher = Cipher::from_passphrase(WATCH_KEY);
         handle_message(&command_msg(&cipher, "r1"), &shared).await.unwrap();
         assert!(rx.try_recv().is_err(), "no executor → no reply");
+    }
+
+    // --- preflight_dest: the session comes from the roster (regression) ------
+    // Agents report `session_id: None` in GetInfo (the relay assigns sessions;
+    // `build_agent_info` leaves the field unset). preflight used to return that
+    // None, so every controller-sourced transfer skipped the healthy direct
+    // UDP/QUIC channel and crawled through the relay in base64 instead — and
+    // liveness probes starved behind the slice flood on the same relay
+    // connection ("NOT RESPONDING" during transfers).
+
+    #[tokio::test]
+    async fn preflight_takes_session_from_roster_not_getinfo() {
+        let (shared, mut rx, cipher) = shared_with_executor();
+        // Destination in the roster with a relay-assigned session, writable mode.
+        let mut dest = agent("htf", Some("sess-htf"));
+        dest.mode = remote_agents_shared::AgentMode::Bypass;
+        shared.agents.write().await.push(dest);
+
+        let probe = {
+            let shared = shared.clone();
+            tokio::spawn(async move { preflight_dest(&shared, "id-htf", "send_file").await })
+        };
+
+        // Answer the liveness GetInfo with what agents actually send: an Info
+        // whose session_id is None (they never learn their relay session).
+        match timeout(Duration::from_secs(2), rx.recv()).await.expect("probe sent") {
+            Some(ClientMessage::Command { request_id, .. }) => {
+                let mut info = agent("htf", None);
+                info.mode = remote_agents_shared::AgentMode::Bypass;
+                let result = CommandResult::Info { info }.encrypt(&cipher).unwrap();
+                let msg = ServerMessage::CommandResult {
+                    request_id,
+                    agent_id: "id-htf".into(),
+                    result,
+                };
+                handle_message(&msg.to_proto_bytes().unwrap(), &shared).await.unwrap();
+            }
+            other => panic!("expected a GetInfo command, got {other:?}"),
+        }
+
+        let session = timeout(Duration::from_secs(2), probe)
+            .await
+            .expect("preflight completes")
+            .unwrap()
+            .expect("rostered writable destination must pass preflight");
+        assert_eq!(
+            session,
+            Some("sess-htf".to_string()),
+            "session must come from the roster, not the (None) GetInfo reply"
+        );
+    }
+
+    // A destination that answers but reports a non-writable mode fails the
+    // preflight with a named error (the reply's mode is what the probe is for).
+    #[tokio::test]
+    async fn preflight_rejects_non_writable_reply() {
+        let (shared, mut rx, cipher) = shared_with_executor();
+        shared.agents.write().await.push(agent("ro", Some("sess-ro")));
+
+        let probe = {
+            let shared = shared.clone();
+            tokio::spawn(async move { preflight_dest(&shared, "id-ro", "send_file").await })
+        };
+
+        match timeout(Duration::from_secs(2), rx.recv()).await.expect("probe sent") {
+            Some(ClientMessage::Command { request_id, .. }) => {
+                let info = agent("ro", None); // Plan mode: not writable
+                let result = CommandResult::Info { info }.encrypt(&cipher).unwrap();
+                let msg = ServerMessage::CommandResult {
+                    request_id,
+                    agent_id: "id-ro".into(),
+                    result,
+                };
+                handle_message(&msg.to_proto_bytes().unwrap(), &shared).await.unwrap();
+            }
+            other => panic!("expected a GetInfo command, got {other:?}"),
+        }
+
+        let err = timeout(Duration::from_secs(2), probe)
+            .await
+            .expect("preflight completes")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.to_string().contains("does not allow writes"), "got: {err}");
     }
 }

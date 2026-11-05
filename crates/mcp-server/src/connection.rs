@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use remote_agents_shared::{
-    AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, UdpAnswer,
-    UdpFrame, UdpOffer,
+    AgentInfo, Cipher, ClientMessage, Command, CommandResult, ServerMessage, Target, TransferVia,
+    UdpAnswer, UdpFrame, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -964,6 +964,19 @@ async fn send_file_slice(
     }
 }
 
+/// Which session id to dial a direct channel with, given the roster's
+/// (relay-assigned) value and whatever a GetInfo reply reported. Agents report
+/// `session_id: None` in GetInfo — the relay assigns sessions and
+/// `build_agent_info` never sets the field — so a None reply must never evict
+/// a roster session: it once did, silently forcing every mode-refreshed
+/// transfer onto the slow relay path while the direct channel sat idle.
+pub(crate) fn merge_dest_session(
+    roster: Option<String>,
+    reported: Option<String>,
+) -> Option<String> {
+    reported.or(roster)
+}
+
 /// Start a host↔host transfer from the `run`-agent loop: register progress, open
 /// a UDP channel best-effort, and spawn the streaming task. Returns the transfer
 /// id immediately.
@@ -1011,7 +1024,11 @@ async fn begin_send_file(
         match send_peer_command(&cipher, tx, pending, &dest_id, Command::GetInfo).await {
             Ok(CommandResult::Info { info }) => {
                 tracing::info!("GetInfo returned mode {:?} for dest {}", info.mode, dest_id);
-                dest_session = info.session_id;
+                // A GetInfo reply normally carries session_id: None (the relay
+                // assigns sessions; `build_agent_info` never sets the field), so
+                // it must not evict the roster session — see
+                // `merge_dest_session`.
+                dest_session = merge_dest_session(dest_session, info.session_id);
                 info.mode
             }
             Ok(other) => {
@@ -1039,6 +1056,12 @@ async fn begin_send_file(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, size);
+    // Observability: refreshed inside the task once the channel has punched.
+    let via = match dest_session.as_deref() {
+        Some(s) => udp.channel_via(s).await.unwrap_or(TransferVia::Relay),
+        None => TransferVia::Relay,
+    };
+    store.set_via(&transfer_id, via);
 
     if let Some(sess) = &dest_session {
         if !udp.has_udp_channel(sess).await {
@@ -1055,6 +1078,15 @@ async fn begin_send_file(
         if punched {
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
+        // The channel may have just punched during the wait — refresh `via`
+        // so the reported transport matches what the slices actually use.
+        store.set_via(
+            &tid,
+            match dest_session.as_deref() {
+                Some(s) => udp2.channel_via(s).await.unwrap_or(TransferVia::Relay),
+                None => TransferVia::Relay,
+            },
+        );
         let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
             let (cipher, tx3, udp3, pending3) =
                 (cipher.clone(), tx2.clone(), udp2.clone(), pending2.clone());
@@ -1361,7 +1393,11 @@ async fn begin_sync_dir(
     let final_mode = if !dest_mode.allows_write() {
         match send_peer_command(&cipher, tx, pending, &dest_id, Command::GetInfo).await {
             Ok(CommandResult::Info { info }) => {
-                dest_session = info.session_id;
+                // A GetInfo reply normally carries session_id: None (the relay
+                // assigns sessions; `build_agent_info` never sets the field), so
+                // it must not evict the roster session — see
+                // `merge_dest_session`.
+                dest_session = merge_dest_session(dest_session, info.session_id);
                 info.mode
             }
             _ => dest_mode, // fallback to cached
@@ -1382,6 +1418,13 @@ async fn begin_sync_dir(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let store = state.transfers();
     store.start(&transfer_id, 0);
+    // Observability: refreshed inside `run_sync_agent` once the channel state
+    // is re-checked after the punch wait.
+    let via = match dest_session.as_deref() {
+        Some(s) => udp.channel_via(s).await.unwrap_or(TransferVia::Relay),
+        None => TransferVia::Relay,
+    };
+    store.set_via(&transfer_id, via);
 
     // Best-effort: open a direct UDP channel before streaming so files take the
     // fast path. Failure is fine — slices fall back to the relay.
@@ -1467,33 +1510,53 @@ async fn run_sync_agent(
     if let Some(session) = &dest_session {
         if udp.has_udp_channel(session).await {
             sec.max_transfer_size = 0;
+            store.set_via(
+                transfer_id,
+                udp.channel_via(session).await.unwrap_or(TransferVia::Relay),
+            );
         }
     }
     let chunk = sec.transfer_chunk_size;
 
-    // 4. Stream each changed file on the shared channel.
-    for entry in &plan.to_transfer {
-        let src_file = join_dest(&src_path, &entry.rel_path);
-        let dest_file = join_remote(&dest_path, &entry.rel_path);
-        let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway: keeps stream_file's progress() a no-op on the folder status
-        let send = |offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
-            let (cipher, tx3, udp3, pending3) =
-                (cipher.clone(), tx.clone(), udp.clone(), pending.clone());
-            let (did, dsess, dp, tid2) =
-                (dest_id.to_string(), dest_session.clone(), dest_file.clone(), file_tid.clone());
-            async move {
-                send_file_slice(
-                    &cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), &tid2, &dp, offset,
-                    raw, eof, sha,
-                )
-                .await
-            }
-        };
-        crate::transfer::stream_file(store, &src_file, &file_tid, &sec, chunk, entry.size, send)
+    // 4. Stream the changed files, several at a time (the per-file eof
+    //    round-trip — hash + ack — no longer serializes the whole tree).
+    let files: Vec<crate::transfer::TreeFile> = plan
+        .to_transfer
+        .iter()
+        .map(|e| crate::transfer::TreeFile {
+            src: join_dest(&src_path, &e.rel_path),
+            dest: join_remote(&dest_path, &e.rel_path),
+            rel: e.rel_path.clone(),
+            size: e.size,
+        })
+        .collect();
+    let send = |f: &crate::transfer::TreeFile,
+                offset: u64,
+                raw: Vec<u8>,
+                eof: bool,
+                sha: Option<String>| {
+        let (cipher, tx3, udp3, pending3) = (cipher.clone(), tx.clone(), udp.clone(), pending.clone());
+        let (did, dsess) = (dest_id.to_string(), dest_session.clone());
+        let tid = uuid::Uuid::new_v4().to_string(); // throwaway: the receiver ignores it
+        let dest_file = f.dest.clone();
+        async move {
+            send_file_slice(
+                &cipher, &tx3, &udp3, &pending3, &did, dsess.as_deref(), &tid, &dest_file, offset,
+                raw, eof, sha,
+            )
             .await
-            .with_context(|| format!("sync file {}", entry.rel_path))?;
-        store.file_done(transfer_id, entry.size);
-    }
+        }
+    };
+    crate::transfer::stream_tree(
+        store,
+        transfer_id,
+        files,
+        chunk,
+        &sec,
+        crate::transfer::SYNC_PARALLEL_FILES,
+        send,
+    )
+    .await?;
 
     // 5. Delete destination extras (additive default → only when requested).
     if delete && !plan.to_delete.is_empty() {
@@ -1695,6 +1758,32 @@ mod tests {
                 "jitter {j:?} exceeded backoff/2"
             );
         }
+    }
+
+    // --- merge_dest_session: the roster session survives a None reply -------
+    // Regression: a GetInfo reply carries `session_id: None` (agents never learn
+    // their relay session), and overwriting the roster session with it forced
+    // every mode-refreshed transfer onto the slow relay path.
+
+    #[test]
+    fn merge_dest_session_keeps_roster_on_none_reply() {
+        assert_eq!(
+            merge_dest_session(Some("sess-htf".into()), None),
+            Some("sess-htf".into())
+        );
+        assert_eq!(merge_dest_session(None, None), None);
+    }
+
+    #[test]
+    fn merge_dest_session_prefers_reported_when_present() {
+        assert_eq!(
+            merge_dest_session(Some("roster".into()), Some("reported".into())),
+            Some("reported".into())
+        );
+        assert_eq!(
+            merge_dest_session(None, Some("reported".into())),
+            Some("reported".into())
+        );
     }
 
     // --- build_agent_info ---------------------------------------------------

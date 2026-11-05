@@ -15,10 +15,10 @@
 
 set -u
 
-PROJ="/home/79f33ac4/dev/tunshell_mcp_agents"
+PROJ="/home/kkk/dev/tunshell_mcp_agents"
 LOG="/tmp/iterate.log"
 LOCK="/tmp/iterate-tunshell-mcp.lock"
-OPENCODE="/home/79f33ac4/.opencode/bin/opencode"
+OPENCODE="/home/kkk/.opencode/bin/opencode"
 PROMPT="${1:-Выполни одну итерацию согласно docs/ITERATE.md}"
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }

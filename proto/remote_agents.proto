@@ -37,6 +37,15 @@ enum TransferState {
   TRANSFER_STATE_FAILED = 3;
 }
 
+// Transport a transfer actually used (observability). Additive: peers that
+// don't set it deserialize as TRANSFER_VIA_UNKNOWN.
+enum TransferVia {
+  TRANSFER_VIA_UNKNOWN = 0;
+  TRANSFER_VIA_QUIC = 1;
+  TRANSFER_VIA_ARQ = 2;
+  TRANSFER_VIA_RELAY = 3;
+}
+
 enum TaskStatus {
   TASK_STATUS_QUEUED = 0;
   TASK_STATUS_RUNNING = 1;
@@ -130,6 +139,7 @@ message TransferStatus {
   optional string error = 5;
   uint32 files_done = 6;
   uint32 files_total = 7;
+  TransferVia via = 8;
 }
 
 message ManifestEntry {

@@ -451,6 +451,22 @@ impl UdpFrame {
     }
 }
 
+/// Whether a serialized [`UdpFrame`] is a bulk `FileData` frame. The QUIC
+/// writer uses this to route file bytes onto their own (lower-priority) lane
+/// so control frames — acks, commands, results — are never queued behind a
+/// wall of bulk data.
+///
+/// Postcard encodes externally-tagged enums as a leading variant-index
+/// varint, so byte 0 IS the index (valid while indices stay under 128). The
+/// variant order is pinned by [`udp_frame_variant_index_is_pinned`]; if the
+/// enum is ever reordered, that test fails instead of frames silently
+/// changing lanes.
+pub fn is_bulk_frame(bytes: &[u8]) -> bool {
+    // FileData is variant index 3 (Command=0, Result=1, Error=2, FileData=3,
+    // FileAck=4).
+    bytes.first() == Some(&3)
+}
+
 /// Largest message body that can be fragmented: the header's `count`/`index` are
 /// `u16`, so a message is capped at `u16::MAX` fragments of `FRAGMENT_CHUNK_SIZE`
 /// body bytes each. Bodies this large don't occur on current paths (the relay's
@@ -874,6 +890,43 @@ mod tests {
             assert!(!bytes.is_empty());
             assert_eq!(UdpFrame::from_bytes(&bytes), Some(f));
         }
+    }
+
+    // Pins the postcard variant indices that `is_bulk_frame` (and the QUIC
+    // writer's lane routing) rely on. If the enum is ever reordered, this test
+    // fails — update `is_bulk_frame` together with it.
+    #[test]
+    fn udp_frame_variant_index_is_pinned() {
+        let ctl = UdpFrame::Command {
+            request_id: "r".into(),
+            from_session: "s".into(),
+            payload: vec![1, 2, 3],
+        };
+        let res = UdpFrame::Result { request_id: "r".into(), result: vec![9] };
+        let err = UdpFrame::Error { request_id: "r".into(), error: "e".into() };
+        let bulk = UdpFrame::FileData {
+            request_id: "r".into(),
+            transfer_id: "t".into(),
+            dest_path: "/d".into(),
+            offset: 7,
+            eof: false,
+            sha256: None,
+            data: vec![0xAB; 4096],
+        };
+        let ack = UdpFrame::FileAck { request_id: "r".into(), error: None };
+        assert_eq!(ctl.to_bytes().first(), Some(&0));
+        assert_eq!(res.to_bytes().first(), Some(&1));
+        assert_eq!(err.to_bytes().first(), Some(&2));
+        assert_eq!(bulk.to_bytes().first(), Some(&3));
+        assert_eq!(ack.to_bytes().first(), Some(&4));
+
+        assert!(is_bulk_frame(&bulk.to_bytes()));
+        assert!(!is_bulk_frame(&ctl.to_bytes()));
+        assert!(!is_bulk_frame(&res.to_bytes()));
+        assert!(!is_bulk_frame(&err.to_bytes()));
+        assert!(!is_bulk_frame(&ack.to_bytes()));
+        // Not a frame at all → not bulk (rides the control lane).
+        assert!(!is_bulk_frame(&[]));
     }
 
     #[test]

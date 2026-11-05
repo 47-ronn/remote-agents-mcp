@@ -2009,7 +2009,7 @@ mod tests {
 
     #[test]
     fn decodes_claude_project_dir() {
-        assert_eq!(decode_claude_dir("-home-79f33ac4-dev-x"), "/home/79f33ac4/dev/x");
+        assert_eq!(decode_claude_dir("-home-kkk-dev-x"), "/home/kkk/dev/x");
     }
 
     #[test]
@@ -2020,12 +2020,12 @@ mod tests {
         let jsonl = concat!(
             r#"{"type":"mode","sessionId":"a"}"#,
             "\n",
-            r#"{"type":"user","cwd":"/home/79f33ac4/dev/tunshell_mcp_agents","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"user","cwd":"/home/kkk/dev/tunshell_mcp_agents","message":{"role":"user","content":"hi"}}"#,
             "\n",
         );
         assert_eq!(
             cwd_from_jsonl(jsonl).as_deref(),
-            Some("/home/79f33ac4/dev/tunshell_mcp_agents")
+            Some("/home/kkk/dev/tunshell_mcp_agents")
         );
         // No cwd anywhere → None (caller falls back to the lossy dir decode).
         assert_eq!(cwd_from_jsonl(r#"{"type":"mode"}"#), None);

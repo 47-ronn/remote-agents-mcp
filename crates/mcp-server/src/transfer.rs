@@ -11,7 +11,7 @@ use crate::safety;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use futures::stream::{FuturesUnordered, StreamExt};
-use remote_agents_shared::{TransferState, TransferStatus};
+use remote_agents_shared::{TransferState, TransferVia, TransferStatus};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,6 +23,12 @@ use std::sync::RwLock;
 /// round-trips for a large speedup without bursting so many UDP fragments that
 /// the socket buffers overflow. The final (eof) slice is always sent alone.
 const TRANSFER_WINDOW: usize = 32;
+
+/// How many files a folder sync streams concurrently. One at a time pays the
+/// per-file eof round-trip (hash + ack) serially, which dominates when a tree
+/// has many small files; a small bound overlaps those round-trips without
+/// exploding the socket buffers or the receiver's write parallelism.
+pub const SYNC_PARALLEL_FILES: usize = 4;
 
 /// In-memory registry of host↔host transfers this node initiated, polled via
 /// `TransferGet`. Cheap to clone (shared `Arc` in `AgentState`).
@@ -44,8 +50,17 @@ impl TransferStore {
                 files_done: 0,
                 files_total: 0,
                 error: None,
+                via: TransferVia::Unknown,
             },
         );
+    }
+
+    /// Record which transport the transfer actually uses (observability: a
+    /// sync silently crawling through the relay is visible in `transfer_get`).
+    pub fn set_via(&self, id: &str, via: TransferVia) {
+        if let Some(t) = self.inner.write().unwrap().get_mut(id) {
+            t.via = via;
+        }
     }
 
     /// Record progress (and flip to `Running`).
@@ -269,6 +284,89 @@ where
     sent += want;
     store.progress(transfer_id, sent);
     Ok(())
+}
+
+/// One file of a folder-sync plan, resolved for both ends.
+#[derive(Debug, Clone)]
+pub struct TreeFile {
+    /// Absolute path on THIS host (the sync source).
+    pub src: String,
+    /// Absolute path on the DESTINATION host (joined with `/`).
+    pub dest: String,
+    /// Manifest-relative path (for error messages).
+    pub rel: String,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// Stream several files (a folder-sync plan) to a peer with bounded
+/// parallelism: a tree of many small files no longer pays the per-file eof
+/// round-trip (hash + ack) serially. Each file reuses [`stream_file`] with a
+/// throwaway per-file id (its byte-level `progress` stays a no-op on the
+/// folder status); folder-level progress is bumped via
+/// [`TransferStore::file_done`] as files complete. The first error fails the
+/// sync — in-flight files are drained (bounded partial writes) and no further
+/// files are started.
+pub async fn stream_tree<F, Fut>(
+    store: &TransferStore,
+    transfer_id: &str,
+    files: Vec<TreeFile>,
+    chunk: u64,
+    sec: &SecurityConfig,
+    parallel: usize,
+    send_slice: F,
+) -> Result<()>
+where
+    // (file, offset, raw slice, eof, whole-file sha on eof) -> Ok once the peer
+    // acked it. The closure picks the transport per call; it must be `Fn`
+    // because several file futures call it concurrently.
+    F: Fn(&TreeFile, u64, Vec<u8>, bool, Option<String>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let parallel = parallel.max(1);
+    let mut pending = files.into_iter();
+    let mut inflight = FuturesUnordered::new();
+    let mut first_err: Option<anyhow::Error> = None;
+
+    loop {
+        // Refill the window while there is room and nothing has failed yet.
+        while first_err.is_none() && inflight.len() < parallel {
+            let Some(f) = pending.next() else { break };
+            let file_tid = uuid::Uuid::new_v4().to_string(); // throwaway, as in the serial loop
+            let send = &send_slice;
+            inflight.push(async move {
+                let res = stream_file(
+                    store,
+                    &f.src,
+                    &file_tid,
+                    sec,
+                    chunk,
+                    f.size,
+                    // The per-file closure carries this file's dest path.
+                    |offset, raw, eof, sha| send(&f, offset, raw, eof, sha),
+                )
+                .await;
+                (f, res)
+            });
+        }
+        if inflight.is_empty() {
+            break;
+        }
+        let (file, res) = inflight.next().await.expect("window non-empty");
+        match res {
+            Ok(()) => store.file_done(transfer_id, file.size),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.context(format!("sync file {}", file.rel)));
+                }
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Lowercase-hex SHA-256 of a whole file (streamed, constant memory).
@@ -519,5 +617,105 @@ mod tests {
         let r = receive_chunk(&dp, 0, &b64(&[0u8; 16]), false, None, &cfg);
         assert!(r.is_err(), "WS base64 path must still honor max_transfer_size");
         assert!(!dest.exists());
+    }
+
+    // stream_tree: several files through the same in-memory pipeline with
+    // bounded parallelism — every file must round-trip and the folder counters
+    // must reflect each completed file.
+    #[tokio::test]
+    async fn stream_tree_round_trips_files_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..7usize {
+            let data: Vec<u8> = (0..=255).cycle().take(1000 * i + 37).collect();
+            let src = dir.path().join(format!("src-{i}.bin"));
+            std::fs::write(&src, &data).unwrap();
+            tree.push(TreeFile {
+                src: src.to_string_lossy().into_owned(),
+                dest: dir.path().join(format!("dst-{i}.bin")).to_string_lossy().into_owned(),
+                rel: format!("{i}.bin"),
+                size: data.len() as u64,
+            });
+            want.push(data);
+        }
+
+        let cfg = sec();
+        let total: u64 = tree.iter().map(|f| f.size).sum();
+        let store = TransferStore::default();
+        store.start("t", total);
+        store.set_totals("t", total, tree.len() as u32);
+
+        // Stand-in for the network: each slice is written straight to its
+        // file's own dest (the closure routes by the TreeFile it's handed).
+        let cfg_recv = cfg.clone();
+        let send = move |f: &TreeFile, offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let (cfg, dest) = (cfg_recv.clone(), f.dest.clone());
+            async move {
+                receive_chunk_raw(&dest, offset, &raw, eof, sha.as_deref(), &cfg)?;
+                Ok(())
+            }
+        };
+
+        stream_tree(&store, "t", tree.clone(), 256, &cfg, 4, send)
+            .await
+            .expect("all files stream");
+
+        for (f, data) in tree.iter().zip(&want) {
+            assert_eq!(&std::fs::read(&f.dest).unwrap(), data, "file {} body", f.rel);
+        }
+        let st = store.get("t").unwrap();
+        assert_eq!(st.files_done, tree.len() as u32);
+        assert_eq!(st.bytes, total);
+    }
+
+    // A failing file surfaces the error; files already in flight still drain
+    // (bounded partial writes) and no further files start.
+    #[tokio::test]
+    async fn stream_tree_fails_fast_but_drains_in_flight_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = Vec::new();
+        for i in 0..6usize {
+            let data: Vec<u8> = (0..=255).cycle().take(2048).collect();
+            let src = dir.path().join(format!("s{i}.bin"));
+            std::fs::write(&src, &data).unwrap();
+            tree.push(TreeFile {
+                src: src.to_string_lossy().into_owned(),
+                dest: dir.path().join(format!("d{i}.bin")).to_string_lossy().into_owned(),
+                rel: if i == 1 { "bad.bin".into() } else { format!("{i}.bin") },
+                size: data.len() as u64,
+            });
+        }
+
+        let cfg = sec();
+        let store = TransferStore::default();
+        store.start("t", 0);
+
+        let cfg_recv = cfg.clone();
+        let send = move |f: &TreeFile, offset: u64, raw: Vec<u8>, eof: bool, sha: Option<String>| {
+            let (cfg, dest, rel) = (cfg_recv.clone(), f.dest.clone(), f.rel.clone());
+            async move {
+                if rel == "bad.bin" {
+                    anyhow::bail!("simulated wire failure");
+                }
+                receive_chunk_raw(&dest, offset, &raw, eof, sha.as_deref(), &cfg)?;
+                Ok(())
+            }
+        };
+
+        let err = stream_tree(&store, "t", tree.clone(), 512, &cfg, 2, send)
+            .await
+            .expect_err("the bad file must fail the sync");
+        assert!(err.to_string().contains("sync file bad.bin"), "got: {err}");
+
+        let st = store.get("t").unwrap();
+        assert!(
+            (1..tree.len() as u32).contains(&st.files_done),
+            "in-flight files drain, unstarted files never run: {} done",
+            st.files_done
+        );
+        // The bad file's dest was never written.
+        let bad = tree.iter().find(|f| f.rel == "bad.bin").unwrap();
+        assert!(!std::path::Path::new(&bad.dest).exists());
     }
 }

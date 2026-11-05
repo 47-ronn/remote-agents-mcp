@@ -156,6 +156,30 @@ impl From<proto::TransferState> for crate::TransferState {
     }
 }
 
+impl From<crate::TransferVia> for proto::TransferVia {
+    fn from(v: crate::TransferVia) -> Self {
+        use crate::TransferVia as D;
+        match v {
+            D::Unknown => Self::Unknown,
+            D::Quic => Self::Quic,
+            D::Arq => Self::Arq,
+            D::Relay => Self::Relay,
+        }
+    }
+}
+impl From<proto::TransferVia> for crate::TransferVia {
+    fn from(v: proto::TransferVia) -> Self {
+        use proto::TransferVia as P;
+        match v {
+            P::Quic => Self::Quic,
+            P::Arq => Self::Arq,
+            P::Relay => Self::Relay,
+            // 0 and any value an older/newer peer might send map to Unknown.
+            _ => Self::Unknown,
+        }
+    }
+}
+
 impl From<crate::TaskStatus> for proto::TaskStatus {
     fn from(s: crate::TaskStatus) -> Self {
         use crate::TaskStatus as D;
@@ -489,6 +513,7 @@ impl From<crate::TransferStatus> for proto::TransferStatus {
             error: t.error,
             files_done: t.files_done,
             files_total: t.files_total,
+            via: proto::TransferVia::from(t.via) as i32,
         }
     }
 }
@@ -504,6 +529,9 @@ impl From<proto::TransferStatus> for crate::TransferStatus {
             files_done: t.files_done,
             files_total: t.files_total,
             error: t.error,
+            via: proto::TransferVia::try_from(t.via)
+                .unwrap_or_default()
+                .into(),
         }
     }
 }
@@ -1526,7 +1554,7 @@ mod tests {
             CommandResult::FileThumb { data: b64_encode(&[1u8, 2]), w: 64, h: 48 },
             CommandResult::FileSearch { hits: vec![] },
             CommandResult::TransferQueued { id: "t".into() },
-            CommandResult::Transfer { status: TransferStatus { id: "t".into(), state: TransferState::Running, bytes: 10, total: 100, files_done: 2, files_total: 5, error: None } },
+            CommandResult::Transfer { status: TransferStatus { id: "t".into(), state: TransferState::Running, bytes: 10, total: 100, files_done: 2, files_total: 5, error: None, via: TransferVia::Quic } },
             CommandResult::DirManifest { entries: vec![ManifestEntry { rel_path: "a/b.txt".into(), size: 9, mtime_ms: 123, sha256: Some("deadbeef".into()) }], root_exists: true },
             CommandResult::TunnelStarted { tunnel: TunnelInfo { id: "t".into(), target: "x".into(), public_url: "u".into(), status: "running".into() } },
             CommandResult::TunnelList { tunnels: vec![] },

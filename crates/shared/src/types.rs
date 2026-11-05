@@ -292,6 +292,31 @@ pub enum TransferState {
     Failed,
 }
 
+/// Transport a host↔host transfer actually used, surfaced in `TransferStatus`
+/// so a transfer silently crawling through the relay is visible at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferVia {
+    /// Not known yet (just queued) or reported by an older peer that doesn't
+    /// set the field. The default keeps deserialization of old payloads working.
+    #[default]
+    Unknown,
+    /// Direct QUIC (quinn) over the hole-punched socket — the fast path.
+    Quic,
+    /// Direct channel on the userspace ARQ (QUIC handshake failed).
+    Arq,
+    /// Relayed over the WebSocket (base64) — the slow fallback.
+    Relay,
+}
+
+impl TransferVia {
+    /// Whether the transport is still unknown — used to keep the serialized
+    /// shape identical to pre-`via` payloads when there is nothing to report.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, TransferVia::Unknown)
+    }
+}
+
 /// Progress of one host↔host file transfer, polled via `TransferGet`. The same
 /// status backs a folder sync (`SyncDirTo`), where the file counters track
 /// progress across the changed files and `total`/`bytes` aggregate their sizes.
@@ -311,6 +336,10 @@ pub struct TransferStatus {
     pub files_total: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Transport in use; set once the transfer starts (older peers: Unknown).
+    /// Serialized only when known, so payloads keep their pre-field shape.
+    #[serde(default, skip_serializing_if = "TransferVia::is_unknown")]
+    pub via: TransferVia,
 }
 
 /// One file in a directory manifest, used to diff a source tree against a
@@ -511,6 +540,35 @@ mod tests {
         assert!(!AgentMode::Plan.requires_backup());
         assert!(!AgentMode::Bypass.requires_backup());
         assert!(!AgentMode::Disabled.requires_backup());
+    }
+
+    #[test]
+    fn transfer_via_defaults_and_roundtrips() {
+        // Old peers (and stored payloads) predate the field: missing `via`
+        // must deserialize as Unknown, not fail.
+        let old = serde_json::json!({
+            "id": "t1",
+            "state": "running",
+            "bytes": 10,
+            "total": 20,
+            "files_done": 1,
+            "files_total": 2,
+        });
+        let st: TransferStatus = serde_json::from_value(old).expect("old payload must parse");
+        assert_eq!(st.via, TransferVia::Unknown);
+
+        // New values round-trip and skip-when-unknown keeps old shape.
+        for via in [TransferVia::Quic, TransferVia::Arq, TransferVia::Relay] {
+            let mut st2 = st.clone();
+            st2.via = via;
+            let json = serde_json::to_value(&st2).unwrap();
+            let back: TransferStatus = serde_json::from_value(json).unwrap();
+            assert_eq!(back.via, via);
+        }
+        let mut st3 = st;
+        st3.via = TransferVia::Unknown;
+        let json = serde_json::to_value(&st3).unwrap();
+        assert!(json.get("via").is_none(), "unknown serializes to nothing (old shape)");
     }
 
     #[test]
