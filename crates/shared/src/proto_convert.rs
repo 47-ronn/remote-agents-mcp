@@ -408,6 +408,7 @@ impl From<crate::SessionMessage> for proto::SessionMessage {
             role: m.role,
             text: m.text,
             ts: m.ts,
+            waiting: m.waiting,
         }
     }
 }
@@ -417,6 +418,7 @@ impl From<proto::SessionMessage> for crate::SessionMessage {
             role: m.role,
             text: m.text,
             ts: m.ts,
+            waiting: m.waiting,
         }
     }
 }
@@ -1523,7 +1525,7 @@ mod tests {
             CommandResult::TunnelStarted { tunnel: TunnelInfo { id: "t".into(), target: "x".into(), public_url: "u".into(), status: "running".into() } },
             CommandResult::TunnelList { tunnels: vec![] },
             CommandResult::SessionList { sessions: vec![SessionMeta { provider: "claude".into(), id: "s".into(), title: "t".into(), updated: 1, cwd: None, resumable: true }], active: vec!["s".into()] },
-            CommandResult::SessionTranscript { messages: vec![SessionMessage { role: "user".into(), text: "hi".into(), ts: Some(1) }] },
+            CommandResult::SessionTranscript { messages: vec![SessionMessage { role: "user".into(), text: "hi".into(), ts: Some(1), waiting: None }] },
             CommandResult::SessionSearch {
                 hits: vec![crate::SessionSearchHit {
                     provider: "claude".into(),

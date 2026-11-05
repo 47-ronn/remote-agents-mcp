@@ -87,6 +87,9 @@ message SessionMessage {
   string role = 1;
   string text = 2;
   optional uint64 ts = 3;
+  // Tool name this turn is blocked on (question/permission still PENDING a
+  // human answer) — the "needs you" signal for the panel's live badges.
+  optional string waiting = 4;
 }
 
 // One full-text search hit over the local AI-chat history index (ctx-style:

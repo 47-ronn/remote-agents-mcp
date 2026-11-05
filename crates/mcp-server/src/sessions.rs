@@ -130,8 +130,7 @@ pub fn windowed_transcript(provider: &str, id: &str, seq: usize, half: usize) ->
         text: format!(
             "… сообщения {start}–{end} из {total}; совпадение — №{center} …"
         ),
-        ts: None,
-    });
+        ts: None, waiting: None, });
     out.extend(msgs.into_iter().skip(start).take(end - start));
     Ok(cap_transcript(out))
 }
@@ -161,8 +160,7 @@ fn cap_transcript(msgs: Vec<SessionMessage>) -> Vec<SessionMessage> {
         text: format!(
             "… показаны последние {keep} из {total} сообщений ({dropped} более ранних опущены) …"
         ),
-        ts: None,
-    });
+        ts: None, waiting: None, });
     out.extend(msgs.into_iter().skip(total - keep));
     out
 }
@@ -346,8 +344,7 @@ fn claude_transcript(id: &str) -> Result<Vec<SessionMessage>> {
                     ts: v
                         .get("timestamp")
                         .and_then(|t| t.as_str())
-                        .and_then(parse_iso_ms),
-                });
+                        .and_then(parse_iso_ms), waiting: None, });
             }
         }
     }
@@ -393,7 +390,14 @@ fn opencode_sessions(limit: usize) -> Vec<SessionMeta> {
 }
 
 fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
-    let out = run_cli_home("opencode", &["export", id]).context("opencode export failed")?;
+    // opencode v2 moved the subcommand: `opencode export <id>` (1.x) became
+    // `opencode session export <id>`. Try v2 first, keep the v1 form as a
+    // fallback for hosts still on 1.x (an unknown subcommand exits non-zero
+    // almost instantly, so the miss costs ~0.2s). Export works from HOME for
+    // any project's session id, matching the HOME-scoped session list.
+    let out = run_cli_home("opencode", &["session", "export", id])
+        .or_else(|| run_cli_home("opencode", &["export", id]))
+        .context("opencode export failed")?;
     let v: serde_json::Value = serde_json::from_str(&out)?;
     let msgs = v.get("messages").and_then(|m| m.as_array());
     Ok(msgs
@@ -403,12 +407,45 @@ fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
         .collect())
 }
 
-/// One opencode export message → a transcript turn. Current opencode (1.x)
-/// nests `{info:{role,time:{created}}, parts:[{type:"text",text}, …]}`; older
-/// exports used a flat `{role, content}`. Handle both; drop non-text parts
-/// (tool / step-start / step-finish) and empty turns.
+/// Readable text for a v2 `question` tool part: the question plus its option
+/// labels, so the prompt is visible in the panel transcript.
+fn opencode_question_text(part: &serde_json::Value) -> String {
+    let Some(q) = part
+        .get("state")
+        .and_then(|s| s.get("input"))
+        .and_then(|i| i.get("questions"))
+        .and_then(|q| q.as_array())
+        .and_then(|a| a.first())
+    else {
+        return String::new();
+    };
+    let text = q.get("question").and_then(|t| t.as_str()).unwrap_or("");
+    let opts = q
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|os| {
+            os.iter()
+                .filter_map(|o| o.get("label").and_then(|l| l.as_str()))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default();
+    if opts.is_empty() {
+        format!("❓ {text}")
+    } else {
+        format!("❓ {text}\n[{opts}]")
+    }
+}
+
+/// One opencode export message → a transcript turn. Handles all three shapes
+/// the CLI has shipped across versions; drops non-text parts and empty turns:
+///   - v2 `session export`: flat `{type:"user"|"assistant", text, time:{created}}`
+///     (`idle` markers carry no text and are dropped);
+///   - v1 (1.x): nested `{info:{role,time:{created}}, parts:[{type:"text",text}, …]}`;
+///   - legacy export: flat `{role, content}`.
 fn opencode_message(m: &serde_json::Value) -> Option<SessionMessage> {
-    // Current shape: role/time under `info`, text under `parts`.
+    // v1 shape first — its messages can carry a top-level `type` too, so the
+    // flat v2 check must not shadow them.
     if let Some(info) = m.get("info") {
         let role = info.get("role").and_then(|r| r.as_str())?.to_string();
         let text = m
@@ -430,7 +467,66 @@ fn opencode_message(m: &serde_json::Value) -> Option<SessionMessage> {
             .get("time")
             .and_then(|t| t.get("created"))
             .and_then(|c| c.as_u64());
-        return Some(SessionMessage { role, text, ts });
+        return Some(SessionMessage { role, text, ts, waiting: None });
+    }
+    // v2 `session export` shape: role in `type`, plain text in `text`, ts in
+    // `time.created`; structured turns additionally carry `content` parts. A
+    // tool part with `state.status == "pending"` means the turn is BLOCKED on
+    // a human (a question / permission) → surfaced as `waiting` (the panel's
+    // "needs you" signal), and the question tool's prompt becomes visible
+    // text — it previously never reached the web transcript at all. "idle"
+    // markers and tool-only turns with nothing to show drop out.
+    if let Some(role) = m
+        .get("type")
+        .and_then(|t| t.as_str())
+        .filter(|t| *t == "user" || *t == "assistant")
+    {
+        let mut text = m
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = m
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(|c| c.as_u64());
+        let parts = m.get("content").and_then(|p| p.as_array());
+        // Tool this turn is still waiting on, if any.
+        let pending = parts
+            .and_then(|ps| {
+                ps.iter().find(|p| {
+                    p.get("type").and_then(|t| t.as_str()) == Some("tool")
+                        && p.get("state")
+                            .and_then(|s| s.get("status"))
+                            .and_then(|s| s.as_str())
+                            == Some("pending")
+                })
+            })
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .map(String::from);
+        // The question tool's prompt — shown whether still pending or already
+        // answered: it is a real conversational turn either way.
+        if text.trim().is_empty() {
+            if let Some(q) = parts.and_then(|ps| {
+                ps.iter().find(|p| {
+                    p.get("type").and_then(|t| t.as_str()) == Some("tool")
+                        && p.get("name").and_then(|n| n.as_str()) == Some("question")
+                })
+            }) {
+                text = opencode_question_text(q);
+            }
+        }
+        if text.trim().is_empty() {
+            let name = pending.as_deref()?;
+            text = format!("⏳ {name} — ожидает вашего ответа");
+        }
+        return Some(SessionMessage {
+            role: role.to_string(),
+            text,
+            ts,
+            waiting: pending,
+        });
     }
     // Legacy flat shape: {role, content, time}.
     let role = m.get("role").and_then(|r| r.as_str())?.to_string();
@@ -439,7 +535,12 @@ fn opencode_message(m: &serde_json::Value) -> Option<SessionMessage> {
     if text.trim().is_empty() {
         return None;
     }
-    Some(SessionMessage { role, text, ts: m.get("time").and_then(|t| t.as_u64()) })
+    Some(SessionMessage {
+        role,
+        text,
+        ts: m.get("time").and_then(|t| t.as_u64()),
+        waiting: None,
+    })
 }
 
 // --- VS Code agents: Cline / Roo / Kilo (filesystem JSON) -------------------
@@ -587,8 +688,7 @@ fn cline_message(v: &serde_json::Value) -> Option<SessionMessage> {
     Some(SessionMessage {
         role: role.to_string(),
         text: text.to_string(),
-        ts: v.get("ts").and_then(|t| t.as_u64()),
-    })
+        ts: v.get("ts").and_then(|t| t.as_u64()), waiting: None, })
 }
 
 /// Extract display text from a ClineMessage `text`. Most are plain strings; some
@@ -755,8 +855,7 @@ fn zed_message(m: &serde_json::Value) -> Option<SessionMessage> {
     Some(SessionMessage {
         role: role.to_string(),
         text,
-        ts: None,
-    })
+        ts: None, waiting: None, })
 }
 
 // --- Cursor (agent-transcripts JSONL tree) -----------------------------------
@@ -911,8 +1010,7 @@ fn cursor_message(line: &str) -> Option<SessionMessage> {
     Some(SessionMessage {
         role: role.to_string(),
         text,
-        ts,
-    })
+        ts, waiting: None, })
 }
 
 /// Concatenate the `type:"text"` blocks of `message.content` (top-level
@@ -1115,8 +1213,7 @@ fn codex_message(line: &str) -> Option<SessionMessage> {
     Some(SessionMessage {
         role: role.to_string(),
         text,
-        ts,
-    })
+        ts, waiting: None, })
 }
 
 // --- Gemini CLI & Qwen Code (chat recordings) ----------------------------------
@@ -1283,8 +1380,7 @@ fn gemini_family_message(line: &str) -> Option<SessionMessage> {
     Some(SessionMessage {
         role: role.to_string(),
         text,
-        ts,
-    })
+        ts, waiting: None, })
 }
 
 // --- Goose (sessions.db SQLite) --------------------------------------------------
@@ -1468,7 +1564,7 @@ fn goose_transcript(id: &str) -> Result<Vec<SessionMessage>> {
                 continue;
             }
             let ts = ts.as_deref().and_then(parse_iso_ms);
-            msgs.push(SessionMessage { role, text, ts });
+            msgs.push(SessionMessage { role, text, ts, waiting: None, });
         }
         return Ok(msgs);
     }
@@ -1659,8 +1755,7 @@ fn continue_messages(v: &serde_json::Value) -> Vec<SessionMessage> {
             Some(SessionMessage {
                 role: role.to_string(),
                 text,
-                ts,
-            })
+                ts, waiting: None, })
         })
         .collect()
 }
@@ -1975,7 +2070,7 @@ mod tests {
     }
 
     fn msg(text: &str) -> SessionMessage {
-        SessionMessage { role: "assistant".into(), text: text.into(), ts: None }
+        SessionMessage { role: "assistant".into(), text: text.into(), ts: None, waiting: None }
     }
 
     #[test]
@@ -2068,6 +2163,86 @@ mod tests {
         assert_eq!(m.role, "assistant");
         assert_eq!(m.text, "Проверю список\nготово");
         assert_eq!(m.ts, Some(1781625315855));
+        assert_eq!(m.waiting, None);
+
+        // opencode v2 `session export`: flat {type, text, time:{created}}.
+        let v2 = serde_json::json!({
+            "id": "msg_1aabcb25c001BfmxpJ4dhC4RAA",
+            "time": {"created": 1793865855676u64},
+            "text": "remote agent у нас дублирует историю",
+            "files": [],
+            "agents": [],
+            "type": "user"
+        });
+        let vm = opencode_message(&v2).unwrap();
+        assert_eq!(vm.role, "user");
+        assert_eq!(vm.text, "remote agent у нас дублирует историю");
+        assert_eq!(vm.ts, Some(1793865855676));
+
+        // v2 "idle" markers (no recognized role / no text) are dropped.
+        let idle = serde_json::json!({"type": "idle", "text": "", "time": {"created": 1u64}});
+        assert!(opencode_message(&idle).is_none());
+
+        // v2 PENDING question: empty text, the question tool part carries the
+        // prompt → visible turn + `waiting` marker (the "needs you" signal).
+        let pend = serde_json::json!({
+            "type": "assistant",
+            "text": "",
+            "time": {"created": 1793866000000u64},
+            "content": [
+                {"type": "reasoning", "text": "думаю"},
+                {"type": "tool", "name": "question", "executed": false,
+                 "state": {"status": "pending", "input": {"questions": [{
+                    "question": "Что строим следующим?",
+                    "options": [{"label": "Статусы"}, {"label": "Терминал"}]
+                 }]}}}
+            ]
+        });
+        let pm = opencode_message(&pend).unwrap();
+        assert_eq!(pm.role, "assistant");
+        assert_eq!(pm.waiting.as_deref(), Some("question"));
+        assert!(pm.text.contains("Что строим следующим?"));
+        assert!(pm.text.contains("Статусы / Терминал"));
+
+        // v2 answered question: still visible, but no `waiting`.
+        let answered = serde_json::json!({
+            "type": "assistant",
+            "text": "",
+            "time": {"created": 1793866000001u64},
+            "content": [
+                {"type": "tool", "name": "question",
+                 "state": {"status": "completed", "input": {"questions": [{
+                    "question": "Как открываешь панель?", "options": [{"label": "a"}, {"label": "b"}]
+                 }]}}}
+            ]
+        });
+        let am = opencode_message(&answered).unwrap();
+        assert_eq!(am.waiting, None);
+        assert!(am.text.contains("Как открываешь панель?"));
+
+        // v2 pending non-question tool with no text: marker text + waiting.
+        let toolpend = serde_json::json!({
+            "type": "assistant",
+            "text": "",
+            "time": {"created": 2u64},
+            "content": [{"type": "tool", "name": "bash",
+                         "state": {"status": "pending"}}]
+        });
+        let tm = opencode_message(&toolpend).unwrap();
+        assert_eq!(tm.waiting.as_deref(), Some("bash"));
+        assert!(tm.text.contains("bash"));
+
+        // v2 turn with text AND a pending tool: text kept, waiting set.
+        let mixed = serde_json::json!({
+            "type": "assistant",
+            "text": "проверяю файлы",
+            "time": {"created": 3u64},
+            "content": [{"type": "tool", "name": "edit",
+                         "state": {"status": "pending"}}]
+        });
+        let mm = opencode_message(&mixed).unwrap();
+        assert_eq!(mm.text, "проверяю файлы");
+        assert_eq!(mm.waiting.as_deref(), Some("edit"));
 
         // A message with only non-text parts yields nothing.
         let toolonly = serde_json::json!({

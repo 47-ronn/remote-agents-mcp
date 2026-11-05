@@ -534,7 +534,7 @@ mod tests {
     }
 
     fn msg(role: &str, text: &str, ts: u64) -> SessionMessage {
-        SessionMessage { role: role.into(), text: text.into(), ts: Some(ts) }
+        SessionMessage { role: role.into(), text: text.into(), ts: Some(ts), waiting: None }
     }
 
     /// Build an index at `dir` from the given sessions and return a reader.
