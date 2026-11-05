@@ -211,6 +211,10 @@ pub struct SessionMessage {
     /// Timestamp (Unix ms), if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+    /// Tool name this turn is blocked on — a question/permission still
+    /// PENDING a human answer ("needs you" in the panel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
 }
 
 /// One full-text search hit over a host's indexed AI-chat history (ctx-style:
