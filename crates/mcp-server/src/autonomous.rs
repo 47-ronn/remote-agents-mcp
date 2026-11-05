@@ -13,14 +13,23 @@ use crate::config::AutonomousConfig;
 use anyhow::{bail, Context, Result};
 use remote_agents_shared::{AgentEvent, AutonomousTask, TaskStatus};
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::process::Command;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
+
+struct LiveTask {
+    pid: Option<u32>,
+    stdin: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
+    cancelled: Arc<AtomicBool>,
+}
 
 pub struct AutonomousStore {
     config: AutonomousConfig,
@@ -28,6 +37,9 @@ pub struct AutonomousStore {
     /// PATH), computed once at load. Gates whether dispatch is accepted.
     available: bool,
     db: Mutex<Connection>,
+    /// Currently running tasks, keyed by task id — holds the process group pid
+    /// (for `cancel`) and piped stdin (for `send_input`).
+    live: Mutex<HashMap<String, LiveTask>>,
     /// Outbound event channel: completion is pushed here, forwarded to the relay
     /// by the connection loop.
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -53,6 +65,7 @@ impl AutonomousStore {
             config,
             available,
             db: Mutex::new(conn),
+            live: Mutex::new(HashMap::new()),
             events,
         }
     }
@@ -137,6 +150,70 @@ impl AutonomousStore {
         Ok(out)
     }
 
+    /// Cancel a running or queued autonomous task: SIGKILLs its process group
+    /// if currently running and marks the record `Failed ("cancelled by user")`.
+    pub fn cancel(&self, id: &str) -> Result<AutonomousTask> {
+        let live_entry = self.live.lock().unwrap().remove(id);
+        if let Some(entry) = live_entry {
+            entry.cancelled.store(true, Ordering::SeqCst);
+            crate::executor::shell::kill_process_group(entry.pid);
+        }
+        let existing = self
+            .get(id)?
+            .with_context(|| format!("no autonomous task '{}'", id))?;
+        if matches!(existing.status, TaskStatus::Queued | TaskStatus::Running) {
+            self.finish(
+                id,
+                TaskStatus::Failed,
+                existing.result,
+                Some("cancelled by user".into()),
+                None,
+            );
+        }
+        self.get(id)?
+            .with_context(|| format!("no autonomous task '{}'", id))
+    }
+
+    /// Write a line of text to the stdin of a currently running task and record
+    /// the echoed input in the live result buffer.
+    pub async fn send_input(&self, id: &str, input: &str) -> Result<()> {
+        let stdin_arc = {
+            let guard = self.live.lock().unwrap();
+            let entry = guard
+                .get(id)
+                .with_context(|| format!("task '{}' is not currently running", id))?;
+            entry.stdin.clone()
+        };
+        let mut guard = stdin_arc.lock().await;
+        let stdin = guard
+            .as_mut()
+            .with_context(|| format!("stdin of task '{}' is closed", id))?;
+        let mut line = input.to_string();
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .context("write to task stdin")?;
+        stdin.flush().await.context("flush task stdin")?;
+        drop(guard);
+
+        // Append the sent line to the live output buffer so observers see it
+        // immediately in the stream.
+        if let Ok(Some(cur)) = self.get(id) {
+            let mut buf = cur.result.unwrap_or_default();
+            if !buf.is_empty() && !buf.ends_with('\n') {
+                buf.push('\n');
+            }
+            buf.push_str("› ");
+            buf.push_str(input.trim_end());
+            buf.push('\n');
+            self.update_partial(id, &buf);
+        }
+        Ok(())
+    }
+
     // --- internals ---------------------------------------------------------
 
     async fn run_task(
@@ -158,7 +235,9 @@ impl AutonomousStore {
         let mut cmd = Command::new(program);
         cmd.args(&runner[1..]);
         cmd.arg(prompt); // prompt appended as the final argument
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         // Kill the AI process if the wait future is dropped (i.e. on the timeout
         // below) — otherwise an expensive `claude -p`/`opencode` run is orphaned
         // and keeps running after the task is marked timed-out. `kill_on_drop`
@@ -185,8 +264,10 @@ impl AutonomousStore {
 
         info!("Running autonomous task '{}' via {:?}", id, program);
         // Spawn manually (rather than `cmd.output()`) so the pid is in hand for a
-        // process-group kill if the timeout fires.
-        let child = match cmd.spawn() {
+        // process-group kill if the timeout fires, and stream stdout/stderr chunks
+        // into `result` while the process is running so `task_get` callers see
+        // real-time progress (herdr-style live output).
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 error!("Autonomous task '{}' failed to spawn: {}", id, e);
@@ -201,12 +282,97 @@ impl AutonomousStore {
             }
         };
         let pid = child.id();
-        match timeout(Duration::from_secs(self.config.timeout), child.wait_with_output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let code = output.status.code();
-                if output.status.success() {
+        let stdin_handle = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.live.lock().unwrap().insert(
+            id.to_string(),
+            LiveTask {
+                pid,
+                stdin: stdin_handle,
+                cancelled: cancelled.clone(),
+            },
+        );
+
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<(bool, Vec<u8>)>();
+        if let Some(mut out) = stdout_pipe.take() {
+            let tx = chunk_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = out.read(&mut buf).await {
+                    if n == 0 || tx.send((false, buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        if let Some(mut err) = stderr_pipe.take() {
+            let tx = chunk_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = err.read(&mut buf).await {
+                    if n == 0 || tx.send((true, buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(chunk_tx);
+
+        let mut stdout_bytes = Vec::<u8>::new();
+        let mut stderr_bytes = Vec::<u8>::new();
+        let mut last_flush: Option<Instant> = None;
+        let mut dirty = false;
+
+        let wait_fut = async {
+            loop {
+                tokio::select! {
+                    maybe_chunk = chunk_rx.recv() => {
+                        match maybe_chunk {
+                            Some((is_err, bytes)) => {
+                                if is_err {
+                                    stderr_bytes.extend_from_slice(&bytes);
+                                } else {
+                                    stdout_bytes.extend_from_slice(&bytes);
+                                    dirty = true;
+                                }
+                                if dirty
+                                    && last_flush
+                                        .map(|t| t.elapsed() >= Duration::from_millis(150))
+                                        .unwrap_or(true)
+                                {
+                                    let partial = String::from_utf8_lossy(&stdout_bytes).to_string();
+                                    self.update_partial(id, &partial);
+                                    last_flush = Some(Instant::now());
+                                    dirty = false;
+                                }
+                            }
+                            None => break child.wait().await,
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(150)), if dirty => {
+                        let partial = String::from_utf8_lossy(&stdout_bytes).to_string();
+                        self.update_partial(id, &partial);
+                        last_flush = Some(Instant::now());
+                        dirty = false;
+                    }
+                }
+            }
+        };
+
+        let outcome = timeout(Duration::from_secs(self.config.timeout), wait_fut).await;
+        self.live.lock().unwrap().remove(id);
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+
+        match outcome {
+            Ok(Ok(status)) => {
+                let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+                let code = status.code();
+                if status.success() {
                     self.finish(id, TaskStatus::Done, Some(stdout), None, code);
                 } else {
                     let err = if stderr.trim().is_empty() {
@@ -229,14 +395,16 @@ impl AutonomousStore {
             }
             Err(_) => {
                 warn!("Autonomous task '{}' timed out", id);
-                // `wait_with_output` is dropped here; kill_on_drop reaps the
-                // leader, but SIGKILL the whole group to reach grandchildren the
-                // AI CLI backgrounded (see iter145).
                 crate::executor::shell::kill_process_group(pid);
+                let partial = if stdout_bytes.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&stdout_bytes).to_string())
+                };
                 self.finish(
                     id,
                     TaskStatus::Failed,
-                    None,
+                    partial,
                     Some(format!("timed out after {}s", self.config.timeout)),
                     None,
                 );
@@ -275,6 +443,14 @@ impl AutonomousStore {
         );
     }
 
+    fn update_partial(&self, id: &str, partial: &str) {
+        let conn = self.db.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE autonomous_tasks SET result = ?2 WHERE id = ?1 AND status = 'running'",
+            rusqlite::params![id, partial],
+        );
+    }
+
     fn finish(
         &self,
         id: &str,
@@ -284,10 +460,14 @@ impl AutonomousStore {
         exit_code: Option<i32>,
     ) {
         let conn = self.db.lock().unwrap();
+        // Terminal states are sticky: a late writer (e.g. run_task completing
+        // right after task_cancel marked the row failed "cancelled by user")
+        // must not resurrect the record. The UPDATE only fires while the row
+        // is still non-terminal.
         let _ = conn.execute(
             "UPDATE autonomous_tasks
                 SET status = ?2, result = ?3, error = ?4, exit_code = ?5, finished_at = ?6
-              WHERE id = ?1",
+              WHERE id = ?1 AND status IN ('queued','running')",
             rusqlite::params![
                 id,
                 status_str(status),
@@ -634,5 +814,75 @@ mod tests {
         let AgentEvent::TaskCompleted { task_id, status } = ev;
         assert_eq!(task_id, id);
         assert_eq!(status, TaskStatus::Done);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_streaming_input_and_cancel() {
+        let s = store_runner_timeout(
+            vec![
+                "sh",
+                "-c",
+                "echo READY; read line; echo GOT:$line; sleep 30",
+            ],
+            10,
+        );
+        let id = s.dispatch("ignored", None).unwrap();
+
+        // Wait for the initial "READY" chunk to land while status == Running.
+        let mut saw_ready = false;
+        for _ in 0..50 {
+            let t = s.get(&id).unwrap().unwrap();
+            if t.status == TaskStatus::Running
+                && t.result.as_deref().unwrap_or("").contains("READY")
+            {
+                saw_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_ready, "expected live partial stdout while running");
+
+        // Send a line to the running child's stdin and wait for "GOT:hello-herdr".
+        s.send_input(&id, "hello-herdr").await.unwrap();
+        let mut saw_got = false;
+        for _ in 0..50 {
+            let t = s.get(&id).unwrap().unwrap();
+            if t.result.as_deref().unwrap_or("").contains("GOT:hello-herdr") {
+                saw_got = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_got, "expected child to echo stdin line while running");
+
+        // Cancel the running task and verify it transitions to Failed.
+        let cancelled = s.cancel(&id).unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Failed);
+        assert_eq!(cancelled.error.as_deref(), Some("cancelled by user"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finish_never_overwrites_terminal_status() {
+        // task_cancel marks the row failed "cancelled by user"; a racing
+        // run_task that completes right after must not overwrite it.
+        // Symmetrically, a late cancel must not flip a Done row.
+        let s = store_runner_timeout(vec!["sh", "-c", "true"], 10);
+        let id = s.dispatch("p", None).unwrap();
+        let done = await_terminal(&s, &id).await;
+        assert_eq!(done.status, TaskStatus::Done);
+
+        // Late writer arrives after the row is terminal → no-op.
+        s.finish(
+            &id,
+            TaskStatus::Failed,
+            None,
+            Some("late writer".into()),
+            None,
+        );
+        let still = s.get(&id).unwrap().unwrap();
+        assert_eq!(still.status, TaskStatus::Done);
+        assert_eq!(still.error, None);
     }
 }

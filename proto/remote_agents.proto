@@ -294,6 +294,11 @@ message Command {
   }
   message TaskGet { string id = 1; }
   message TaskList {}
+  message TaskCancel { string id = 1; }
+  message TaskInput {
+    string id = 1;
+    string input = 2;
+  }
   message SessionList {}
   message SessionGet {
     string provider = 1;
@@ -439,6 +444,8 @@ message Command {
     ChainArm chain_arm = 37;
     ChainList chain_list = 39;
     ChainCancel chain_cancel = 40;
+    TaskCancel task_cancel = 41;
+    TaskInput task_input = 42;
   }
 }
 
