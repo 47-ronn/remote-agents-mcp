@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, Cipher, Endpoint,
-    UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
+    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, Cipher, ChannelState,
+    Endpoint, TransferVia, UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -98,6 +98,26 @@ impl UdpTransport {
 
     /// Initiate a UDP channel to a peer.
     pub async fn offer_channel(&self, peer_session: String) -> Result<String> {
+        // Reuse a live channel; REPLACE a dead one (QUIC stream ended →
+        // `Disconnected`, punch exhausted → `Fallback`, closed → `Closed`).
+        // Without this a dead entry pinned itself in the map forever and all
+        // bulk silently fell back to the slow relay until restart. A channel
+        // still punching (`Probing`) is left alone so we don't race its own
+        // handshake.
+        if let Some(ch) = self.channels.read().await.get(&peer_session) {
+            if ch.is_ready().await {
+                return Ok(ch.channel_id.clone());
+            }
+            let st = ch.state().await;
+            if !matches!(
+                st,
+                ChannelState::Closed | ChannelState::Disconnected | ChannelState::Fallback
+            ) {
+                return Ok(ch.channel_id.clone());
+            }
+        }
+        self.channels.write().await.remove(&peer_session);
+
         let channel_id = uuid::Uuid::new_v4().to_string();
 
         let (channel, recv_rx) = UdpChannel::new(
@@ -269,6 +289,18 @@ impl UdpTransport {
         } else {
             false
         }
+    }
+
+    /// Which transport a transfer to `peer_session` would use right now:
+    /// `Some(Quic)`/`Some(Arq)` when a ready direct channel exists (recorded
+    /// in `TransferStatus::via`), `None` when it would ride the relay.
+    pub async fn channel_via(&self, peer_session: &str) -> Option<TransferVia> {
+        let channels = self.channels.read().await;
+        let ch = channels.get(peer_session)?;
+        if !ch.is_ready().await {
+            return None;
+        }
+        Some(if ch.is_quic() { TransferVia::Quic } else { TransferVia::Arq })
     }
 
     /// Send data to a peer via UDP (if available).

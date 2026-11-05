@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use remote_agents_shared::{
-    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, Cipher, Endpoint,
-    UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
+    candidate_addrs_multi, local_candidate_ips, reflexive_endpoint, Cipher, ChannelState,
+    Endpoint, TransferVia, UdpAnswer, UdpChannel, UdpChannelResult, UdpConfig, UdpOffer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,13 +106,28 @@ impl UdpTransport {
             anyhow::bail!("refusing to open a UDP channel to self");
         }
 
-        // Idempotent per session: reuse an existing channel instead of creating a
-        // second one that would OVERWRITE the map entry — clobbering an
-        // already-connected channel with a fresh (still-punching or failed) one
-        // and forcing data onto the slow WS fallback.
+        // Reuse only a channel that can actually carry data. A dead entry
+        // (QUIC stream ended → `Disconnected`, punch exhausted → `Fallback`,
+        // closed → `Closed`) previously poisoned the map forever: every later
+        // offer "reused" it, so after ONE channel death all bulk silently fell
+        // back to the slow relay until the process restarted. Drop the dead
+        // entry and re-offer instead. A channel still punching (`Probing`) is
+        // left alone — clobbering it would race its own handshake. (Callers
+        // that re-offer on roster refresh guard with `has_channel`, so this
+        // mainly serves explicit dials from transfer starts.)
         if let Some(ch) = self.channels.read().await.get(&agent_session) {
-            return Ok(ch.channel_id.clone());
+            if ch.is_ready().await {
+                return Ok(ch.channel_id.clone());
+            }
+            let st = ch.state().await;
+            if !matches!(
+                st,
+                ChannelState::Closed | ChannelState::Disconnected | ChannelState::Fallback
+            ) {
+                return Ok(ch.channel_id.clone());
+            }
         }
+        self.channels.write().await.remove(&agent_session);
 
         let channel_id = uuid::Uuid::new_v4().to_string();
 
@@ -298,6 +313,18 @@ impl UdpTransport {
         } else {
             false
         }
+    }
+
+    /// Which transport a transfer to `agent_session` would use right now:
+    /// `Some(Quic)`/`Some(Arq)` when a ready direct channel exists (recorded
+    /// in `TransferStatus::via`), `None` when it would ride the relay.
+    pub async fn channel_via(&self, agent_session: &str) -> Option<TransferVia> {
+        let channels = self.channels.read().await;
+        let ch = channels.get(agent_session)?;
+        if !ch.is_ready().await {
+            return None;
+        }
+        Some(if ch.is_quic() { TransferVia::Quic } else { TransferVia::Arq })
     }
 
     /// Whether a channel entry already exists for this session, in ANY state
@@ -525,5 +552,28 @@ mod tests {
         assert!(transport.has_channel("agent-x").await);
         // ...but it isn't Connected yet (no hole-punch in a unit test).
         assert!(!transport.has_udp_channel("agent-x").await);
+    }
+
+    // Regression: a channel that can't carry data (here: freshly offered and
+    // still `Disconnected`, the same state a dead QUIC/ARQ channel ends in)
+    // must not be reused forever. The old "reuse any existing entry" rule
+    // pinned one dead channel in the map, and after its death every transfer
+    // silently crawled through the relay until the process restarted.
+    #[tokio::test]
+    async fn offer_channel_replaces_a_not_ready_channel() {
+        let (transport, mut rx) = transport();
+        transport.set_session_id("me".to_string()).await;
+
+        let first = transport.offer_channel("agent-x".to_string()).await.unwrap();
+        let second = transport.offer_channel("agent-x".to_string()).await.unwrap();
+        assert_ne!(first, second, "a not-ready channel must be re-offered, not reused");
+        assert!(transport.has_channel("agent-x").await);
+
+        // Both offers were signaled to the relay.
+        let mut offers = 0;
+        while rx.try_recv().is_ok() {
+            offers += 1;
+        }
+        assert_eq!(offers, 2, "each offer should be queued for signaling");
     }
 }

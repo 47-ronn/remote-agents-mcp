@@ -101,13 +101,19 @@ mod channel_impl {
         srtt_ms: Mutex<Option<f64>>,
         rttvar_ms: Mutex<f64>,
         /// QUIC data path (quinn over the punched socket). When `quic_active`,
-        /// `send_reliable`/`send_unreliable` write length-delimited frames to
-        /// `quic_send` and a reader task feeds `recv_tx` — replacing the
-        /// hand-rolled ARQ. Set the moment we commit to QUIC so the ARQ path is
-        /// never used for this channel (the peer is on QUIC too). `quic_conn` is
-        /// held only to keep the connection + endpoint alive.
+        /// `send_reliable`/`send_unreliable` hand encrypted frames to the
+        /// [`quic_writer`] task through one of two mpsc lanes — control
+        /// (everything) and bulk (`UdpFrame::FileData`, demultiplexed by
+        /// [`crate::udp::is_bulk_frame`]) — replacing the hand-rolled ARQ. The
+        /// writer task owns the stream, so no lock is held across a
+        /// flow-control-blockable `write_all`, and control frames are always
+        /// drained ahead of bulk data (an ack/command can't queue behind a
+        /// wall of file bytes). Set the moment we commit to QUIC so the ARQ
+        /// path is never used for this channel (the peer is on QUIC too).
+        /// `quic_conn` is held only to keep the connection + endpoint alive.
         quic_active: std::sync::atomic::AtomicBool,
-        quic_send: Mutex<Option<quinn::SendStream>>,
+        quic_ctl: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+        quic_bulk: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
         quic_conn: Mutex<Option<crate::quic::QuicConn>>,
     }
 
@@ -178,7 +184,8 @@ mod channel_impl {
                 srtt_ms: Mutex::new(None),
                 rttvar_ms: Mutex::new(0.0),
                 quic_active: std::sync::atomic::AtomicBool::new(false),
-                quic_send: Mutex::new(None),
+                quic_ctl: Mutex::new(None),
+                quic_bulk: Mutex::new(None),
                 quic_conn: Mutex::new(None),
             };
 
@@ -442,7 +449,22 @@ mod channel_impl {
                 let _ = crate::quic::write_msg(&mut send, &[]).await; // prime the stream
             }
 
-            *self.quic_send.lock().await = Some(send);
+            // Two lanes into one writer task: control (everything) and bulk
+            // (FileData). The writer owns the stream, so `send_reliable` never
+            // holds a lock across a write that may block on flow control, and
+            // control frames are written ahead of queued bulk data. Both lanes
+            // carry the same length-delimited frames on the SAME bidi stream,
+            // so the wire format is unchanged for existing peers.
+            let (ctl_tx, ctl_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (bulk_tx, bulk_rx) = mpsc::channel::<Vec<u8>>(32);
+            {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    quic_writer(send, ctl_rx, bulk_rx, &me.state).await;
+                });
+            }
+            *self.quic_ctl.lock().await = Some(ctl_tx);
+            *self.quic_bulk.lock().await = Some(bulk_tx);
             *self.quic_conn.lock().await = Some(conn);
             *self.state.write().await = ChannelState::Connected;
 
@@ -465,17 +487,24 @@ mod channel_impl {
             Ok(())
         }
 
-        /// Whether the channel is ready to carry data: a live QUIC stream when in
+        /// Whether the channel is ready to carry data: a live QUIC writer when in
         /// QUIC mode, otherwise the ARQ `Connected` state. Used to gate
         /// `send_via_udp` so a half-open QUIC handshake doesn't drop into the ARQ.
         pub async fn is_ready(&self) -> bool {
             use std::sync::atomic::Ordering;
             if self.quic_active.load(Ordering::SeqCst) {
                 *self.state.read().await == ChannelState::Connected
-                    && self.quic_send.lock().await.is_some()
+                    && self.quic_ctl.lock().await.is_some()
             } else {
                 *self.state.read().await == ChannelState::Connected
             }
+        }
+
+        /// Whether this channel carries data over QUIC (vs the userspace ARQ).
+        /// Used to report the transfer's `via` transport.
+        pub fn is_quic(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            self.quic_active.load(Ordering::SeqCst)
         }
 
         /// Send reliable data (QUIC stream when active; else the ARQ — retransmit
@@ -484,11 +513,21 @@ mod channel_impl {
             use std::sync::atomic::Ordering;
             if self.quic_active.load(Ordering::SeqCst) {
                 let enc = self.cipher.encrypt_bytes(data).map_err(|_| UdpChannelError::Crypto)?;
-                let mut guard = self.quic_send.lock().await;
-                let send = guard.as_mut().ok_or(UdpChannelError::Closed)?;
-                crate::quic::write_msg(send, &enc)
-                    .await
-                    .map_err(|e| UdpChannelError::HolePunchFailed(format!("quic write: {e}")))?;
+                // Bulk FileData rides its own lane so control frames are never
+                // queued behind file bytes (see `quic_writer`). Bounded queues
+                // give backpressure: a full bulk lane parks the sending slice
+                // instead of ballooning memory.
+                let sender = if crate::udp::is_bulk_frame(data) {
+                    let bulk = self.quic_bulk.lock().await.clone();
+                    match bulk {
+                        Some(s) => Some(s),
+                        None => self.quic_ctl.lock().await.clone(),
+                    }
+                } else {
+                    self.quic_ctl.lock().await.clone()
+                };
+                let sender = sender.ok_or(UdpChannelError::Closed)?;
+                sender.send(enc).await.map_err(|_| UdpChannelError::Closed)?;
                 return Ok(());
             }
             if *self.state.read().await != ChannelState::Connected {
@@ -898,6 +937,57 @@ mod channel_impl {
         }
     }
 
+    /// The QUIC writer: the ONE task that owns the channel's bidi
+    /// `SendStream`, so no lock is ever held across a `write_all` that can
+    /// block on stream flow control. Frames arrive on two lanes:
+    ///
+    /// - control (acks, commands, results, errors) — always drained FIRST
+    ///   (`biased` + lane order), so a burst of bulk bytes can't strand an
+    ///   ack or a command behind it;
+    /// - bulk (`UdpFrame::FileData`) — large frames, bounded queue, pure
+    ///   backpressure when full.
+    ///
+    /// Order between the lanes is irrelevant (frames are independent
+    /// request/response pairs correlated by id; slice writes are
+    /// offset-addressed), and per-lane order is preserved, which is all any
+    /// consumer depends on. The wire format is unchanged — both lanes
+    /// interleave onto the same length-delimited stream, so peers of any
+    /// version read it identically.
+    ///
+    /// Exits on the first write error (connection dead) — marking the channel
+    /// `Disconnected` so `is_ready()` turns false and callers fall back to the
+    /// relay — or when both lanes close (channel dropped), finishing the
+    /// stream cleanly.
+    async fn quic_writer(
+        mut send: quinn::SendStream,
+        mut ctl_rx: mpsc::Receiver<Vec<u8>>,
+        mut bulk_rx: mpsc::Receiver<Vec<u8>>,
+        state: &RwLock<ChannelState>,
+    ) {
+        let mut ctl_open = true;
+        let mut bulk_open = true;
+        while ctl_open || bulk_open {
+            // `biased` makes the poll order deterministic: a ready control
+            // frame always wins over a ready bulk frame.
+            let frame = tokio::select! {
+                f = ctl_rx.recv(), if ctl_open => match f {
+                    Some(f) => f,
+                    None => { ctl_open = false; continue; }
+                },
+                f = bulk_rx.recv(), if bulk_open => match f {
+                    Some(f) => f,
+                    None => { bulk_open = false; continue; }
+                },
+            };
+            if crate::quic::write_msg(&mut send, &frame).await.is_err() {
+                *state.write().await = ChannelState::Disconnected;
+                return;
+            }
+        }
+        // Both lanes closed → the channel is being dropped; end the stream.
+        let _ = send.finish();
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1034,6 +1124,63 @@ mod channel_impl {
             // Each side locked onto the reachable loopback candidate, not the dead one.
             assert_eq!(*a.peer_endpoint.read().await, Some(b_peer));
             assert_eq!(*b.peer_endpoint.read().await, Some(a_peer));
+        }
+
+        /// QUIC over loopback: the control and bulk lanes both deliver frames
+        /// (in any order — they're independent), and the channel reports
+        /// `is_quic`. Mirrors `spawn_punch_then_loops`: the answerer accepts,
+        /// the offerer connects.
+        #[tokio::test]
+        async fn quic_lanes_deliver_bulk_and_control() {
+            let cipher = Cipher::from_passphrase("quic-lanes");
+            let (a, _a_rx) =
+                UdpChannel::new("ch".into(), cipher.clone(), UdpConfig::default()).await.unwrap();
+            let (b, mut b_rx) =
+                UdpChannel::new("ch".into(), cipher, UdpConfig::default()).await.unwrap();
+            let (a, b) = (Arc::new(a), Arc::new(b));
+            let (a_peer, b_peer) = (loopback_peer(&a), loopback_peer(&b));
+            a.force_connected_to(b_peer).await;
+            b.force_connected_to(a_peer).await;
+
+            // Server (answerer) accepts, client (offerer) connects.
+            let bs = b.clone();
+            let server = tokio::spawn(async move { bs.start_quic(true).await });
+            a.start_quic(false).await.expect("client QUIC handshake");
+            server.await.expect("server task alive").expect("server QUIC accept");
+
+            assert!(a.is_ready().await, "client channel ready");
+            assert!(b.is_ready().await, "server channel ready");
+            assert!(a.is_quic());
+            assert!(b.is_quic());
+
+            let ctl = UdpFrame::Command {
+                request_id: "ctl".into(),
+                from_session: "s".into(),
+                payload: vec![1, 2, 3],
+            };
+            let bulk = UdpFrame::FileData {
+                request_id: "blk".into(),
+                transfer_id: "t".into(),
+                dest_path: "/tmp/x".into(),
+                offset: 0,
+                eof: false,
+                sha256: None,
+                data: vec![0xAB; 300_000],
+            };
+            a.send_reliable(&ctl.to_bytes()).await.unwrap();
+            a.send_reliable(&bulk.to_bytes()).await.unwrap();
+
+            // Both frames must arrive (lane order is unspecified).
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let frame = tokio::time::timeout(Duration::from_secs(5), b_rx.recv())
+                    .await
+                    .expect("frame delivered over QUIC")
+                    .expect("channel open");
+                got.push(frame);
+            }
+            assert!(got.contains(&ctl.to_bytes()), "control frame delivered");
+            assert!(got.contains(&bulk.to_bytes()), "bulk frame delivered");
         }
     }
 }
