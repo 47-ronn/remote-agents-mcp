@@ -194,6 +194,17 @@ pub enum Command {
     /// List autonomous tasks on the host
     TaskList,
 
+    /// Cancel a running or queued autonomous task by id (kills its process group).
+    TaskCancel {
+        id: String,
+    },
+
+    /// Send a line of text to the stdin of a running autonomous task.
+    TaskInput {
+        id: String,
+        input: String,
+    },
+
     // === AI-provider sessions (claude / opencode history) ===
     /// List the host's provider conversations (metadata only).
     SessionList,

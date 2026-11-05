@@ -402,6 +402,25 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             vec![],
         ),
         make_tool(
+            "task_cancel",
+            "Cancel a running or queued autonomous task by ID (kills its process group).",
+            json!({
+                "id": {"type": "string", "description": "Task ID to cancel"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["id"],
+        ),
+        make_tool(
+            "task_input",
+            "Send a line of text to the stdin of a running autonomous task.",
+            json!({
+                "id": {"type": "string", "description": "Running task ID"},
+                "input": {"type": "string", "description": "Text line to write to the task's stdin"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["id", "input"],
+        ),
+        make_tool(
             "chain_arm",
             "Arm a replicated task chain: when the source task (src_task on src_agent) finishes, this host (the chain OWNER) dispatches `prompt` to dst_agent with the source result as context. The chain is replicated to autonomous peers with majority-ack consensus and survives owner restarts. Fire happens within ~10s of the source finishing.",
             json!({
@@ -881,6 +900,13 @@ impl McpHandler {
                 id: get_str_required("id")?,
             },
             "task_list" => Command::TaskList,
+            "task_cancel" => Command::TaskCancel {
+                id: get_str_required("id")?,
+            },
+            "task_input" => Command::TaskInput {
+                id: get_str_required("id")?,
+                input: get_str_required("input")?,
+            },
             "chain_list" => Command::ChainList,
             "chain_cancel" => Command::ChainCancel {
                 chain_id: get_str_required("chain_id")?,

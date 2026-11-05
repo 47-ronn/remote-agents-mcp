@@ -779,6 +779,8 @@ impl TryFrom<crate::Command> for proto::Command {
             }
             D::TaskGet { id } => K::TaskGet(p::TaskGet { id }),
             D::TaskList => K::TaskList(p::TaskList {}),
+            D::TaskCancel { id } => K::TaskCancel(p::TaskCancel { id }),
+            D::TaskInput { id, input } => K::TaskInput(p::TaskInput { id, input }),
             D::SessionList => K::SessionList(p::SessionList {}),
             D::SessionGet { provider, id, around_seq, window } => {
                 K::SessionGet(p::SessionGet { provider, id, around_seq, window })
@@ -882,6 +884,8 @@ impl TryFrom<proto::Command> for crate::Command {
             K::TaskDispatch(e) => D::TaskDispatch { prompt: e.prompt, initiator: e.initiator },
             K::TaskGet(e) => D::TaskGet { id: e.id },
             K::TaskList(_) => D::TaskList,
+            K::TaskCancel(e) => D::TaskCancel { id: e.id },
+            K::TaskInput(e) => D::TaskInput { id: e.id, input: e.input },
             K::SessionList(_) => D::SessionList,
             K::SessionGet(e) => D::SessionGet {
                 provider: e.provider,
@@ -1445,6 +1449,8 @@ mod tests {
             Command::TaskDispatch { prompt: "p".into(), initiator: Some("i".into()) },
             Command::TaskGet { id: "t".into() },
             Command::TaskList,
+            Command::TaskCancel { id: "t".into() },
+            Command::TaskInput { id: "t".into(), input: "yes\n".into() },
             Command::SessionList,
             Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: None, window: None },
             Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: Some(3), window: Some(5) },

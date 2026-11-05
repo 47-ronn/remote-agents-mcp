@@ -224,6 +224,16 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
             Ok(CommandResult::TaskList { tasks })
         }
 
+        Command::TaskCancel { id } => {
+            let task = state.autonomous().cancel(id)?;
+            Ok(CommandResult::Task { task })
+        }
+
+        Command::TaskInput { id, input } => {
+            state.autonomous().send_input(id, input).await?;
+            Ok(CommandResult::Ok)
+        }
+
         // === AI-provider sessions (claude / opencode history) ===
         Command::SessionList => {
             // Filesystem/CLI scans are blocking — keep them off the async runtime.
