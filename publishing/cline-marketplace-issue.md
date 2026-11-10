@@ -4,7 +4,7 @@ Open a new issue at: https://github.com/cline/mcp-marketplace/issues
 (Use the "Add MCP Server" issue template.)
 
 ## Required
-- **GitHub Repo URL:** https://github.com/47-ronn/tunshell_mcp_agents
+- **GitHub Repo URL:** https://github.com/47-ronn/remote-agents-mcp
 - **Logo:** 400×400 PNG (attach to the issue). Put the same file at
   `assets/logo.png` in the repo so other catalogs can reuse it.
 - **Why it should be added (value to Cline users):**

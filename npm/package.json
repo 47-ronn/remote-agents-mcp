@@ -4,10 +4,10 @@
   "mcpName": "io.github.47-ronn/remote-agents",
   "description": "Unified MCP server for controlling fleets of remote machines through AI agents (Claude, opencode)",
   "keywords": ["mcp", "model-context-protocol", "remote", "agent", "fleet", "ssh", "devops"],
-  "homepage": "https://github.com/47-ronn/tunshell_mcp_agents#readme",
+  "homepage": "https://github.com/47-ronn/remote-agents-mcp#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/47-ronn/tunshell_mcp_agents.git"
+    "url": "git+https://github.com/47-ronn/remote-agents-mcp.git"
   },
   "license": "MIT",
   "author": "47-ron",

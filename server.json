@@ -3,7 +3,7 @@
   "name": "io.github.47-ronn/remote-agents",
   "description": "Control fleets of remote machines via AI agents: exec, files, git, fleet ops, map/reduce.",
   "repository": {
-    "url": "https://github.com/47-ronn/tunshell_mcp_agents",
+    "url": "https://github.com/47-ronn/remote-agents-mcp",
     "source": "github"
   },
   "version": "0.1.7",

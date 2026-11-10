@@ -23,9 +23,9 @@ about:
     files, drive git, fan out fleet ops, and map/reduce across hosts. Agents
     connect outbound to a relay; end-to-end encrypted by default.
   # 400x400-ish PNG hosted over https (reuse the Cline logo once created).
-  icon: https://raw.githubusercontent.com/47-ronn/tunshell_mcp_agents/main/assets/logo.png
+  icon: https://raw.githubusercontent.com/47-ronn/remote-agents-mcp/main/assets/logo.png
 source:
-  project: https://github.com/47-ronn/tunshell_mcp_agents
+  project: https://github.com/47-ronn/remote-agents-mcp
   # dockerfile lives at repo root; Docker builds & signs the image.
   dockerfile: Dockerfile
 config:
