@@ -357,36 +357,105 @@ fn opencode_sessions(limit: usize) -> Vec<SessionMeta> {
     // `opencode session list` is scoped to the CWD's project, so run it from
     // HOME to get the global session list (the agent's own working directory
     // would otherwise expose only that one project's handful of sessions).
-    let limit = limit.to_string();
-    let Some(out) = run_cli_home(
+    let limit_str = limit.to_string();
+    let mut all: Vec<SessionMeta> = run_cli_home(
         "opencode",
-        &["session", "list", "--format", "json", "-n", &limit],
+        &["session", "list", "--format", "json", "-n", &limit_str],
+    )
+    .and_then(|out| serde_json::from_str::<Vec<serde_json::Value>>(&out).ok())
+    .map(|arr| {
+        arr.into_iter()
+            .filter_map(|s| {
+                let id = s.get("id")?.as_str()?.to_string();
+                Some(SessionMeta {
+                    provider: "opencode".to_string(),
+                    id,
+                    title: s
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("(без названия)")
+                        .to_string(),
+                    updated: s.get("updated").and_then(|u| u.as_u64()).unwrap_or(0),
+                    cwd: s
+                        .get("directory")
+                        .and_then(|d| d.as_str())
+                        .map(String::from),
+                    resumable: true,
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    // Even from HOME the CLI lists only the HOME project's sessions — chats
+    // started in other directories (other projects, mounted drives) stay
+    // invisible, so the search index never saw them. The v2 SQLite DB knows
+    // every session regardless of directory: merge in what the CLI missed.
+    let cli_ids: std::collections::HashSet<String> =
+        all.iter().map(|s| s.id.clone()).collect();
+    for s in opencode_db_sessions(limit) {
+        if !cli_ids.contains(&s.id) {
+            all.push(s);
+        }
+    }
+    all.sort_by_key(|s| std::cmp::Reverse(s.updated));
+    all.truncate(limit);
+    all
+}
+
+/// Sessions from opencode v2's SQLite DB (`~/.local/share/opencode/opencode.db`)
+/// that the project-scoped CLI list can't see. Read through the `sqlite3`
+/// binary — no new Rust dependency — and answer empty (status-quo HOME-only
+/// list) when the DB, the binary, or the table is absent (opencode 1.x hosts).
+fn opencode_db_sessions(limit: usize) -> Vec<SessionMeta> {
+    let Some(db) = dirs::data_dir().map(|d| d.join("opencode").join("opencode.db")) else {
+        return vec![];
+    };
+    if !db.is_file() {
+        return vec![];
+    }
+    // `time_archived` NULL → still a live-history session; skip tombstoned ones.
+    let q = format!(
+        "SELECT id, COALESCE(title, slug) AS title, directory AS cwd, \
+         MAX(COALESCE(time_updated, time_created)) AS updated \
+         FROM session_v2 WHERE time_archived IS NULL \
+         GROUP BY id ORDER BY updated DESC LIMIT {limit}"
+    );
+    let Some(out) = run_cli_in(
+        "sqlite3",
+        &["-json", &db.to_string_lossy(), &q],
+        CLI_TIMEOUT,
+        None,
     ) else {
         return vec![];
     };
-    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
-        return vec![];
-    };
-    arr.into_iter()
-        .filter_map(|s| {
-            let id = s.get("id")?.as_str()?.to_string();
-            Some(SessionMeta {
-                provider: "opencode".to_string(),
-                id,
-                title: s
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("(без названия)")
-                    .to_string(),
-                updated: s.get("updated").and_then(|u| u.as_u64()).unwrap_or(0),
-                cwd: s
-                    .get("directory")
-                    .and_then(|d| d.as_str())
-                    .map(String::from),
-                resumable: true,
-            })
+    parse_opencode_db_sessions(&out)
+}
+
+/// Pure parse of the `sqlite3 -json` rows → session metas. Testable without
+/// a database. Rows: `{id, title, cwd, updated}`.
+fn parse_opencode_db_sessions(out: &str) -> Vec<SessionMeta> {
+    serde_json::from_str::<Vec<serde_json::Value>>(out)
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|s| {
+                    let id = s.get("id")?.as_str()?.to_string();
+                    Some(SessionMeta {
+                        provider: "opencode".to_string(),
+                        id,
+                        title: s
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or("(без названия)")
+                            .to_string(),
+                        updated: s.get("updated").and_then(|u| u.as_u64()).unwrap_or(0),
+                        cwd: s.get("cwd").and_then(|c| c.as_str()).map(String::from),
+                        resumable: true,
+                    })
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 fn opencode_transcript(id: &str) -> Result<Vec<SessionMessage>> {
@@ -2031,6 +2100,24 @@ mod tests {
         assert_eq!(cwd_from_jsonl(r#"{"type":"mode"}"#), None);
         // Empty cwd is ignored.
         assert_eq!(cwd_from_jsonl(r#"{"type":"user","cwd":""}"#), None);
+    }
+
+    #[test]
+    fn parses_opencode_db_rows_and_dedupes_empty_titles() {
+        // `sqlite3 -json` output: one row per session; title may be NULL →
+        // falls back to slug (here via COALESCE in SQL) or the placeholder.
+        let rows = r#"[{"id":"ses_a","title":"Шифрование","cwd":"/media/x/proj","updated":1794328713565},{"id":"ses_b","title":null,"cwd":null,"updated":0}]"#;
+        let metas = parse_opencode_db_sessions(rows);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].id, "ses_a");
+        assert_eq!(metas[0].title, "Шифрование");
+        assert_eq!(metas[0].cwd.as_deref(), Some("/media/x/proj"));
+        assert_eq!(metas[0].provider, "opencode");
+        assert_eq!(metas[1].title, "(без названия)");
+        assert_eq!(metas[1].updated, 0);
+        // Garbage (sqlite3 missing/error text) → empty, never a panic.
+        assert!(parse_opencode_db_sessions("not json").is_empty());
+        assert!(parse_opencode_db_sessions("[]").is_empty());
     }
 
     #[test]
