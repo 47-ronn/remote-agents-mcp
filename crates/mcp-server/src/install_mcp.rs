@@ -18,6 +18,12 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
+/// The fleet-usage skill shipped in the repo (`skills/remote-agents/SKILL.md`).
+/// Baked into the binary so `install-mcp` can drop it into the client's skills
+/// directory — the agent then knows how to drive the fleet from the first turn,
+/// without the user hand-copying docs.
+const SKILL_MD: &str = include_str!("../../../skills/remote-agents/SKILL.md");
+
 /// How a given client stores MCP servers in its config file.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
@@ -194,6 +200,37 @@ fn yaml_snippet(client_id: &str, server_name: &str, command: &str, args: &[Strin
     }
 }
 
+/// Where a client keeps agent skills (`<dir>/<name>/SKILL.md`), if it supports
+/// them at all. Only clients with a real skills convention are listed; for the
+/// rest, `None` means "nothing to install" (their rule systems are different
+/// formats — the SKILL.md stays available in the repo).
+fn skill_dir(client: &Client) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let cfg = dirs::config_dir()?;
+    match client.id {
+        // opencode: ~/.config/opencode/skills/<name>/SKILL.md
+        "opencode" => Some(cfg.join("opencode").join("skills")),
+        // Claude Code: ~/.claude/skills/<name>/SKILL.md (project-level
+        // .claude/skills is also read; global is the safe default).
+        "claude-code" => Some(home.join(".claude").join("skills")),
+        _ => None,
+    }
+}
+
+/// Write the shipped SKILL.md into the client's skills dir. Best-effort: a
+/// failure to install the skill never fails the MCP registration itself.
+fn install_skill(client: &Client, name: &str) -> Option<PathBuf> {
+    let dir = skill_dir(client)?;
+    let skill = dir.join(name).join("SKILL.md");
+    // Create the FULL parent chain — `…/skills/<name>/` — not just the skills
+    // root; writing the file without it fails with ENOENT.
+    let parent = skill.parent()?.to_path_buf();
+    std::fs::create_dir_all(&parent)
+        .ok()
+        .and_then(|_| std::fs::write(&skill, SKILL_MD).ok())
+        .map(|_| skill)
+}
+
 /// Install/merge the `remote-agents` MCP server into `client`'s config.
 ///
 /// `command` is the absolute path to this binary; `args` is the full argv after
@@ -222,6 +259,9 @@ pub fn install_mcp(
             path.display(),
             snippet
         );
+        if let Some(skill) = install_skill(client, server_name) {
+            println!("✓ Installed skill '{}' → {}", server_name, skill.display());
+        }
         return Ok(());
     }
 
@@ -245,6 +285,13 @@ pub fn install_mcp(
         if had_config { "merged into" } else { "created" },
         path.display()
     );
+    if let Some(skill) = install_skill(client, server_name) {
+        println!(
+            "✓ Installed skill '{}' → {} (the agent now knows how to drive the fleet)",
+            server_name,
+            skill.display()
+        );
+    }
     Ok(())
 }
 
@@ -269,6 +316,32 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["mcpServers"]["remote-agents"]["command"], "remote-agents");
         assert_eq!(v["mcpServers"]["remote-agents"]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn skill_md_is_a_valid_skill_with_all_tools_documented() {
+        // Frontmatter must carry the name + description a skills loader needs,
+        // and the body must mention the core tool families so the agent the
+        // skill teaches matches the server it ships with.
+        assert!(SKILL_MD.starts_with("---\n"));
+        assert!(SKILL_MD.contains("name: remote-agents"));
+        assert!(SKILL_MD.contains("description:"));
+        for t in [
+            "list_agents", "exec", "fleet_exec", "task_dispatch", "task_input",
+            "session_search", "fleet_session_search", "mapreduce", "send_file",
+            "set_mode",
+        ] {
+            assert!(SKILL_MD.contains(t), "skill missing tool {t}");
+        }
+    }
+
+    #[test]
+    fn skill_dir_only_for_clients_with_skills_convention() {
+        // A path only for the clients that actually read skills directories.
+        assert!(skill_dir(find_client("opencode").unwrap()).is_some());
+        assert!(skill_dir(find_client("claude-code").unwrap()).is_some());
+        assert!(skill_dir(find_client("cursor").unwrap()).is_none());
+        assert!(skill_dir(find_client("zed").unwrap()).is_none());
     }
 
     #[test]
