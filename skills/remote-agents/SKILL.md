@@ -43,6 +43,7 @@ This MCP server is a **full peer**: it can drive every other host in the room.
 | Transfers | `send_file`, `sync_dir`, `transfer_get` (direct UDP hole-punch, relay fallback) |
 | Git | `git_status/pull/commit/push` (one host), `fleet_git` (all hosts) |
 | Tunnels | `tunnel_start`, `tunnel_list`, `tunnel_stop` (Cloudflare quick tunnels) |
+| tmux panes | `pane_start`, `pane_send`, `pane_read`, `pane_list`, `pane_kill` (persistent interactive terminals — see below) |
 | Host info | `get_info`, `set_mode`, `list_agents`, `fleet_update_check` |
 | Schedules (cron) | `schedule_add`, `schedule_remove`, `schedule_list` |
 | AI tasks | `task_dispatch`, `task_get`, `task_list`, `task_cancel`, `task_input` |
@@ -77,6 +78,17 @@ hole-punching, SHA-256 verified) with relay fallback; poll `transfer_get`.
 **Timeouts.** `exec` accepts `timeout_ms`; default kills the whole process
 group. Long builds: give an explicit generous timeout or run them as
 `sched`uled/`task_dispatch` jobs instead.
+
+**tmux panes = live sessions.** Autonomous tasks are one-shot (the AI process
+dies when it answers). For a *persistent* interactive terminal — an AI CLI you
+keep talking to, a build watcher, a TUI — use the pane tools: `pane_start
+{name}` creates a detached tmux pane `ra/<name>` (optionally typing `command`
+into it), `pane_send {target, text, enter}` types into it later, `pane_read
+{target, history}` reads the screen (this is how you see TUI output), and
+`pane_list` shows all panes with their commands (a `dead: true` pane's process
+exited — kill it or send a new command). The pane outlives every call, and
+like all tools it works with `agent_id` — a live interactive session on a
+remote host. Requires tmux on the target host.
 
 ## Failure modes
 

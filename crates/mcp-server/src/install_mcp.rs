@@ -329,7 +329,8 @@ mod tests {
         for t in [
             "list_agents", "exec", "fleet_exec", "task_dispatch", "task_input",
             "session_search", "fleet_session_search", "mapreduce", "send_file",
-            "set_mode",
+            "set_mode", "pane_start", "pane_send", "pane_read", "pane_list",
+            "pane_kill",
         ] {
             assert!(SKILL_MD.contains(t), "skill missing tool {t}");
         }

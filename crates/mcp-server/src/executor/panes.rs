@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn names_are_sanitized_for_tmux_targets() {
-        assert_eq!(safe_name("my chat: v2"), "my-chat:-v2");
+        assert_eq!(safe_name("my chat: v2"), "my-chat--v2");
         assert_eq!(safe_name("a.b"), "a-b");
         assert_eq!(safe_name("ok_1-2"), "ok_1-2");
     }
