@@ -35,11 +35,11 @@ fn tmux(args: &[&str]) -> Result<String> {
 }
 
 fn tmux_status(args: &[&str]) -> Result<bool> {
-    Ok(StdCommand::new("tmux")
+    StdCommand::new("tmux")
         .args(args)
         .output()
         .map(|o| o.status.success())
-        .context("failed to run tmux — is it installed?")?)
+        .context("failed to run tmux — is it installed?")
 }
 
 /// Ensure the `ra` session exists (idempotent).
