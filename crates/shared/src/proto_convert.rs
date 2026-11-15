@@ -480,6 +480,31 @@ impl From<proto::SessionSearchHit> for crate::SessionSearchHit {
     }
 }
 
+impl From<crate::PaneInfo> for proto::PaneInfo {
+    fn from(p: crate::PaneInfo) -> Self {
+        proto::PaneInfo {
+            target: p.target,
+            pane_id: p.pane_id,
+            session: p.session,
+            window: p.window,
+            command: p.command,
+            dead: p.dead,
+        }
+    }
+}
+impl From<proto::PaneInfo> for crate::PaneInfo {
+    fn from(p: proto::PaneInfo) -> Self {
+        crate::PaneInfo {
+            target: p.target,
+            pane_id: p.pane_id,
+            session: p.session,
+            window: p.window,
+            command: p.command,
+            dead: p.dead,
+        }
+    }
+}
+
 impl From<crate::FileMeta> for proto::FileMeta {
     fn from(m: crate::FileMeta) -> Self {
         proto::FileMeta {
@@ -809,6 +834,17 @@ impl TryFrom<crate::Command> for proto::Command {
             D::TaskList => K::TaskList(p::TaskList {}),
             D::TaskCancel { id } => K::TaskCancel(p::TaskCancel { id }),
             D::TaskInput { id, input } => K::TaskInput(p::TaskInput { id, input }),
+            D::PaneStart { name, command, cwd } => {
+                K::PaneStart(p::PaneStart { name, command, cwd })
+            }
+            D::PaneSend { target, text, enter, keys } => {
+                K::PaneSend(p::PaneSend { target, text, enter, keys })
+            }
+            D::PaneRead { target, history } => {
+                K::PaneRead(p::PaneRead { target, history })
+            }
+            D::PaneList => K::PaneList(p::PaneList {}),
+            D::PaneKill { target } => K::PaneKill(p::PaneKill { target }),
             D::SessionList => K::SessionList(p::SessionList {}),
             D::SessionGet { provider, id, around_seq, window } => {
                 K::SessionGet(p::SessionGet { provider, id, around_seq, window })
@@ -914,6 +950,15 @@ impl TryFrom<proto::Command> for crate::Command {
             K::TaskList(_) => D::TaskList,
             K::TaskCancel(e) => D::TaskCancel { id: e.id },
             K::TaskInput(e) => D::TaskInput { id: e.id, input: e.input },
+            K::PaneStart(e) => {
+                D::PaneStart { name: e.name, command: e.command, cwd: e.cwd }
+            }
+            K::PaneSend(e) => {
+                D::PaneSend { target: e.target, text: e.text, enter: e.enter, keys: e.keys }
+            }
+            K::PaneRead(e) => D::PaneRead { target: e.target, history: e.history },
+            K::PaneList(_) => D::PaneList,
+            K::PaneKill(e) => D::PaneKill { target: e.target },
             K::SessionList(_) => D::SessionList,
             K::SessionGet(e) => D::SessionGet {
                 provider: e.provider,
@@ -1063,6 +1108,13 @@ impl TryFrom<crate::CommandResult> for proto::CommandResult {
             D::SessionSearch { hits } => K::SessionSearch(p::SessionSearchResult {
                 hits: hits.into_iter().map(Into::into).collect(),
             }),
+            D::PaneStarted { target, pane_id, existed } => {
+                K::PaneStarted(p::PaneStarted { target, pane_id, existed })
+            }
+            D::PaneText { text } => K::PaneText(p::PaneText { text }),
+            D::PaneList { panes } => K::PaneList(p::PaneListResult {
+                panes: panes.into_iter().map(Into::into).collect(),
+            }),
             D::MapResult { job_id, partition_id, output, success, error } => {
                 K::MapResult(p::MapResult { job_id, partition_id, output, success, error })
             }
@@ -1160,6 +1212,15 @@ impl TryFrom<proto::CommandResult> for crate::CommandResult {
             },
             K::SessionSearch(e) => D::SessionSearch {
                 hits: e.hits.into_iter().map(Into::into).collect(),
+            },
+            K::PaneStarted(e) => D::PaneStarted {
+                target: e.target,
+                pane_id: e.pane_id,
+                existed: e.existed,
+            },
+            K::PaneText(e) => D::PaneText { text: e.text },
+            K::PaneList(e) => D::PaneList {
+                panes: e.panes.into_iter().map(Into::into).collect(),
             },
             K::MapResult(e) => D::MapResult {
                 job_id: e.job_id,
@@ -1479,6 +1540,13 @@ mod tests {
             Command::TaskList,
             Command::TaskCancel { id: "t".into() },
             Command::TaskInput { id: "t".into(), input: "yes\n".into() },
+            Command::PaneStart { name: "build".into(), command: Some("make".into()), cwd: Some("/src".into()) },
+            Command::PaneStart { name: "chat".into(), command: None, cwd: None },
+            Command::PaneSend { target: "ra/build".into(), text: "hi".into(), enter: true, keys: None },
+            Command::PaneSend { target: "%3".into(), text: String::new(), enter: false, keys: Some("C-c,Up".into()) },
+            Command::PaneRead { target: "ra/build".into(), history: 50 },
+            Command::PaneList,
+            Command::PaneKill { target: "ra/build".into() },
             Command::SessionList,
             Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: None, window: None },
             Command::SessionGet { provider: "claude".into(), id: "s".into(), around_seq: Some(3), window: Some(5) },
@@ -1575,6 +1643,13 @@ mod tests {
                 }],
             },
             CommandResult::MapResult { job_id: "j".into(), partition_id: 0, output: "o".into(), success: true, error: None },
+            CommandResult::PaneStarted { target: "ra/build".into(), pane_id: "%3".into(), existed: false },
+            CommandResult::PaneStarted { target: "ra/chat".into(), pane_id: "%4".into(), existed: true },
+            CommandResult::PaneText { text: "screen output\n".into() },
+            CommandResult::PaneList { panes: vec![crate::PaneInfo {
+                target: "ra:build.0".into(), pane_id: "%3".into(), session: "ra".into(),
+                window: "build".into(), command: "node".into(), dead: false,
+            }] },
             CommandResult::MapResult { job_id: "j".into(), partition_id: 1, output: "".into(), success: false, error: Some("boom".into()) },
             CommandResult::ReduceResult { job_id: "j".into(), output: "o".into(), success: true, error: None },
             CommandResult::ChainList { chains: vec![crate::TaskChain {

@@ -247,6 +247,26 @@ pub struct SessionSearchHit {
     pub cwd: Option<String>,
 }
 
+/// One tmux pane on the host (from `PaneList`). `target` is ready for
+/// PaneSend/PaneRead/PaneKill (`session:window.pane` or a pane id like `%3`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfo {
+    /// Full tmux target (`session:window.pane`).
+    pub target: String,
+    /// Pane id (`%N`), stable across re-ordering.
+    pub pane_id: String,
+    /// Session name (panes we created live in the `ra` session).
+    pub session: String,
+    /// Window name.
+    pub window: String,
+    /// Process currently running in the pane (e.g. `bash`, `node`, `htop`).
+    pub command: String,
+    /// True when the pane's process has exited (dead pane, only the shell-less
+    /// frame remains — usually means "kill it or send a new command").
+    #[serde(default)]
+    pub dead: bool,
+}
+
 /// Metadata for one file on a host — used both as the `FileStat` result and as
 /// a `FileSearch` hit. The body is never included; fetch it in chunks via
 /// `FileChunk` (binary-safe) or preview an image via `FileThumb`.

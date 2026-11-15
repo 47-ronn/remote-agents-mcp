@@ -457,6 +457,62 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             }),
             vec![],
         ),
+        // === tmux panes (persistent interactive terminals) ===
+        make_tool(
+            "pane_start",
+            "Start a persistent interactive terminal (tmux pane) that outlives this call. \
+             Optionally fire an initial command into it. The pane keeps running detached — \
+             drive it later with pane_send, read its screen with pane_read. \
+             Ideal for interactive AI CLIs (claude / opencode), build watchers, TUI programs.",
+            json!({
+                "name": {"type": "string", "description": "Unique pane name (becomes ra/<name>)"},
+                "command": {"type": "string", "description": "Optional: command to type into the pane on start"},
+                "cwd": {"type": "string", "description": "Optional: working directory for the pane"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["name"],
+        ),
+        make_tool(
+            "pane_send",
+            "Type text into a tmux pane: `text` is sent literally, `keys` are tmux key names \
+             (C-c, Up, Enter…), `enter` presses Enter after the text. Drives interactive programs.",
+            json!({
+                "target": {"type": "string", "description": "Pane target from pane_start/pane_list (e.g. 'ra/build' or '%3')"},
+                "text": {"type": "string", "description": "Text to type literally (empty = keys only)"},
+                "enter": {"type": "boolean", "description": "Press Enter after the text (default false)"},
+                "keys": {"type": "string", "description": "Optional: comma-separated tmux keys to send (C-c, Up, Down)"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["target"],
+        ),
+        make_tool(
+            "pane_read",
+            "Read a tmux pane's screen: visible text plus `history` lines of scrollback. \
+             This is how you see what a TUI/interactive program printed.",
+            json!({
+                "target": {"type": "string", "description": "Pane target (e.g. 'ra/build' or '%3')"},
+                "history": {"type": "integer", "description": "Scrollback lines to include beyond the visible screen (default 0)"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["target"],
+        ),
+        make_tool(
+            "pane_list",
+            "List all tmux panes on the host: target, pane id, current command, dead flag.",
+            json!({
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec![],
+        ),
+        make_tool(
+            "pane_kill",
+            "Kill a tmux pane (its window dies with it if it was the last pane).",
+            json!({
+                "target": {"type": "string", "description": "Pane target to kill (e.g. 'ra/build' or '%3')"},
+                "agent_id": {"type": "string", "description": AGENT_ID_DESC}
+            }),
+            vec!["target"],
+        ),
         make_tool(
             "session_get",
             "Fetch a session transcript. Without `around_seq`: the capped whole transcript. With \
@@ -912,6 +968,25 @@ impl McpHandler {
                 chain_id: get_str_required("chain_id")?,
             },
             "session_list" => Command::SessionList,
+            "pane_start" => Command::PaneStart {
+                name: get_str_required("name")?,
+                command: get_str("command"),
+                cwd: get_str("cwd"),
+            },
+            "pane_send" => Command::PaneSend {
+                target: get_str_required("target")?,
+                text: get_str("text").unwrap_or_default(),
+                enter: get_bool("enter", false),
+                keys: get_str("keys"),
+            },
+            "pane_read" => Command::PaneRead {
+                target: get_str_required("target")?,
+                history: get_u64("history").unwrap_or(0) as u32,
+            },
+            "pane_list" => Command::PaneList,
+            "pane_kill" => Command::PaneKill {
+                target: get_str_required("target")?,
+            },
             "session_get" => Command::SessionGet {
                 provider: get_str_required("provider")?,
                 id: get_str_required("id")?,
@@ -1584,6 +1659,34 @@ fn format_result(result: &CommandResult) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        CommandResult::PaneStarted { target, pane_id, existed } => format!(
+            "Pane {} ({}) — {}",
+            target,
+            pane_id,
+            if *existed { "already existed" } else { "started" }
+        ),
+        CommandResult::PaneText { text } => {
+            let t = text.trim_end();
+            if t.is_empty() { "(empty screen)".to_string() } else { t.to_string() }
+        }
+        CommandResult::PaneList { panes } => {
+            if panes.is_empty() {
+                return "No panes".to_string();
+            }
+            let mut out = format!("{} pane(s):\n", panes.len());
+            for p in panes {
+                out.push_str(&format!(
+                    "  {} {} [{}] {}{} — target: {}\n",
+                    if p.dead { "☠" } else { "▶" },
+                    p.pane_id,
+                    p.command,
+                    p.session,
+                    if p.dead { " (dead)" } else { "" },
+                    p.target,
+                ));
+            }
+            out
+        }
         CommandResult::Ok => "OK".to_string(),
         CommandResult::ChainList { chains } => {
             if chains.is_empty() {

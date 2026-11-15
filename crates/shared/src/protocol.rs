@@ -248,6 +248,44 @@ pub enum Command {
         id: String,
     },
 
+    // === tmux panes (persistent interactive terminals) ===
+    /// Start a detached tmux pane (window in session `ra`), optionally sending
+    /// an initial command. Returns the pane's target and id. The pane outlives
+    /// this call — interact with PaneSend / read with PaneRead.
+    PaneStart {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+
+    /// Type text (and optional keys) into a pane. `text` is sent literally,
+    /// `enter` presses Enter after it, `keys` are tmux key names (C-c, Up…).
+    PaneSend {
+        target: String,
+        text: String,
+        #[serde(default)]
+        enter: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keys: Option<String>,
+    },
+
+    /// Capture a pane's visible screen plus `history` lines of scrollback.
+    PaneRead {
+        target: String,
+        #[serde(default)]
+        history: u32,
+    },
+
+    /// List all panes across tmux sessions (session:window.pane, command, dead flag).
+    PaneList,
+
+    /// Kill a pane (its window dies with it if it was the last pane).
+    PaneKill {
+        target: String,
+    },
+
     // === File transfer (search, binary-safe chunked read, thumbnails) ===
     /// Metadata for one file (size/mime/is_image) without reading its body.
     FileStat {
@@ -666,6 +704,26 @@ pub enum CommandResult {
     /// AI-chat history (response to `SessionSearch`).
     SessionSearch {
         hits: Vec<SessionSearchHit>,
+    },
+
+    // === tmux panes ===
+    /// A pane was started (or already existed). `target` addresses it for
+    /// PaneSend/PaneRead (`ra/<name>`), `pane_id` is tmux's `%N`.
+    PaneStarted {
+        target: String,
+        pane_id: String,
+        /// True when the pane already existed (idempotent re-start).
+        existed: bool,
+    },
+
+    /// Captured pane text: the visible screen plus scrollback history.
+    PaneText {
+        text: String,
+    },
+
+    /// All panes across sessions, with their targets and current commands.
+    PaneList {
+        panes: Vec<PaneInfo>,
     },
 
     // === Distributed compute (MapReduce, Phase 13) ===

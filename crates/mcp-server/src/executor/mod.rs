@@ -2,6 +2,7 @@
 
 mod filesystem;
 mod git;
+mod panes;
 pub(crate) mod shell;
 
 use crate::safety;
@@ -232,6 +233,17 @@ pub async fn execute(cmd: &Command, state: &AgentState) -> Result<CommandResult>
         Command::TaskInput { id, input } => {
             state.autonomous().send_input(id, input).await?;
             Ok(CommandResult::Ok)
+        }
+
+        // === tmux panes (persistent interactive terminals) ===
+        // tmux CLI calls are short blocking processes over a unix socket —
+        // run them on the blocking pool like the other CLI-backed handlers.
+        Command::PaneStart { .. } | Command::PaneSend { .. } | Command::PaneRead { .. }
+        | Command::PaneList | Command::PaneKill { .. } => {
+            let cmd = cmd.clone();
+            tokio::task::spawn_blocking(move || panes::execute(&cmd))
+                .await
+                .map_err(|e| anyhow::anyhow!("pane operation failed: {e}"))?
         }
 
         // === AI-provider sessions (claude / opencode history) ===

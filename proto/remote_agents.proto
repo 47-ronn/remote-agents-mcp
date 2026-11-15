@@ -123,6 +123,23 @@ message SessionSearchHit {
   optional string cwd = 10;
 }
 
+// One tmux pane on a host (from `PaneList`). `target` is ready for
+// pane_send / pane_read / pane_kill (`session:window.pane` or `%N`).
+message PaneInfo {
+  // Full tmux target (`session:window.pane`).
+  string target = 1;
+  // Pane id (`%N`), stable across re-ordering.
+  string pane_id = 2;
+  // Session name (panes we created live in the `ra` session).
+  string session = 3;
+  // Window name.
+  string window = 4;
+  // Process currently running in the pane (bash, node, htop, …).
+  string command = 5;
+  // The pane's process has exited — kill it or send a new command.
+  bool dead = 6;
+}
+
 message FileMeta {
   string path = 1;
   uint64 size = 2;
@@ -309,6 +326,23 @@ message Command {
     string id = 1;
     string input = 2;
   }
+  message PaneStart {
+    string name = 1;
+    optional string command = 2;
+    optional string cwd = 3;
+  }
+  message PaneSend {
+    string target = 1;
+    string text = 2;
+    bool enter = 3;
+    optional string keys = 4;
+  }
+  message PaneRead {
+    string target = 1;
+    uint32 history = 2;
+  }
+  message PaneList {}
+  message PaneKill { string target = 1; }
   message SessionList {}
   message SessionGet {
     string provider = 1;
@@ -456,6 +490,11 @@ message Command {
     ChainCancel chain_cancel = 40;
     TaskCancel task_cancel = 41;
     TaskInput task_input = 42;
+    PaneStart pane_start = 43;
+    PaneSend pane_send = 44;
+    PaneRead pane_read = 45;
+    PaneList pane_list = 46;
+    PaneKill pane_kill = 47;
   }
 }
 
@@ -512,6 +551,13 @@ message CommandResult {
   }
   message SessionTranscript { repeated SessionMessage messages = 1; }
   message SessionSearchResult { repeated SessionSearchHit hits = 1; }
+  message PaneStarted {
+    string target = 1;
+    string pane_id = 2;
+    bool existed = 3;
+  }
+  message PaneText { string text = 1; }
+  message PaneListResult { repeated PaneInfo panes = 1; }
   message MapResult {
     string job_id = 1;
     uint32 partition_id = 2;
@@ -577,6 +623,9 @@ message CommandResult {
     SessionSearchResult session_search = 26;
     ChainAckResult chain_ack = 27;
     ChainListResult chain_list = 28;
+    PaneStarted pane_started = 29;
+    PaneText pane_text = 30;
+    PaneListResult pane_list = 31;
   }
 }
 
