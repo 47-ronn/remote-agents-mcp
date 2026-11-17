@@ -54,6 +54,23 @@ Supported: `claude-desktop`, `claude-code`, `cursor`, `cline`, `roo`, `kilo`,
 `windsurf`, `zed`, `opencode` (config merged in place, preserving existing
 servers) and `continue`, `goose` (YAML — a paste-able snippet is printed).
 
+## One-paste host bootstrap (`share`)
+
+`remote-agent share` prints a script that downloads the latest release binary
+from GitHub and joins **this** room — the room/token/relay are embedded as
+base64. Nothing to install on the target host:
+
+```bash
+remote-agent share                       # sh script (Linux/macOS)
+remote-agent share --format ps1          # PowerShell (Windows)
+remote-agent share -q | ssh web-1 sh      # straight onto a remote host
+```
+
+The script ends in `run --bootstrap <b64>`: the binary decodes the embedded
+config and joins immediately (the local config file is overridden for this
+run). ⚠️ The script carries the room token in plain text — pipe it, don't log
+it.
+
 ## Update checks
 
 When started in a long-running mode (`run` / `mcp` / `hybrid`), the launcher does

@@ -97,7 +97,11 @@ GitHub and runs `remote-agent run --bootstrap <b64>` — the room/token/relay/
 tags are embedded in the script as base64, so a paste is all a fresh host
 needs (no npm/cargo). `share {b64: true}` gives just the base64 for manual
 `run --bootstrap` use. The script carries the room token in plain text —
-treat it like a password.
+treat it like a password. The web panel's **Share room** button (🔗 in the
+header) generates the same scripts plus a **QR for phones**: an encrypted
+`#/app/join/<payload>` link (AES-GCM + 6-digit code, TTL 2 minutes) that
+auto-fills the room on scan — the token never travels as plain base64
+through a camera app.
 
 ## Failure modes
 

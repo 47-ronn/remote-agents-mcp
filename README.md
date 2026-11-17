@@ -153,6 +153,49 @@ remote-agents run --relay wss://<your-relay-host> --room dev --token <secret> \
 remote-agents install --room dev --token <secret> --relay wss://<your-relay-host>
 ```
 
+### 1b. Bootstrap a fresh host with one paste (`share`)
+
+`remote-agent share` prints a self-contained script that downloads the latest
+release binary from GitHub and joins **this** room — the connection config
+(room, token, relay, tags) is embedded in the script as base64 JSON, so a
+fresh host needs nothing but `curl`:
+
+```bash
+# Print the script for Linux/macOS (or --format ps1 for Windows):
+remote-agent share
+remote-agent share -q | ssh web-1 sh        # pipe straight onto a remote host
+```
+
+The `ssh` flow in detail:
+
+```bash
+# 1. From your admin machine (already connected to the room):
+remote-agent share -q | ssh -o StrictHostKeyChecking=accept-new web-1 sh
+#
+#    what happens on web-1:
+#      sh reads the script from stdin and executes it:
+#        * uname -s/-m  → picks x86_64/aarch64, linux/musl or darwin
+#        * curl …releases/latest/download/remote-agent-$target
+#          → fresh binary into $TMPDIR/remote-agent-bootstrap/
+#        * exec remote-agent run --bootstrap <b64>
+#          → decodes the embedded config (base64 JSON) and joins the room.
+#
+# 2. Watch it appear in the fleet:
+remote-agents mcp   # (or the web panel) → list_agents shows web-1
+```
+
+Details worth knowing:
+
+- `--bootstrap <b64>` **overrides** the local config file (the sharer's room is
+  the point) — a config that already exists on the host is ignored for this
+  run; only an empty token field in the bootstrap falls back to the local one.
+- `share --b64` prints only the base64 config (for `run --bootstrap` by hand).
+- The **MCP tool `share`** (and the web panel's "Share room" button) generate
+  the same script programmatically.
+- ⚠️ The script carries the room token in plain text (base64 is an encoding,
+  not encryption). Treat a generated script like a password: pipe it, don't
+  paste it into logs or chats.
+
 ### 2. Choose a relay
 
 **Public relay (no setup):**
