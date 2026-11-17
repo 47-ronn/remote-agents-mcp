@@ -43,6 +43,7 @@ This MCP server is a **full peer**: it can drive every other host in the room.
 | Transfers | `send_file`, `sync_dir`, `transfer_get` (direct UDP hole-punch, relay fallback) |
 | Git | `git_status/pull/commit/push` (one host), `fleet_git` (all hosts) |
 | Tunnels | `tunnel_start`, `tunnel_list`, `tunnel_stop` (Cloudflare quick tunnels) |
+| Bootstrap | `share` — one-line sh/ps1 script that installs the latest binary on a fresh host and joins THIS room (config embedded as base64; `run --bootstrap <b64>` decodes it) |
 | tmux panes | `pane_start`, `pane_send`, `pane_read`, `pane_list`, `pane_kill` (persistent interactive terminals — see below) |
 | Host info | `get_info`, `set_mode`, `list_agents`, `fleet_update_check` |
 | Schedules (cron) | `schedule_add`, `schedule_remove`, `schedule_list` |
@@ -89,6 +90,14 @@ into it), `pane_send {target, text, enter}` types into it later, `pane_read
 exited — kill it or send a new command). The pane outlives every call, and
 like all tools it works with `agent_id` — a live interactive session on a
 remote host. Requires tmux on the target host.
+
+**Bootstrapping fresh hosts.** `share` prints a one-line script (sh for
+Linux/macOS, ps1 for Windows) that downloads the latest release binary from
+GitHub and runs `remote-agent run --bootstrap <b64>` — the room/token/relay/
+tags are embedded in the script as base64, so a paste is all a fresh host
+needs (no npm/cargo). `share {b64: true}` gives just the base64 for manual
+`run --bootstrap` use. The script carries the room token in plain text —
+treat it like a password.
 
 ## Failure modes
 

@@ -27,6 +27,7 @@ pub mod safety;
 pub mod scheduler;
 pub mod session_index;
 pub mod sessions;
+pub mod share;
 pub mod sync;
 pub mod transfer;
 pub mod tunnel;

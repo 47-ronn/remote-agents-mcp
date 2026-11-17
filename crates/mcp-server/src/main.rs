@@ -49,6 +49,31 @@ enum Commands {
         /// commands from other peers (for prod controllers / browser dashboards).
         #[arg(long)]
         no_agent: bool,
+
+        /// Bootstrap config (base64 JSON, from `remote-agent share`): overrides
+        /// the local config file — room/token/relay/tags arrive with the script.
+        #[arg(long, hide = true)]
+        bootstrap: Option<String>,
+    },
+
+    /// Generate a one-line bootstrap script (sh / ps1) that downloads the
+    /// latest release binary from GitHub and joins THIS room with the current
+    /// config embedded as base64. Paste it on a fresh host — no npm/cargo
+    /// needed. The script carries the room token in plain text: treat it
+    /// like a password.
+    Share {
+        /// Script flavor: sh (Linux/macOS) or ps1 (Windows)
+        #[arg(long, default_value = "sh")]
+        format: String,
+
+        /// Print only the raw script (no decorations) — for piping:
+        ///   remote-agent share --sh | ssh host sh
+        #[arg(long, short = 'q')]
+        quiet: bool,
+
+        /// Also print the base64 bootstrap config alone (for `run --bootstrap`).
+        #[arg(long)]
+        b64: bool,
     },
 
     /// Run as MCP stdio server (for Claude Desktop, opencode, etc.). The node
@@ -216,8 +241,50 @@ async fn main() -> Result<()> {
             name,
             tags,
             no_agent,
+            bootstrap,
         } => {
+            // --bootstrap <b64>: config handed over by a `share` script — decode
+            // and layer ON TOP of everything else (it wins over file/env/flags:
+            // the sharer's room is the point of the paste).
+            if let Some(b64) = bootstrap {
+                let bs = remote_agent::share::BootstrapConfig::from_b64(&b64)?;
+                let mut cfg = build_config(room, token, relay, name, tags, no_agent);
+                bs.apply_over(&mut cfg);
+                info!(
+                    "Bootstrap config applied: joining room '{}' at {}",
+                    cfg.room, cfg.relay_url
+                );
+                connection::run(&cfg).await?;
+                return Ok(());
+            }
             run_agent(room, token, relay, name, tags, no_agent).await?;
+        }
+        Commands::Share { format, quiet, b64 } => {
+            use remote_agent::share;
+            let cfg = build_config(None, None, None, None, None, false);
+            let bs = share::BootstrapConfig::from_config(&cfg);
+            let b64s = bs.to_b64();
+            if b64 && !quiet {
+                println!("{b64s}");
+                return Ok(());
+            }
+            let script = match format.as_str() {
+                "sh" | "bash" => share::sh_script(&b64s),
+                "ps1" | "powershell" => share::ps1_script(&b64s),
+                other => {
+                    eprintln!("unknown format '{other}' — use sh or ps1");
+                    std::process::exit(2);
+                }
+            };
+            if quiet {
+                print!("{script}");
+            } else {
+                println!("--- bootstrap script ({format}) — room '{}' ---", cfg.room);
+                println!("{script}");
+                println!(
+                    "--- end ---\npaste on the target host. carries the room token in plain text; treat as a password."
+                );
+            }
         }
         Commands::Mcp { name, room, token, relay, tags, no_agent } => {
             run_mcp(name, room, token, relay, tags, no_agent).await?;

@@ -457,6 +457,20 @@ fn all_tools(has_relay: bool) -> Vec<Tool> {
             }),
             vec![],
         ),
+        // === bootstrap sharing ===
+        make_tool(
+            "share",
+            "Generate a one-line bootstrap script (sh for Linux/macOS, ps1 for Windows) that \
+             downloads the latest release binary from GitHub and joins THIS room with the current \
+             config (room, token, relay, tags) embedded as base64. Paste it on a fresh host — \
+             no npm/cargo needed. The script carries the room token in plain text: treat it like \
+             a password. Set b64=true to get only the base64 config (for `run --bootstrap`).",
+            json!({
+                "format": {"type": "string", "description": "Script flavor: sh (default) or ps1", "enum": ["sh", "ps1"]},
+                "b64": {"type": "boolean", "description": "Return only the raw base64 bootstrap config (default false)"}
+            }),
+            vec![],
+        ),
         // === tmux panes (persistent interactive terminals) ===
         make_tool(
             "pane_start",
@@ -750,6 +764,7 @@ impl ServerHandler for McpHandler {
             "fleet_git" => return self.handle_fleet_git(args).await,
             "mapreduce" => return self.handle_mapreduce(args).await,
             "chain_arm" => return self.handle_chain_arm(args).await,
+            "share" => return self.handle_share(args).await,
             _ => {}
         }
 
@@ -1135,6 +1150,43 @@ impl McpHandler {
     /// `ChainArm` out to every autonomous peer, require a majority ack. The
     /// connection loop's chain-owner tick (10s + on TaskCompleted) watches the
     /// source task and fires the follow-up on `dst_agent` — no panel needed.
+    /// `share`: generate a one-line bootstrap script (sh/ps1) that downloads the
+    /// latest release binary and joins THIS room with the current config
+    /// embedded as base64. Local-only (reads this host's config — the same
+    /// thing the panel/CLI `remote-agent share` prints).
+    async fn handle_share(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, CallToolError> {
+        use crate::share;
+        let fmt = args
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sh")
+            .to_string();
+        let b64_only = args
+            .get("b64")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let cfg = { self.state.read().await.config.clone() };
+        let bs = share::BootstrapConfig::from_config(&cfg);
+        let b64 = bs.to_b64();
+        let text = if b64_only {
+            b64
+        } else {
+            match fmt.as_str() {
+                "sh" | "bash" => share::sh_script(&b64),
+                "ps1" | "powershell" => share::ps1_script(&b64),
+                other => {
+                    return Err(exec_error(format!(
+                        "unknown format '{other}' — use sh or ps1"
+                    )))
+                }
+            }
+        };
+        Ok(text_result(text))
+    }
+
     async fn handle_chain_arm(
         &self,
         args: Map<String, Value>,
